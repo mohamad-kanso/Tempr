@@ -8,8 +8,6 @@
 
 ## Now
 
-- [ ] Resolve Open Decision #5 (GPUI fork strategy) before adding GPUI as a dependency — affects whether it is pinned to a commit hash or a fork branch (→ docs/PRODUCT.md OD#5)
-
 ## Next
 
 - [ ] Phase 1: PostgreSQL async driver (`sqlx` or custom) with TLS connection, query execution, streaming result batches

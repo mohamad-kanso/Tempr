@@ -33,6 +33,7 @@
 | D11 | 2026-07-13 | Lorekeeper living-docs system adopted; PRODUCT/PROGRESS/TODO/DECISIONS bootstrapped | User + Claude |
 | D12 | 2026-07-13 | MIT license chosen as working default — closes OD#2 | Claude (Phase 0) |
 | D13 | 2026-07-13 | PR review-based development workflow — branch → PR → /code-review → user approval → merge | User |
+| D14 | 2026-07-13 | GPUI dependency via upstream git pin (no fork) — `rev = "<sha>"`, updated deliberately | User |
 
 ---
 
@@ -141,6 +142,15 @@
 **Decision**: `license = "MIT"` set in `[workspace.package]` and inherited by all crates via `license.workspace = true`. OD#2 is closed.
 **Why**: `cargo deny check` requires a license field on all workspace crates. MIT is permissive, compatible with all current dependencies, does not restrict plugin authors, and can be superseded before any public release if a copyleft strategy is preferred. Choosing MIT now unblocks CI without foreclosing the AGPL option — a superseding ADR can change it before the repo goes public.
 **Consequences**: MIT is the legal default until explicitly superseded. Any license change before public release requires a new DECISIONS.md entry (D13+) and updating `Cargo.toml`. If the project goes AGPL, the entire commit history will carry the MIT header for early commits — inform legal if this matters.
+
+---
+
+## D14 — GPUI dependency via upstream git pin (2026-07-13)
+
+**By**: User.
+**Decision**: Depend on GPUI from the upstream `zed-industries/zed` monorepo pinned to a specific commit SHA (`rev = "<sha>"`). No fork. Rev is updated deliberately when new GPUI APIs are needed. Closes OD#5.
+**Why**: A fork doesn't eliminate the need to track upstream — GPUI is in active development and improvements are needed — it just adds a rebase burden on top. The custom component layer committed in D1 already provides the right abstraction to absorb API churn without forking. Deliberate rev bumps give controlled upgrade cadence without fork maintenance overhead.
+**Consequences**: Phase 1 adds `gpui = { git = "https://github.com/zed-industries/zed", rev = "<sha>" }` to the workspace Cargo.toml. The pinned SHA is updated intentionally, not on every Zed release. No fork to maintain. If a patch is ever needed that upstream won't accept, reconsider with a superseding entry.
 
 ---
 

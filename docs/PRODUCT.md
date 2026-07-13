@@ -103,7 +103,6 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 | 1 | **Name & branding** — "Tempr" is a working name; logo, domain needed | Keep "Tempr" vs. rename; no strong leaning yet | Blocks any public release or repo exposure |
 | 3 | **Telemetry policy** — even anonymized telemetry requires explicit opt-in | Opt-in only (product invariant already set); policy text and toggle UX need design | Blocks Phase 4 / any beta |
 | 4 | **Beta program timing** — after Phase 2 (usable editor) or Phase 3 (intelligence)? | Earlier = more feedback but rougher experience | Affects Phase 3/4 sequencing |
-| 5 | **GPUI fork strategy** — maintain a fork or depend on upstream? | Upstream is simpler but risks breaking changes; fork gives control but adds maintenance | Affects Phase 0 Cargo setup and ongoing maintenance |
 | 6 | **Plugin distribution** — central registry vs. Git-based vs. both? | Git-based is simpler first; registry adds discovery | Blocks Phase 4 plugin story |
 | 7 | **Release cadence post-v1** — fixed schedule (e.g. 8-week) vs. rolling? | Rolling is simpler; fixed gives users predictability | Post-v1 only |
 | 8 | **Multi-engine catalog caching** — per-engine namespace or unified model? | Per-engine is simpler; unified is more powerful | Affects Phase 3 architecture (must decide before Intelligence phase) |
