@@ -34,6 +34,7 @@
 | D12 | 2026-07-13 | MIT license chosen as working default — closes OD#2 | Claude (Phase 0) |
 | D13 | 2026-07-13 | PR review-based development workflow — branch → PR → /code-review → user approval → merge | User |
 | D14 | 2026-07-13 | GPUI dependency via upstream git pin (no fork) — `rev = "<sha>"`, updated deliberately | User |
+| D15 | 2026-07-13 | No direct commits to main ever — all work via branch → PR → review → merge, no exceptions | User |
 
 ---
 
@@ -145,6 +146,16 @@
 
 ---
 
+## D15 — No direct commits to main, ever (2026-07-13)
+
+**By**: User.
+**Supersedes**: D13.
+**Decision**: All work — feature, fix, docs, chore — must go through a branch → PR → `/code-review` → user approval → merge workflow. No direct commits to main under any circumstances. The D13 "trivial doc correction" judgment exception is eliminated.
+**Why**: Claude committed docs changes directly to main (OD#5 resolution), citing the judgment exception in D13. That exception is too wide and defeats the point of branch protection. A bright-line rule with no exceptions removes the rationalization surface.
+**Consequences**: Even single-line doc fixes go on a branch and through a PR. More process overhead for trivial changes; the tradeoff is an unambiguous rule that cannot be argued around.
+
+---
+
 ## D14 — GPUI dependency via upstream git pin (2026-07-13)
 
 **By**: User.
@@ -155,6 +166,8 @@
 ---
 
 ## D13 — PR review-based development workflow (2026-07-13)
+
+**Superseded by**: D15.
 
 **By**: User.
 **Decision**: All feature-level work (Phase checklist items) follows: `feature-dev` skill → `git checkout -b feat/ph<N>-<slug>` → implement → `/code-review` → `gh pr create` → user approves → `gh pr merge`. No direct pushes to `main`. Enforced locally by `.github/hooks/pre-push` (installed via `scripts/setup.sh`). Branch prefixes: `feat/ph<N>-*`, `fix/*`, `docs/*`, `chore/*`.
