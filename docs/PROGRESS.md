@@ -8,7 +8,7 @@
 
 - **Last completed**: Phase 0 — all exit criteria verified 2026-07-13
 - **Verified**: `cargo fmt --check` ✅ · `cargo clippy --workspace --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (36 tests: 15 domain, 6 events, 5 services, 10 workspace) · `cargo deny check` ✅ (advisories ok, bans ok, licenses ok, sources ok)
-- **Next action**: Resolve OD#5 (GPUI fork strategy) then begin Phase 1 — PostgreSQL driver + GPUI application shell
+- **Next action**: Begin Phase 1 — PostgreSQL driver + GPUI application shell (GPUI: upstream git pin, see D14)
 
 ## Phase checklist
 
@@ -83,9 +83,11 @@
 | 2026-07-13 | Capability-gated roadmap phases over date-based milestones | → D10 |
 | 2026-07-13 | Lorekeeper living-docs adopted | → D11 |
 | 2026-07-13 | PR review-based workflow adopted — branch → PR → /code-review → user approval | → D13 |
+| 2026-07-13 | GPUI dependency strategy: upstream git pin, no fork; OD#5 closed | → D14 |
+| 2026-07-13 | No direct commits to main ever — judgment exception in D13 eliminated | → D15 |
 
 ## Session log
 
 | Date | Phase | What was done | Follow-ups |
 |---|---|---|---|
-| 2026-07-13 | Phase 0 | Architecture suite (16 docs + 9 ADRs + RFC) written; Cargo workspace + 5 crates scaffolded; domain types (15 tests), event bus (6), service registry (5), workspace manifest (4), storage (6) implemented; CI workflow + cargo-deny configured; MIT license set (→ D12); all 8 exit criteria verified; PR review workflow (D13) adopted: pre-push hook + setup script + CLAUDE.md hard rule | Resolve OD#5, begin Phase 1; run bash scripts/setup.sh in each new worktree |
+| 2026-07-13 | Phase 0 | Architecture suite (16 docs + 9 ADRs + RFC) written; Cargo workspace + 5 crates scaffolded; domain types (15 tests), event bus (6), service registry (5), workspace manifest (4), storage (6) implemented; CI workflow + cargo-deny configured; MIT license set (→ D12); all 8 exit criteria verified; PR review workflow (D13) adopted: pre-push hook + setup script + CLAUDE.md hard rule; OD#5 resolved: upstream git pin, no fork (→ D14); lorekeeper check: zero drift; D13 judgment exception eliminated — no direct commits to main ever (→ D15) | Begin Phase 1; run bash scripts/setup.sh in each new worktree |

@@ -33,6 +33,8 @@
 | D11 | 2026-07-13 | Lorekeeper living-docs system adopted; PRODUCT/PROGRESS/TODO/DECISIONS bootstrapped | User + Claude |
 | D12 | 2026-07-13 | MIT license chosen as working default — closes OD#2 | Claude (Phase 0) |
 | D13 | 2026-07-13 | PR review-based development workflow — branch → PR → /code-review → user approval → merge | User |
+| D14 | 2026-07-13 | GPUI dependency via upstream git pin (no fork) — `rev = "<sha>"`, updated deliberately | User |
+| D15 | 2026-07-13 | No direct commits to main ever — all work via branch → PR → review → merge, no exceptions | User |
 
 ---
 
@@ -146,7 +148,28 @@
 
 ## D13 — PR review-based development workflow (2026-07-13)
 
+**Superseded by**: D15.
+
 **By**: User.
 **Decision**: All feature-level work (Phase checklist items) follows: `feature-dev` skill → `git checkout -b feat/ph<N>-<slug>` → implement → `/code-review` → `gh pr create` → user approves → `gh pr merge`. No direct pushes to `main`. Enforced locally by `.github/hooks/pre-push` (installed via `scripts/setup.sh`). Branch prefixes: `feat/ph<N>-*`, `fix/*`, `docs/*`, `chore/*`.
 **Why**: Agents working directly on `main` bypass review. A lightweight push-gate plus a CLAUDE.md hard rule ensures both human and agent work goes through review before landing. Approach A (CLAUDE.md rule + local git hook) chosen over heavier Claude Code PreToolUse hooks for simplicity.
 **Consequences**: Every feature branch requires a PR and a `/code-review` pass before merge. Trivial one-line doc corrections in the same session may still land directly — use judgment. GitHub server-side branch protection is optional at this stage.
+
+---
+
+## D14 — GPUI dependency via upstream git pin (2026-07-13)
+
+**By**: User.
+**Decision**: Depend on GPUI from the upstream `zed-industries/zed` monorepo pinned to a specific commit SHA (`rev = "<sha>"`). No fork. Rev is updated deliberately when new GPUI APIs are needed. Closes OD#5.
+**Why**: A fork doesn't eliminate the need to track upstream — GPUI is in active development and improvements are needed — it just adds a rebase burden on top. The custom component layer committed in D1 already provides the right abstraction to absorb API churn without forking. Deliberate rev bumps give controlled upgrade cadence without fork maintenance overhead.
+**Consequences**: Phase 1 adds `gpui = { git = "https://github.com/zed-industries/zed", rev = "<sha>" }` to the workspace Cargo.toml. The pinned SHA is updated intentionally, not on every Zed release. No fork to maintain. If a patch is ever needed that upstream won't accept, reconsider with a superseding entry.
+
+---
+
+## D15 — No direct commits to main, ever (2026-07-13)
+
+**By**: User.
+**Supersedes**: D13.
+**Decision**: All work — feature, fix, docs, chore — must go through a branch → PR → `/code-review` → user approval → merge workflow. No direct commits to main under any circumstances. The D13 "trivial doc correction" judgment exception is eliminated.
+**Why**: Claude committed docs changes directly to main (OD#5 resolution), citing the judgment exception in D13. That exception is too wide and defeats the point of branch protection. A bright-line rule with no exceptions removes the rationalization surface.
+**Consequences**: Even single-line doc fixes go on a branch and through a PR. More process overhead for trivial changes; the tradeoff is an unambiguous rule that cannot be argued around.
