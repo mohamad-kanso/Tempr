@@ -2,9 +2,41 @@
 
 Native Rust Database IDE — Zed's speed + DataGrip's SQL intelligence. PostgreSQL first. Not a DBeaver clone.
 
+## Living documentation (docs/PRODUCT.md · docs/PROGRESS.md · docs/TODO.md · docs/DECISIONS.md)
+
+Four files that must always reflect reality. Each fact has exactly ONE home — link, never duplicate:
+
+| File | Owns | Read it when |
+|---|---|---|
+| `docs/PRODUCT.md` | WHAT & WHY — features + acceptance criteria, platform constraints, out-of-scope, NFRs, Open Decisions | Before implementing or changing ANY user-facing behavior |
+| `docs/PROGRESS.md` | WHERE — current status, phase checklist, decisions log (fine-grained), session log | FIRST thing every session (the status block tells you the next action) |
+| `docs/TODO.md` | WHAT'S PARKED — Now / Next / Later / Ideas | When something comes up that isn't the current task |
+| `docs/DECISIONS.md` | WHY (MAJOR) — the numbered cross-session record of major decisions with rationale and consequences | Before revisiting ANY settled approach, and whenever a major decision is made |
+
+**Session start ritual**: read the PROGRESS.md status block → that is your context and next action. Skim TODO.md "Now" and the DECISIONS.md index. Open PRODUCT.md for the feature you're about to touch.
+
+**Update triggers** (do these in the same turn/commit as the change, per the hard rule below):
+
+| Event | Update |
+|---|---|
+| Task completed | PROGRESS: status block + checklist; amend today's session-log row (one row per session, not per micro-task) |
+| Business behavior / requirement / scope changed | PRODUCT (feature text, constraints, or Open Decisions) + a PROGRESS decisions-log row |
+| **MAJOR decision made** (architecture/stack/pattern rule, new dependency, business-rule change, blueprint deviation, closed open decision, explicit user directive) | DECISIONS.md entry (numbered, with By/Why/Consequences) in the same turn; the PROGRESS decisions-log row links `→ D<n>` instead of restating the why |
+| An open decision gets resolved | Move it from PRODUCT's Open Decisions into the feature text; DECISIONS.md entry; log row links it |
+| New idea or deferred work appears | TODO.md immediately, in the right section — never leave it in conversation |
+| Phase completed | PROGRESS checklist + status block, "Current phase" line below, sweep TODO (promote/close items), commit |
+
+**Consistency rules**:
+- Never check a PROGRESS box without verifying (run the check commands, confirm the artifact exists) — unverified stays unchecked.
+- PRODUCT's ✅/🔜 feature markers must agree with the PROGRESS checklist.
+- If code and docs disagree, the code is the truth — fix the docs in the same commit.
+- Keep entries terse: a decisions-log row is one line of what + why; prose belongs in PRODUCT; major rationale belongs in DECISIONS.md.
+- DECISIONS.md entries are never edited or silently overturned — supersede with a new entry carrying `Supersedes: D<n>`. The one allowed edit to an old entry: add a `**Superseded by**: D<m>` line under its title.
+- When the session log (or decisions log) exceeds ~30 rows, archive all but the newest ~10 to `docs/archive/PROGRESS-<year>.md` at a phase boundary — never mid-task. DECISIONS.md is never archived or trimmed.
+
 ## Project Status
 
-Architecture/documentation phase. `docs/` is the source of truth. **Do not write implementation code or scaffold crates unless explicitly asked** — the brief locks this.
+Architecture/documentation phase complete; implementation not yet started. **Do not write implementation code or scaffold crates unless explicitly asked.**
 
 ## Locked Decisions
 
@@ -49,8 +81,37 @@ Architecture/documentation phase. `docs/` is the source of truth. **Do not write
 - Changes to locked decisions require an RFC ([rfc/README.md](docs/rfc/README.md)) and a superseding ADR
 - Conventional Commits: `feat:`, `fix:`, `docs:`, `refactor:`
 
-## Future Implementation
+## Commands
+
+```bash
+cargo build                  # build
+cargo fmt --check            # format check
+cargo clippy -- -D warnings  # lint (treat warnings as errors)
+cargo test                   # unit + integration tests
+cargo deny check             # dependency audit (set up in Phase 0)
+```
+
+## Hard rules
+
+- **No business logic in UI.** Views call services; services contain logic; services publish events; views subscribe. Absolute — see D6.
+- **No blocking the UI thread.** All I/O and non-trivial computation run on async runtimes. UI thread renders and dispatches events only.
+- **No DB queries during completion.** Semantic engine works from cached schema data only. < 5 ms budget is a hard real-time constraint — see D9.
+- **No external processes for intelligence.** No LSP server, no sidecar, no JSON-RPC hop. In-process only — see D9.
+- **No non-Rust plugins at v1.** Plugin authors write Rust crates. WASM is post-v1 — see D2, D8.
+- **No mouse-only features.** Every user action must be expressible as a `Command` with a keybinding.
+- **No workspace data leaves the machine without explicit user action.** No telemetry, no cloud sync.
+- **Changes to locked decisions require an RFC** ([rfc/README.md](docs/rfc/README.md)) and a superseding ADR.
+- **Canonical names live in docs/03-domain-model.md and docs/05-services.md** — reuse, never invent parallel names.
+- **Conventional Commits**: `feat:`, `fix:`, `docs:`, `refactor:`. Commit after each phase/feature; do not batch unrelated changes.
+- **Living docs** — after EVERY completed task, before ending the turn: update docs/PROGRESS.md (status block, checklist, session log). Business/scope changes also update docs/PRODUCT.md + a PROGRESS decisions-log row. New ideas or deferred work go to docs/TODO.md immediately, never left in conversation. MAJOR decisions get a docs/DECISIONS.md entry in the same turn. If code and docs disagree, fix the docs in the same commit.
+
+## Implementation reference
 
 When implementation begins:
-- Crate layout follows [14-project-layout.md](docs/14-project-layout.md)
-- Code standards follow [15-coding-standards.md](docs/15-coding-standards.md)
+- Crate layout: [docs/14-project-layout.md](docs/14-project-layout.md)
+- Code standards: [docs/15-coding-standards.md](docs/15-coding-standards.md)
+
+## Current phase
+
+Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
+Phase: 0 — not started.
