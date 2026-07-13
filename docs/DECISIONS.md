@@ -32,6 +32,7 @@
 | D10 | 2026-07-13 | Capability-gated roadmap phases over date-based milestones | User (setup) |
 | D11 | 2026-07-13 | Lorekeeper living-docs system adopted; PRODUCT/PROGRESS/TODO/DECISIONS bootstrapped | User + Claude |
 | D12 | 2026-07-13 | MIT license chosen as working default — closes OD#2 | Claude (Phase 0) |
+| D13 | 2026-07-13 | PR review-based development workflow — branch → PR → /code-review → user approval → merge | User |
 
 ---
 
@@ -140,3 +141,12 @@
 **Decision**: `license = "MIT"` set in `[workspace.package]` and inherited by all crates via `license.workspace = true`. OD#2 is closed.
 **Why**: `cargo deny check` requires a license field on all workspace crates. MIT is permissive, compatible with all current dependencies, does not restrict plugin authors, and can be superseded before any public release if a copyleft strategy is preferred. Choosing MIT now unblocks CI without foreclosing the AGPL option — a superseding ADR can change it before the repo goes public.
 **Consequences**: MIT is the legal default until explicitly superseded. Any license change before public release requires a new DECISIONS.md entry (D13+) and updating `Cargo.toml`. If the project goes AGPL, the entire commit history will carry the MIT header for early commits — inform legal if this matters.
+
+---
+
+## D13 — PR review-based development workflow (2026-07-13)
+
+**By**: User.
+**Decision**: All feature-level work (Phase checklist items) follows: `feature-dev` skill → `git checkout -b feat/ph<N>-<slug>` → implement → `/code-review` → `gh pr create` → user approves → `gh pr merge`. No direct pushes to `main`. Enforced locally by `.github/hooks/pre-push` (installed via `scripts/setup.sh`). Branch prefixes: `feat/ph<N>-*`, `fix/*`, `docs/*`, `chore/*`.
+**Why**: Agents working directly on `main` bypass review. A lightweight push-gate plus a CLAUDE.md hard rule ensures both human and agent work goes through review before landing. Approach A (CLAUDE.md rule + local git hook) chosen over heavier Claude Code PreToolUse hooks for simplicity.
+**Consequences**: Every feature branch requires a PR and a `/code-review` pass before merge. Trivial one-line doc corrections in the same session may still land directly — use judgment. GitHub server-side branch protection is optional at this stage.

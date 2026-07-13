@@ -89,6 +89,7 @@ cargo fmt --check            # format check
 cargo clippy -- -D warnings  # lint (treat warnings as errors)
 cargo test                   # unit + integration tests
 cargo deny check             # dependency audit (set up in Phase 0)
+bash scripts/setup.sh        # install git hooks (run once after clone)
 ```
 
 ## Hard rules
@@ -104,6 +105,7 @@ cargo deny check             # dependency audit (set up in Phase 0)
 - **Canonical names live in docs/03-domain-model.md and docs/05-services.md** — reuse, never invent parallel names.
 - **Conventional Commits**: `feat:`, `fix:`, `docs:`, `refactor:`. Commit after each phase/feature; do not batch unrelated changes.
 - **Living docs** — after EVERY completed task, before ending the turn: update docs/PROGRESS.md (status block, checklist, session log). Business/scope changes also update docs/PRODUCT.md + a PROGRESS decisions-log row. New ideas or deferred work go to docs/TODO.md immediately, never left in conversation. MAJOR decisions get a docs/DECISIONS.md entry in the same turn. If code and docs disagree, fix the docs in the same commit.
+- **Feature work follows branch → PR → review → merge.** Every Phase checklist item goes through: `feature-dev` skill → `git checkout -b feat/ph<N>-<slug>` → implement → `/code-review` → `gh pr create` → user approves → `gh pr merge`. No direct commits to main for feature work. Branch prefixes: `feat/ph<N>-*`, `fix/*`, `docs/*`, `chore/*`. — see D13.
 
 ## Implementation reference
 

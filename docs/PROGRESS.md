@@ -82,9 +82,10 @@
 | 2026-07-13 | Internal semantic engine, not LSP | → D9 |
 | 2026-07-13 | Capability-gated roadmap phases over date-based milestones | → D10 |
 | 2026-07-13 | Lorekeeper living-docs adopted | → D11 |
+| 2026-07-13 | PR review-based workflow adopted — branch → PR → /code-review → user approval | → D13 |
 
 ## Session log
 
 | Date | Phase | What was done | Follow-ups |
 |---|---|---|---|
-| 2026-07-13 | Phase 0 | Architecture suite (16 docs + 9 ADRs + RFC) written; Cargo workspace + 5 crates scaffolded; domain types (15 tests), event bus (6), service registry (5), workspace manifest (4), storage (6) implemented; CI workflow + cargo-deny configured; MIT license set (→ D12); all 8 exit criteria verified | Resolve OD#5, begin Phase 1 |
+| 2026-07-13 | Phase 0 | Architecture suite (16 docs + 9 ADRs + RFC) written; Cargo workspace + 5 crates scaffolded; domain types (15 tests), event bus (6), service registry (5), workspace manifest (4), storage (6) implemented; CI workflow + cargo-deny configured; MIT license set (→ D12); all 8 exit criteria verified; PR review workflow (D13) adopted: pre-push hook + setup script + CLAUDE.md hard rule | Resolve OD#5, begin Phase 1; run bash scripts/setup.sh in each new worktree |

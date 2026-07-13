@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+while read local_ref local_sha remote_ref remote_sha; do
+  if [[ "$remote_ref" == "refs/heads/main" ]]; then
+    echo "ERROR: Direct push to main blocked. Open a PR from a feat/*, fix/*, docs/*, or chore/* branch."
+    exit 1
+  fi
+done
+exit 0
