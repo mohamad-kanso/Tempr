@@ -114,4 +114,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — not started.
+Phase: 0 — complete (2026-07-13). Phase 1 — not started.

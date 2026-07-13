@@ -1,0 +1,19 @@
+[package]
+name              = "tempr_services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tempr_domain.workspace = true
+tempr_events.workspace = true
+
+async-trait.workspace  = true
+parking_lot.workspace  = true
+thiserror.workspace    = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

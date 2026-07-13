@@ -19,14 +19,14 @@
 
 Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 
-### 1. Foundations (Phase 0)
-- 🔜 Cargo workspace builds with zero warnings on Linux, macOS, Windows
-- 🔜 Domain types (`Workspace`, `Connection`, `Query`, `Result`) compile and pass unit tests
-- 🔜 Event bus dispatches typed events to registered handlers with verified ordering guarantees
-- 🔜 Service registry supports registration, lookup, and lifecycle (start/stop)
-- 🔜 Workspace file format is read/write round-trip safe; malformed files produce structured errors
-- 🔜 Storage layer writes and reads structured data to the platform-specific data directory
-- 🔜 CI pipeline runs `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo deny` on every push
+### 1. Foundations (Phase 0) ✅
+- ✅ Cargo workspace builds with zero warnings on Linux, macOS, Windows
+- ✅ Domain types (`Workspace`, `Connection`, `Query`, `Result`) compile and pass unit tests
+- ✅ Event bus dispatches typed events to registered handlers with verified ordering guarantees
+- ✅ Service registry supports registration, lookup, and lifecycle (start/stop)
+- ✅ Workspace file format is read/write round-trip safe; malformed files produce structured errors
+- ✅ Storage layer writes and reads structured data to the platform-specific data directory
+- ✅ CI pipeline runs `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo deny` on every push
 - ✅ All 16 architecture docs exist and cross-reference correctly
 - AC: `cargo test` exits 0. Malformed workspace manifest produces a typed error, not a panic. Event bus delivers events to all registered handlers in registration order.
 
@@ -101,7 +101,6 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 | # | Question | Options / leaning | Blocking? |
 |---|---|---|---|
 | 1 | **Name & branding** — "Tempr" is a working name; logo, domain needed | Keep "Tempr" vs. rename; no strong leaning yet | Blocks any public release or repo exposure |
-| 2 | **License** — AGPL, GPL, or MIT/Apache dual? | AGPL leans toward protecting open-source but may deter plugin authors; MIT/Apache broader adoption; no decision yet | Blocks publishing the repository publicly |
 | 3 | **Telemetry policy** — even anonymized telemetry requires explicit opt-in | Opt-in only (product invariant already set); policy text and toggle UX need design | Blocks Phase 4 / any beta |
 | 4 | **Beta program timing** — after Phase 2 (usable editor) or Phase 3 (intelligence)? | Earlier = more feedback but rougher experience | Affects Phase 3/4 sequencing |
 | 5 | **GPUI fork strategy** — maintain a fork or depend on upstream? | Upstream is simpler but risks breaking changes; fork gives control but adds maintenance | Affects Phase 0 Cargo setup and ongoing maintenance |

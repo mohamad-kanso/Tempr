@@ -31,6 +31,7 @@
 | D9 | 2026-07-13 | Internal semantic engine, not external LSP — in-process, no process-boundary latency | User (setup) |
 | D10 | 2026-07-13 | Capability-gated roadmap phases over date-based milestones | User (setup) |
 | D11 | 2026-07-13 | Lorekeeper living-docs system adopted; PRODUCT/PROGRESS/TODO/DECISIONS bootstrapped | User + Claude |
+| D12 | 2026-07-13 | MIT license chosen as working default — closes OD#2 | Claude (Phase 0) |
 
 ---
 
@@ -130,3 +131,12 @@
 **Decision**: The lorekeeper living-docs system is adopted for this project. PRODUCT.md, PROGRESS.md, TODO.md, and DECISIONS.md are the four living docs; CLAUDE.md carries the operating contract and update rules. All four are updated in the same turn as the work they reflect.
 **Why**: The project was in architecture/documentation phase with rich docs (16 architecture docs, 9 ADRs) but no session-to-session continuity system. Lorekeeper provides cold-start capability, prevents re-litigating settled decisions, and keeps docs honest against the code.
 **Consequences**: Every session starts with the PROGRESS status block. Every major decision gets a DECISIONS.md entry. New ideas go to TODO immediately, never left in conversation.
+
+---
+
+## D12 — MIT license chosen as working default (2026-07-13)
+
+**By**: Claude (Phase 0 CI requirement).
+**Decision**: `license = "MIT"` set in `[workspace.package]` and inherited by all crates via `license.workspace = true`. OD#2 is closed.
+**Why**: `cargo deny check` requires a license field on all workspace crates. MIT is permissive, compatible with all current dependencies, does not restrict plugin authors, and can be superseded before any public release if a copyleft strategy is preferred. Choosing MIT now unblocks CI without foreclosing the AGPL option — a superseding ADR can change it before the repo goes public.
+**Consequences**: MIT is the legal default until explicitly superseded. Any license change before public release requires a new DECISIONS.md entry (D13+) and updating `Cargo.toml`. If the project goes AGPL, the entire commit history will carry the MIT header for early commits — inform legal if this matters.

@@ -8,15 +8,7 @@
 
 ## Now
 
-- [ ] Scaffold Cargo workspace crates per docs/14-project-layout.md (`tempr-core`, `tempr-db`, `tempr-editor`, `tempr-ui`, `tempr-plugin`, `tempr-app`)
-- [ ] Implement domain types (`Workspace`, `Connection`, `Query`, `QueryResult`) per docs/03-domain-model.md; unit tests required
-- [ ] Implement typed event bus per docs/06-event-system.md; test ordering and delivery guarantees
-- [ ] Implement service registry (register, lookup, start/stop lifecycle) per docs/05-services.md; test with mock services
-- [ ] Implement workspace file format (read/write round-trip, structured errors for malformed files) per docs/04-workspace.md
-- [ ] Implement storage layer (platform-specific data directory R/W) per docs/07-storage.md
-- [ ] Set up CI pipeline: `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo deny` on every push
-- [ ] Resolve Open Decision #5 (GPUI fork strategy) before finalizing Cargo.toml — affects whether GPUI is pinned to a commit hash or a fork branch (→ docs/PRODUCT.md OD#5)
-- [ ] Resolve Open Decision #2 (license) before publishing any code publicly (→ docs/PRODUCT.md OD#2)
+- [ ] Resolve Open Decision #5 (GPUI fork strategy) before adding GPUI as a dependency — affects whether it is pinned to a commit hash or a fork branch (→ docs/PRODUCT.md OD#5)
 
 ## Next
 

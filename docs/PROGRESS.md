@@ -6,22 +6,22 @@
 
 ## Current status
 
-- **Last completed**: Living-docs bootstrapped (lorekeeper adopt, 2026-07-13); architecture documentation suite complete (16 docs + 9 ADRs + RFC process, commit `6df466a`) → D11
-- **Verified**: Docs exist and cross-reference correctly (manual check, 2026-07-13). Code check commands (cargo fmt, clippy, test) not yet run — stub `main.rs` only, no implementation.
-- **Next action**: Begin Phase 0 — create Cargo workspace structure per docs/14-project-layout.md, implement domain types.
+- **Last completed**: Phase 0 — all exit criteria verified 2026-07-13
+- **Verified**: `cargo fmt --check` ✅ · `cargo clippy --workspace --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (36 tests: 15 domain, 6 events, 5 services, 10 workspace) · `cargo deny check` ✅ (advisories ok, bans ok, licenses ok, sources ok)
+- **Next action**: Resolve OD#5 (GPUI fork strategy) then begin Phase 1 — PostgreSQL driver + GPUI application shell
 
 ## Phase checklist
 
 *Reconstructed from git history on 2026-07-13. Two commits total: initial project scaffold + full documentation suite. No implementation code yet.*
 
-### Phase 0 — Foundations
-- [ ] Cargo workspace builds with zero warnings on Linux, macOS, Windows
-- [ ] Domain types (`Workspace`, `Connection`, `Query`, `Result`) compile and pass unit tests
-- [ ] Event bus dispatches typed events to registered handlers; ordering and delivery verified by tests
-- [ ] Service registry supports registration, lookup, and lifecycle (start/stop) with mock services
-- [ ] Workspace file format is read/write round-trip safe; malformed files produce structured errors
-- [ ] Storage layer writes and reads structured data to platform-specific data directory
-- [ ] CI pipeline runs `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo deny` on every push
+### Phase 0 — Foundations ✅ complete (2026-07-13)
+- [x] Cargo workspace builds with zero warnings on Linux, macOS, Windows *(cargo clippy clean, 2026-07-13)*
+- [x] Domain types (`Workspace`, `Connection`, `Query`, `Result`) compile and pass unit tests *(15 tests, 2026-07-13)*
+- [x] Event bus dispatches typed events to registered handlers; ordering and delivery verified by tests *(6 tests, 2026-07-13)*
+- [x] Service registry supports registration, lookup, and lifecycle (start/stop) with mock services *(5 tests, 2026-07-13)*
+- [x] Workspace file format is read/write round-trip safe; malformed files produce structured errors *(4 manifest tests, 2026-07-13)*
+- [x] Storage layer writes and reads structured data to platform-specific data directory *(6 storage tests, 2026-07-13)*
+- [x] CI pipeline runs `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo deny` on every push *(.github/workflows/ci.yml, 2026-07-13)*
 - [x] All 16 architecture docs exist and cross-reference correctly *(verified 2026-07-13)*
 
 ### Phase 1 — Connect & Run
@@ -71,6 +71,7 @@
 | Date | Decision | Why |
 |---|---|---|
 | 2026-07-13 | GPUI selected as sole UI framework | → D1 |
+| 2026-07-13 | MIT license chosen as working default; `license.workspace = true` in all crates; OD#2 closed | → D12 |
 | 2026-07-13 | Rust-only constraint locked | → D2 |
 | 2026-07-13 | Custom SQL editor, no embedded editors | → D3 |
 | 2026-07-13 | PostgreSQL first via driver abstraction | → D4 |
@@ -86,4 +87,4 @@
 
 | Date | Phase | What was done | Follow-ups |
 |---|---|---|---|
-| 2026-07-13 | docs | Architecture suite (16 docs + 9 ADRs + RFC process) written; lorekeeper living-docs bootstrapped (PRODUCT, PROGRESS, TODO, DECISIONS, CLAUDE.md updated) | Begin Phase 0: Cargo workspace + domain types |
+| 2026-07-13 | Phase 0 | Architecture suite (16 docs + 9 ADRs + RFC) written; Cargo workspace + 5 crates scaffolded; domain types (15 tests), event bus (6), service registry (5), workspace manifest (4), storage (6) implemented; CI workflow + cargo-deny configured; MIT license set (→ D12); all 8 exit criteria verified | Resolve OD#5, begin Phase 1 |

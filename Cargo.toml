@@ -1,10 +1,56 @@
-[package]
-name = "tempr"
+[workspace]
+members = [
+    "crates/tempr",
+    "crates/tempr_domain",
+    "crates/tempr_events",
+    "crates/tempr_services",
+    "crates/tempr_workspace",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+[workspace.dependencies]
+# Internal crates
+tempr_domain    = { path = "crates/tempr_domain" }
+tempr_events    = { path = "crates/tempr_events" }
+tempr_services  = { path = "crates/tempr_services" }
+tempr_workspace = { path = "crates/tempr_workspace" }
 
-[profile.release]
-opt-level = 3
+# Async
+async-trait = "0.1"
+tokio       = { version = "1", features = ["full"] }
+
+# Data / serialisation
+chrono      = { version = "0.4", features = ["serde"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+uuid        = { version = "1", features = ["v4", "serde"] }
+
+# Error handling
+anyhow    = "1"
+thiserror = "2"
+
+# Platform directories
+dirs = "5"
+
+parking_lot = "0.12"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Testing
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code   = "forbid"
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+unwrap_used  = "warn"
+expect_used  = "warn"
