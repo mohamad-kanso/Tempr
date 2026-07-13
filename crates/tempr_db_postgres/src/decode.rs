@@ -10,10 +10,13 @@ pub(crate) fn decode_value(pg_type: &Type, raw: Option<&str>) -> Result<Value, S
     };
 
     match *pg_type {
-        Type::BOOL => text
-            .parse::<bool>()
-            .map(Value::Bool)
-            .map_err(|e| e.to_string()),
+        Type::BOOL => match text {
+            "t" | "true" | "1" => Ok(Value::Bool(true)),
+            "f" | "false" | "0" => Ok(Value::Bool(false)),
+            other => Err(format!(
+                "provided string was not `true` or `false`: {other}"
+            )),
+        },
         Type::INT2 => text
             .parse::<i16>()
             .map(|v| Value::Int8(v as i64))
@@ -43,15 +46,36 @@ pub(crate) fn decode_value(pg_type: &Type, raw: Option<&str>) -> Result<Value, S
         Type::JSON | Type::JSONB => serde_json::from_str(text)
             .map(Value::Json)
             .map_err(|e| e.to_string()),
-        Type::TIMESTAMPTZ | Type::TIMESTAMP => text
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .map(Value::Timestamp)
-            .or_else(|_| {
-                text.parse::<chrono::NaiveDateTime>().map(|dt| {
-                    Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc))
-                })
-            })
-            .map_err(|e| e.to_string()),
+        Type::TIMESTAMPTZ | Type::TIMESTAMP => {
+            // Try RFC3339 first (e.g. "2025-01-15T10:30:00+00:00")
+            if let Ok(dt) = text.parse::<chrono::DateTime<chrono::Utc>>() {
+                return Ok(Value::Timestamp(dt));
+            }
+            // Try with timezone offset formats PostgreSQL uses
+            for fmt in &["%Y-%m-%d %H:%M:%S%:z", "%Y-%m-%d %H:%M:%S%.f%:z"] {
+                if let Ok(dt) = chrono::DateTime::parse_from_str(text, fmt) {
+                    return Ok(Value::Timestamp(dt.with_timezone(&chrono::Utc)));
+                }
+            }
+            // PostgreSQL sometimes emits just "+00" without minutes — expand it
+            if text.ends_with("+00") || text.ends_with("-00") {
+                let expanded = format!("{}:00", text);
+                for fmt in &["%Y-%m-%d %H:%M:%S%:z", "%Y-%m-%d %H:%M:%S%.f%:z"] {
+                    if let Ok(dt) = chrono::DateTime::parse_from_str(&expanded, fmt) {
+                        return Ok(Value::Timestamp(dt.with_timezone(&chrono::Utc)));
+                    }
+                }
+            }
+            // Try naive datetime without timezone
+            for fmt in &["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
+                    return Ok(Value::Timestamp(
+                        chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc),
+                    ));
+                }
+            }
+            Err(format!("cannot parse timestamp: {text}"))
+        }
         Type::DATE => text
             .parse::<chrono::NaiveDate>()
             .map(Value::Date)

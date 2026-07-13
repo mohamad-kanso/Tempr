@@ -88,12 +88,11 @@ async fn main() -> Result<()> {
     // Register core services
     let connection_service = ConnectionService::new(bus.clone());
     let _query_service = QueryService::new(bus.clone(), connection_service.clone());
-    let schema_service = SchemaService::new(bus.clone(), connection_service.clone());
+    let _schema_service = SchemaService::new(bus.clone(), connection_service.clone());
 
     // Register PostgreSQL driver
     let pg_driver = Arc::new(PostgresDriver::new()) as Arc<dyn DatabaseDriver>;
-    connection_service.register_driver(pg_driver.clone());
-    schema_service.register_driver(pg_driver.clone());
+    connection_service.register_driver(pg_driver);
 
     registry.register(DemoService::new(bus.clone()));
     registry.start_all().await?;

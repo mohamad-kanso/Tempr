@@ -18,6 +18,7 @@ pub struct QueryService {
     event_bus: Arc<EventBus>,
     connection_service: Arc<ConnectionService>,
     active_runs: RwLock<HashMap<QueryRunId, ActiveRun>>,
+    completed_runs: RwLock<HashMap<QueryRunId, QueryRun>>,
 }
 
 impl QueryService {
@@ -26,6 +27,7 @@ impl QueryService {
             event_bus,
             connection_service,
             active_runs: RwLock::new(HashMap::new()),
+            completed_runs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -112,7 +114,7 @@ impl QueryService {
             .await;
 
         let mut active_runs = self.active_runs.write();
-        if let Some(active) = active_runs.get_mut(&run_id) {
+        if let Some(mut active) = active_runs.remove(&run_id) {
             match &result {
                 Ok(result_set) => {
                     active.query_run.outcome = QueryOutcome::Success;
@@ -132,12 +134,12 @@ impl QueryService {
                     });
                 }
             }
+            self.completed_runs.write().insert(run_id, active.query_run);
         }
-        active_runs.remove(&run_id);
 
         result
             .map(|_| run_id)
-            .map_err(|e| ServiceError::StartupFailed {
+            .map_err(|e| ServiceError::QueryFailed {
                 name: "QueryService",
                 reason: e.to_string(),
             })
@@ -154,5 +156,72 @@ impl QueryService {
 
     pub fn active_runs(&self) -> Vec<QueryRunId> {
         self.active_runs.read().keys().copied().collect()
+    }
+
+    pub fn completed_run(&self, run_id: QueryRunId) -> Option<QueryRun> {
+        self.completed_runs.read().get(&run_id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use tempr_events::EventFilter;
+
+    fn make_event_bus() -> Arc<EventBus> {
+        Arc::new(EventBus::new())
+    }
+
+    #[tokio::test]
+    async fn active_runs_empty_initially() {
+        let bus = make_event_bus();
+        let cs = ConnectionService::new(bus.clone());
+        let svc = QueryService::new(bus, cs);
+        assert!(svc.active_runs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_fails_without_connection() {
+        let bus = make_event_bus();
+        let cs = ConnectionService::new(bus.clone());
+        let svc = QueryService::new(bus, cs);
+        let id = ConnectionId::new();
+        let result = svc.execute("SELECT 1", id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_publishes_event() {
+        let bus = make_event_bus();
+        let received: Arc<Mutex<Vec<tempr_events::AppEventKind>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let r = received.clone();
+        let _sub = bus.subscribe(EventFilter::All, move |event| {
+            r.lock().push(event.kind());
+        });
+
+        let cs = ConnectionService::new(bus.clone());
+        let svc = QueryService::new(bus, cs);
+        let run_id = QueryRunId::new();
+
+        svc.cancel(run_id).await.unwrap();
+
+        let events = received.lock();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, tempr_events::AppEventKind::QueryFinished)),
+            "expected QueryFinished event after cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_run_not_stored_without_execute() {
+        let bus = make_event_bus();
+        let cs = ConnectionService::new(bus.clone());
+        let svc = QueryService::new(bus, cs);
+        let run_id = QueryRunId::new();
+        assert!(svc.completed_run(run_id).is_none());
     }
 }

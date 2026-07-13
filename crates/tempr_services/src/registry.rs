@@ -12,6 +12,15 @@ pub enum ServiceError {
 
     #[error("service '{name}' failed to stop: {reason}")]
     ShutdownFailed { name: &'static str, reason: String },
+
+    #[error("query failed: {reason}")]
+    QueryFailed { name: &'static str, reason: String },
+
+    #[error("connection '{id}' not found")]
+    ConnectionNotFound { id: String },
+
+    #[error("connection '{id}' is in state {state}, expected Connected")]
+    NotConnected { id: String, state: &'static str },
 }
 
 /// Base contract every service must implement.
@@ -149,7 +158,6 @@ mod tests {
         fn name(&self) -> &'static str {
             "BetaService"
         }
-        // default no-op start/stop
     }
 
     #[tokio::test]

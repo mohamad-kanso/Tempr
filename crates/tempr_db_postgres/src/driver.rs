@@ -9,7 +9,6 @@ use crate::stream::PostgresStream;
 
 const DEFAULT_BATCH_SIZE: usize = 4000;
 
-/// PostgreSQL driver — wraps `tokio-postgres` behind the `DatabaseDriver` trait.
 pub struct PostgresDriver;
 
 impl Default for PostgresDriver {
@@ -68,7 +67,6 @@ impl DatabaseDriver for PostgresDriver {
     }
 }
 
-/// Active PostgreSQL connection — implements `DriverConnection`.
 struct PostgresConnection {
     client: tokio_postgres::Client,
     batch_size: usize,
@@ -98,7 +96,6 @@ impl DriverConnection for PostgresConnection {
             ));
         }
 
-        // Prepare statement to get column metadata
         let stmt = self
             .client
             .prepare(sql)
@@ -147,56 +144,94 @@ impl DriverConnection for PostgresConnection {
     ) -> Result<Vec<SchemaSnapshotEntry>, DriverError> {
         let mut entries = Vec::new();
 
-        let table_query = match &scope {
-            SchemaScope::All => "SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema')".to_string(),
-            SchemaScope::Schema(s) => format!("SELECT schemaname, tablename FROM pg_tables WHERE schemaname = '{s}'"),
-            SchemaScope::Table { schema, table } => format!("SELECT schemaname, tablename FROM pg_tables WHERE schemaname = '{schema}' AND tablename = '{table}'"),
-        };
-
-        if let Ok(rows) = self.client.query(&table_query, &[]).await {
-            for row in rows {
-                let schema: String = row.get(0);
-                let name: String = row.get(1);
-                entries.push(SchemaSnapshotEntry::Table {
-                    schema,
-                    name,
-                    estimated_rows: None,
-                });
+        // Tables — use parameterized queries to prevent SQL injection
+        match &scope {
+            SchemaScope::All => {
+                if let Ok(rows) = self
+                    .client
+                    .query(
+                        "SELECT schemaname, tablename FROM pg_tables \
+                         WHERE schemaname NOT IN ('pg_catalog', 'information_schema')",
+                        &[],
+                    )
+                    .await
+                {
+                    for row in rows {
+                        entries.push(SchemaSnapshotEntry::Table {
+                            schema: row.get(0),
+                            name: row.get(1),
+                            estimated_rows: None,
+                        });
+                    }
+                }
+            }
+            SchemaScope::Schema(s) => {
+                if let Ok(rows) = self
+                    .client
+                    .query(
+                        "SELECT schemaname, tablename FROM pg_tables WHERE schemaname = $1",
+                        &[s],
+                    )
+                    .await
+                {
+                    for row in rows {
+                        entries.push(SchemaSnapshotEntry::Table {
+                            schema: row.get(0),
+                            name: row.get(1),
+                            estimated_rows: None,
+                        });
+                    }
+                }
+            }
+            SchemaScope::Table { schema, table } => {
+                if let Ok(rows) = self
+                    .client
+                    .query(
+                        "SELECT schemaname, tablename FROM pg_tables \
+                         WHERE schemaname = $1 AND tablename = $2",
+                        &[schema, table],
+                    )
+                    .await
+                {
+                    for row in rows {
+                        entries.push(SchemaSnapshotEntry::Table {
+                            schema: row.get(0),
+                            name: row.get(1),
+                            estimated_rows: None,
+                        });
+                    }
+                }
             }
         }
 
-        let col_query = "SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position, column_default
-            FROM information_schema.columns
-            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY table_schema, table_name, ordinal_position";
+        // Columns
+        let col_query = "SELECT table_schema, table_name, column_name, data_type, \
+                         is_nullable, ordinal_position, column_default \
+                         FROM information_schema.columns \
+                         WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                         ORDER BY table_schema, table_name, ordinal_position";
 
         if let Ok(rows) = self.client.query(col_query, &[]).await {
             for row in rows {
-                let schema: String = row.get(0);
-                let table: String = row.get(1);
-                let name: String = row.get(2);
-                let data_type: String = row.get(3);
                 let nullable_str: Option<String> = row.get(4);
                 let ordinal: i32 = row.get(5);
-                let default: Option<String> = row.get(6);
                 entries.push(SchemaSnapshotEntry::Column {
-                    parent_schema: schema,
-                    parent_table: table,
-                    name,
-                    data_type,
+                    parent_schema: row.get(0),
+                    parent_table: row.get(1),
+                    name: row.get(2),
+                    data_type: row.get(3),
                     nullable: nullable_str.map(|s| s == "YES").unwrap_or(true),
                     ordinal: ordinal as usize,
-                    default,
+                    default: row.get(6),
                 });
             }
         }
 
-        let idx_query = "SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes WHERE schemaname NOT IN ('pg_catalog', 'information_schema')";
+        // Indexes
+        let idx_query = "SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes \
+             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')";
         if let Ok(rows) = self.client.query(idx_query, &[]).await {
             for row in rows {
-                let schema: String = row.get(0);
-                let table: String = row.get(1);
-                let name: String = row.get(2);
                 let indexdef: String = row.get(3);
                 let unique = indexdef.contains("UNIQUE");
                 let index_type = if indexdef.contains(" USING gin") {
@@ -207,9 +242,9 @@ impl DriverConnection for PostgresConnection {
                     "btree"
                 };
                 entries.push(SchemaSnapshotEntry::Index {
-                    parent_schema: schema,
-                    parent_table: table,
-                    name,
+                    parent_schema: row.get(0),
+                    parent_table: row.get(1),
+                    name: row.get(2),
                     columns: Vec::new(),
                     unique,
                     index_type: index_type.to_string(),
