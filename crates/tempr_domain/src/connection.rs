@@ -21,6 +21,16 @@ pub enum DriverKind {
     SQLite,
 }
 
+impl DriverKind {
+    pub fn engine_name(&self) -> &'static str {
+        match self {
+            DriverKind::Postgres => "postgresql",
+            DriverKind::MySQL => "mysql",
+            DriverKind::SQLite => "sqlite",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretRef {
     pub vault_key: String,
