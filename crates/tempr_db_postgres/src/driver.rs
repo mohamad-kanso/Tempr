@@ -1,24 +1,16 @@
 use tempr_db::stream::QueryStream;
 use tempr_db::{
-    DatabaseDriver, DriverConnection, DriverError, EngineId, SchemaScope, SchemaSnapshotEntry,
+    CancelHandle, DatabaseDriver, DriverConnection, DriverError, EngineId, SchemaScope,
+    SchemaSnapshotEntry,
 };
 use tempr_domain::{ColumnSpec, Connection, Value};
 use tokio_postgres::NoTls;
+use tokio_postgres::config::SslMode;
 
-use crate::decode::decode_value;
+use crate::params::{as_sql_refs, to_sql_params};
 use crate::stream::PostgresStream;
 
 const DEFAULT_BATCH_SIZE: usize = 4000;
-
-fn decode_pg_value(col: &tokio_postgres::Column, raw: Option<&str>) -> Value {
-    match raw {
-        Some(text) => decode_value(col.type_(), Some(text)).unwrap_or_else(|e| Value::Custom {
-            type_name: format!("decode_error: {e}"),
-            raw_bytes: Vec::new(),
-        }),
-        None => Value::Null,
-    }
-}
 
 pub struct PostgresDriver;
 
@@ -44,32 +36,31 @@ impl DatabaseDriver for PostgresDriver {
         &self,
         connection: &Connection,
     ) -> Result<Box<dyn DriverConnection>, DriverError> {
-        let host = &connection.host;
-        let port = connection.port;
-        let dbname = &connection.database;
-        let user = &connection.username;
-        let password = &connection.password;
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(&connection.host)
+            .port(connection.port)
+            .dbname(&connection.database)
+            .user(&connection.username)
+            .password(&connection.password)
+            // No TLS connector is wired up yet (see docs/09-database-engine.md
+            // follow-up) — `Prefer` communicates intent without breaking
+            // today's plaintext-only connections the way `Require` would.
+            .ssl_mode(SslMode::Prefer);
 
-        let conn_str = format!(
-            "host={host} port={port} dbname={dbname} user={user} password={password} sslmode=disable"
-        );
-
-        let (client, connection_handle) =
-            tokio_postgres::connect(&conn_str, NoTls)
-                .await
-                .map_err(|e| {
-                    if e.to_string().contains("password authentication failed")
-                        || e.to_string().contains("Authentication failure")
-                    {
-                        DriverError::AuthFailed(e.to_string())
-                    } else {
-                        DriverError::ConnectionRefused(e.to_string())
-                    }
-                })?;
+        let (client, connection_handle) = config.connect(NoTls).await.map_err(|e| {
+            if e.to_string().contains("password authentication failed")
+                || e.to_string().contains("Authentication failure")
+            {
+                DriverError::AuthFailed(e.to_string())
+            } else {
+                DriverError::ConnectionRefused(e.to_string())
+            }
+        })?;
 
         tokio::spawn(async move {
             if let Err(e) = connection_handle.await {
-                tracing::error!("PostgreSQL connection task error: {e}");
+                tracing::error!("Postgres connection task failed: {e:?}");
             }
         });
 
@@ -85,22 +76,35 @@ struct PostgresConnection {
     batch_size: usize,
 }
 
+struct PostgresCancelHandle(tokio_postgres::CancelToken);
+
+#[async_trait::async_trait]
+impl CancelHandle for PostgresCancelHandle {
+    async fn cancel(&self) -> Result<(), DriverError> {
+        self.0
+            .cancel_query(NoTls)
+            .await
+            .map_err(|e| DriverError::Internal(format!("cancel failed: {e}")))
+    }
+}
+
 #[async_trait::async_trait]
 impl DriverConnection for PostgresConnection {
-    async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryStream, DriverError> {
-        let trimmed = sql.trim().to_uppercase();
-        let is_dml = trimmed.starts_with("INSERT")
-            || trimmed.starts_with("UPDATE")
-            || trimmed.starts_with("DELETE")
-            || trimmed.starts_with("CREATE")
-            || trimmed.starts_with("ALTER")
-            || trimmed.starts_with("DROP")
-            || trimmed.starts_with("TRUNCATE");
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream, DriverError> {
+        let owned_params = to_sql_params(params);
+        let sql_params = as_sql_refs(&owned_params);
 
-        if is_dml {
+        let stmt = self
+            .client
+            .prepare(sql)
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?;
+
+        if stmt.columns().is_empty() {
+            // No result columns: DDL/DML with no RETURNING clause.
             let rows_affected = self
                 .client
-                .execute(sql, &[])
+                .execute(&stmt, &sql_params)
                 .await
                 .map_err(|e| DriverError::Query(e.to_string()))?;
             return Ok(QueryStream::new(
@@ -108,12 +112,6 @@ impl DriverConnection for PostgresConnection {
                 self.batch_size,
             ));
         }
-
-        let stmt = self
-            .client
-            .prepare(sql)
-            .await
-            .map_err(|e| DriverError::Query(e.to_string()))?;
 
         let columns: Vec<ColumnSpec> = stmt
             .columns()
@@ -132,41 +130,22 @@ impl DriverConnection for PostgresConnection {
 
         let rows = self
             .client
-            .query(&stmt, &[])
+            .query(&stmt, &sql_params)
             .await
             .map_err(|e| DriverError::Query(e.to_string()))?;
 
-        let all_values: Vec<Vec<Value>> = rows
-            .iter()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| {
-                        let raw: Option<String> = row.try_get(i).ok().flatten();
-                        decode_pg_value(col, raw.as_deref())
-                    })
-                    .collect()
-            })
-            .collect();
-
         Ok(QueryStream::new(
-            Box::new(PostgresStream::from_rows(
-                columns,
-                all_values,
-                self.batch_size,
-            )),
+            Box::new(PostgresStream::from_rows(columns, rows, self.batch_size)),
             self.batch_size,
         ))
     }
 
     async fn cancel(&mut self) -> Result<(), DriverError> {
-        self.client
-            .cancel_token()
-            .cancel_query(NoTls)
-            .await
-            .map_err(|e| DriverError::Internal(format!("cancel failed: {e}")))?;
-        Ok(())
+        self.cancel_handle().cancel().await
+    }
+
+    fn cancel_handle(&self) -> Box<dyn CancelHandle> {
+        Box::new(PostgresCancelHandle(self.client.cancel_token()))
     }
 
     async fn snapshot_schema(
@@ -175,10 +154,10 @@ impl DriverConnection for PostgresConnection {
     ) -> Result<Vec<SchemaSnapshotEntry>, DriverError> {
         let mut entries = Vec::new();
 
-        // Tables — use parameterized queries to prevent SQL injection
+        // Tables — parameterized to prevent SQL injection and to honor scope.
         match &scope {
             SchemaScope::All => {
-                if let Ok(rows) = self
+                let rows = self
                     .client
                     .query(
                         "SELECT schemaname, tablename FROM pg_tables \
@@ -186,36 +165,34 @@ impl DriverConnection for PostgresConnection {
                         &[],
                     )
                     .await
-                {
-                    for row in rows {
-                        entries.push(SchemaSnapshotEntry::Table {
-                            schema: row.get(0),
-                            name: row.get(1),
-                            estimated_rows: None,
-                        });
-                    }
+                    .map_err(|e| DriverError::Query(e.to_string()))?;
+                for row in rows {
+                    entries.push(SchemaSnapshotEntry::Table {
+                        schema: row.get(0),
+                        name: row.get(1),
+                        estimated_rows: None,
+                    });
                 }
             }
             SchemaScope::Schema(s) => {
-                if let Ok(rows) = self
+                let rows = self
                     .client
                     .query(
                         "SELECT schemaname, tablename FROM pg_tables WHERE schemaname = $1",
                         &[s],
                     )
                     .await
-                {
-                    for row in rows {
-                        entries.push(SchemaSnapshotEntry::Table {
-                            schema: row.get(0),
-                            name: row.get(1),
-                            estimated_rows: None,
-                        });
-                    }
+                    .map_err(|e| DriverError::Query(e.to_string()))?;
+                for row in rows {
+                    entries.push(SchemaSnapshotEntry::Table {
+                        schema: row.get(0),
+                        name: row.get(1),
+                        estimated_rows: None,
+                    });
                 }
             }
             SchemaScope::Table { schema, table } => {
-                if let Ok(rows) = self
+                let rows = self
                     .client
                     .query(
                         "SELECT schemaname, tablename FROM pg_tables \
@@ -223,64 +200,118 @@ impl DriverConnection for PostgresConnection {
                         &[schema, table],
                     )
                     .await
-                {
-                    for row in rows {
-                        entries.push(SchemaSnapshotEntry::Table {
-                            schema: row.get(0),
-                            name: row.get(1),
-                            estimated_rows: None,
-                        });
-                    }
+                    .map_err(|e| DriverError::Query(e.to_string()))?;
+                for row in rows {
+                    entries.push(SchemaSnapshotEntry::Table {
+                        schema: row.get(0),
+                        name: row.get(1),
+                        estimated_rows: None,
+                    });
                 }
             }
         }
 
-        // Columns
-        let col_query = "SELECT table_schema, table_name, column_name, data_type, \
-                         is_nullable, ordinal_position, column_default \
-                         FROM information_schema.columns \
-                         WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                         ORDER BY table_schema, table_name, ordinal_position";
-
-        if let Ok(rows) = self.client.query(col_query, &[]).await {
-            for row in rows {
-                let nullable_str: Option<String> = row.get(4);
-                let ordinal: i32 = row.get(5);
-                entries.push(SchemaSnapshotEntry::Column {
-                    parent_schema: row.get(0),
-                    parent_table: row.get(1),
-                    name: row.get(2),
-                    data_type: row.get(3),
-                    nullable: nullable_str.map(|s| s == "YES").unwrap_or(true),
-                    ordinal: ordinal as usize,
-                    default: row.get(6),
-                });
+        // Columns — same scope filter as the table query above.
+        let col_rows = match &scope {
+            SchemaScope::All => {
+                self.client
+                    .query(
+                        "SELECT table_schema, table_name, column_name, data_type, \
+                     is_nullable, ordinal_position, column_default \
+                     FROM information_schema.columns \
+                     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                     ORDER BY table_schema, table_name, ordinal_position",
+                        &[],
+                    )
+                    .await
+            }
+            SchemaScope::Schema(s) => {
+                self.client
+                    .query(
+                        "SELECT table_schema, table_name, column_name, data_type, \
+                     is_nullable, ordinal_position, column_default \
+                     FROM information_schema.columns \
+                     WHERE table_schema = $1 \
+                     ORDER BY table_schema, table_name, ordinal_position",
+                        &[s],
+                    )
+                    .await
+            }
+            SchemaScope::Table { schema, table } => {
+                self.client
+                    .query(
+                        "SELECT table_schema, table_name, column_name, data_type, \
+                     is_nullable, ordinal_position, column_default \
+                     FROM information_schema.columns \
+                     WHERE table_schema = $1 AND table_name = $2 \
+                     ORDER BY table_schema, table_name, ordinal_position",
+                        &[schema, table],
+                    )
+                    .await
             }
         }
+        .map_err(|e| DriverError::Query(e.to_string()))?;
 
-        // Indexes
-        let idx_query = "SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes \
-             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')";
-        if let Ok(rows) = self.client.query(idx_query, &[]).await {
-            for row in rows {
-                let indexdef: String = row.get(3);
-                let unique = indexdef.contains("UNIQUE");
-                let index_type = if indexdef.contains(" USING gin") {
-                    "gin"
-                } else if indexdef.contains(" USING hash") {
-                    "hash"
-                } else {
-                    "btree"
-                };
-                entries.push(SchemaSnapshotEntry::Index {
-                    parent_schema: row.get(0),
-                    parent_table: row.get(1),
-                    name: row.get(2),
-                    columns: Vec::new(),
-                    unique,
-                    index_type: index_type.to_string(),
-                });
+        for row in col_rows {
+            let nullable_str: Option<String> = row.get(4);
+            let ordinal: i32 = row.get(5);
+            entries.push(SchemaSnapshotEntry::Column {
+                parent_schema: row.get(0),
+                parent_table: row.get(1),
+                name: row.get(2),
+                data_type: row.get(3),
+                nullable: nullable_str.map(|s| s == "YES").unwrap_or(true),
+                ordinal: ordinal as usize,
+                default: row.get(6),
+            });
+        }
+
+        // Indexes — join pg_index/pg_attribute directly for exact, ordered
+        // column names instead of parsing `indexdef` text (which breaks on
+        // expression indexes and multi-word index types).
+        const IDX_SELECT: &str = "SELECT n.nspname, t.relname, i.relname, ix.indisunique, \
+             am.amname, array_agg(a.attname ORDER BY x.ordinality) \
+             FROM pg_index ix \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_class t ON t.oid = ix.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             JOIN pg_am am ON am.oid = i.relam \
+             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS x(attnum, ordinality) ON true \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = x.attnum";
+        const IDX_GROUP_BY: &str =
+            "GROUP BY n.nspname, t.relname, i.relname, ix.indisunique, am.amname";
+
+        let idx_rows = match &scope {
+            SchemaScope::All => {
+                let sql = format!(
+                    "{IDX_SELECT} WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') {IDX_GROUP_BY}"
+                );
+                self.client.query(&sql, &[]).await
             }
+            SchemaScope::Schema(s) => {
+                let sql = format!("{IDX_SELECT} WHERE n.nspname = $1 {IDX_GROUP_BY}");
+                self.client.query(&sql, &[s]).await
+            }
+            SchemaScope::Table { schema, table } => {
+                let sql =
+                    format!("{IDX_SELECT} WHERE n.nspname = $1 AND t.relname = $2 {IDX_GROUP_BY}");
+                self.client.query(&sql, &[schema, table]).await
+            }
+        }
+        .map_err(|e| DriverError::Query(e.to_string()))?;
+
+        for row in idx_rows {
+            let unique: bool = row.get(3);
+            let index_type: String = row.get(4);
+            let columns: Vec<String> = row.get(5);
+            entries.push(SchemaSnapshotEntry::Index {
+                parent_schema: row.get(0),
+                parent_table: row.get(1),
+                name: row.get(2),
+                columns,
+                unique,
+                index_type,
+            });
         }
 
         Ok(entries)

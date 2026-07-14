@@ -1,92 +1,72 @@
 use postgres_types::Type;
 use tempr_domain::Value;
+use tokio_postgres::Row;
+use tokio_postgres::types::FromSql;
 
-/// Map a PostgreSQL type OID and raw text value to a `Value`.
-/// PostgreSQL text-format output is assumed (used by `query_raw` and `COPY`).
-pub(crate) fn decode_value(pg_type: &Type, raw: Option<&str>) -> Result<Value, String> {
-    let text = match raw {
-        Some(t) => t,
-        None => return Ok(Value::Null),
-    };
+/// Captures a column's raw binary-protocol bytes for types with no
+/// dedicated decoder below (accepts every OID).
+struct RawBytes(Vec<u8>);
+
+impl<'a> FromSql<'a> for RawBytes {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RawBytes(raw.to_vec()))
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+}
+
+/// Decode column `i` of `row` into a `Value`, dispatching on the column's
+/// actual PostgreSQL type. `tokio-postgres` always transmits results in
+/// binary format, so decoding must go through the Rust type each OID's
+/// `FromSql` impl expects — coercing everything through `String` (as a
+/// prior version of this function did) fails for every non-text-ish type.
+pub(crate) fn decode_value(row: &Row, i: usize, pg_type: &Type) -> Result<Value, String> {
+    macro_rules! get {
+        ($t:ty) => {
+            row.try_get::<_, Option<$t>>(i).map_err(|e| e.to_string())
+        };
+    }
 
     match *pg_type {
-        Type::BOOL => match text {
-            "t" | "true" | "1" => Ok(Value::Bool(true)),
-            "f" | "false" | "0" => Ok(Value::Bool(false)),
-            other => Err(format!(
-                "provided string was not `true` or `false`: {other}"
-            )),
-        },
-        Type::INT2 => text
-            .parse::<i16>()
-            .map(|v| Value::Int8(v as i64))
-            .map_err(|e| e.to_string()),
-        Type::INT4 => text
-            .parse::<i32>()
-            .map(|v| Value::Int8(v as i64))
-            .map_err(|e| e.to_string()),
-        Type::INT8 => text
-            .parse::<i64>()
-            .map(Value::Int8)
-            .map_err(|e| e.to_string()),
-        Type::FLOAT4 => text
-            .parse::<f32>()
-            .map(|v| Value::Float8(v as f64))
-            .map_err(|e| e.to_string()),
-        Type::FLOAT8 => text
-            .parse::<f64>()
-            .map(Value::Float8)
-            .map_err(|e| e.to_string()),
-        Type::NUMERIC => Ok(Value::Numeric(text.to_string())),
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR => Ok(Value::Text(text.to_string())),
-        Type::UUID => text
-            .parse::<uuid::Uuid>()
-            .map(Value::Uuid)
-            .map_err(|e| e.to_string()),
-        Type::JSON | Type::JSONB => serde_json::from_str(text)
-            .map(Value::Json)
-            .map_err(|e| e.to_string()),
-        Type::TIMESTAMPTZ | Type::TIMESTAMP => {
-            // Try RFC3339 first (e.g. "2025-01-15T10:30:00+00:00")
-            if let Ok(dt) = text.parse::<chrono::DateTime<chrono::Utc>>() {
-                return Ok(Value::Timestamp(dt));
-            }
-            // Try with timezone offset formats PostgreSQL uses
-            for fmt in &["%Y-%m-%d %H:%M:%S%:z", "%Y-%m-%d %H:%M:%S%.f%:z"] {
-                if let Ok(dt) = chrono::DateTime::parse_from_str(text, fmt) {
-                    return Ok(Value::Timestamp(dt.with_timezone(&chrono::Utc)));
-                }
-            }
-            // PostgreSQL sometimes emits just "+00" without minutes — expand it
-            if text.ends_with("+00") || text.ends_with("-00") {
-                let expanded = format!("{}:00", text);
-                for fmt in &["%Y-%m-%d %H:%M:%S%:z", "%Y-%m-%d %H:%M:%S%.f%:z"] {
-                    if let Ok(dt) = chrono::DateTime::parse_from_str(&expanded, fmt) {
-                        return Ok(Value::Timestamp(dt.with_timezone(&chrono::Utc)));
-                    }
-                }
-            }
-            // Try naive datetime without timezone
-            for fmt in &["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
-                    return Ok(Value::Timestamp(
-                        chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc),
-                    ));
-                }
-            }
-            Err(format!("cannot parse timestamp: {text}"))
+        Type::BOOL => get!(bool).map(|v| v.map_or(Value::Null, Value::Bool)),
+        Type::INT2 => get!(i16).map(|v| v.map_or(Value::Null, |v| Value::Int8(v as i64))),
+        Type::INT4 => get!(i32).map(|v| v.map_or(Value::Null, |v| Value::Int8(v as i64))),
+        Type::INT8 => get!(i64).map(|v| v.map_or(Value::Null, Value::Int8)),
+        Type::FLOAT4 => get!(f32).map(|v| v.map_or(Value::Null, |v| Value::Float8(v as f64))),
+        Type::FLOAT8 => get!(f64).map(|v| v.map_or(Value::Null, Value::Float8)),
+        Type::NUMERIC => get!(rust_decimal::Decimal)
+            .map(|v| v.map_or(Value::Null, |d| Value::Numeric(d.to_string()))),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
+            get!(String).map(|v| v.map_or(Value::Null, Value::Text))
         }
-        Type::DATE => text
-            .parse::<chrono::NaiveDate>()
-            .map(Value::Date)
-            .map_err(|e| e.to_string()),
-        Type::TIME => text
-            .parse::<chrono::NaiveTime>()
-            .map(Value::Time)
-            .map_err(|e| e.to_string()),
-        _ => Ok(Value::Custom {
-            type_name: pg_type.name().to_string(),
-            raw_bytes: text.as_bytes().to_vec(),
+        Type::BYTEA => get!(Vec<u8>).map(|v| v.map_or(Value::Null, Value::Bytes)),
+        Type::UUID => get!(uuid::Uuid).map(|v| v.map_or(Value::Null, Value::Uuid)),
+        Type::JSON | Type::JSONB => {
+            get!(serde_json::Value).map(|v| v.map_or(Value::Null, Value::Json))
+        }
+        Type::TIMESTAMPTZ => {
+            get!(chrono::DateTime<chrono::Utc>).map(|v| v.map_or(Value::Null, Value::Timestamp))
+        }
+        Type::TIMESTAMP => get!(chrono::NaiveDateTime).map(|v| {
+            v.map_or(Value::Null, |dt| {
+                Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc))
+            })
         }),
+        Type::DATE => get!(chrono::NaiveDate).map(|v| v.map_or(Value::Null, Value::Date)),
+        Type::TIME => get!(chrono::NaiveTime).map(|v| v.map_or(Value::Null, Value::Time)),
+        _ => {
+            let raw = row
+                .try_get::<_, Option<RawBytes>>(i)
+                .map_err(|e| e.to_string())?;
+            Ok(raw.map_or(Value::Null, |RawBytes(bytes)| Value::Custom {
+                type_name: pg_type.name().to_string(),
+                raw_bytes: bytes,
+            }))
+        }
     }
 }

@@ -1,7 +1,7 @@
 use crate::ids::ConnectionId;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Connection {
     pub id: ConnectionId,
     pub name: String,
@@ -12,6 +12,22 @@ pub struct Connection {
     pub username: String,
     pub password: String,
     pub secret_ref: SecretRef,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("driver", &self.driver)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("secret_ref", &self.secret_ref)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

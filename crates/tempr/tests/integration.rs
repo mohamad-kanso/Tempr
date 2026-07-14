@@ -33,16 +33,17 @@ fn make_pg_connection(
     }
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
-async fn pg_connect_and_query_select() {
-    let conn_str = pg_connection_string().expect("set DATABASE_URL");
-    let url = url::Url::parse(&conn_str).expect("invalid DATABASE_URL");
-
+fn setup_pg_cs() -> (Arc<EventBus>, Arc<ConnectionService>) {
     let bus = Arc::new(EventBus::new());
     let cs = ConnectionService::new(bus.clone());
     let driver = Arc::new(tempr_db_postgres::PostgresDriver::new());
     cs.register_driver(driver);
+    (bus, cs)
+}
+
+async fn connect_test_pg(cs: &ConnectionService) -> ConnectionId {
+    let conn_str = pg_connection_string().expect("set DATABASE_URL");
+    let url = url::Url::parse(&conn_str).expect("invalid DATABASE_URL");
 
     let id = ConnectionId::new();
     let conn = make_pg_connection(
@@ -55,6 +56,15 @@ async fn pg_connect_and_query_select() {
     );
 
     cs.connect(&conn).await.expect("connect failed");
+    id
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_connect_and_query_select() {
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
     assert_eq!(cs.state(id), tempr_domain::ConnectionState::Connected);
 
     let qs = QueryService::new(bus.clone(), cs.clone());
@@ -75,25 +85,8 @@ async fn pg_connect_and_query_select() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_insert_and_select() {
-    let conn_str = pg_connection_string().expect("set DATABASE_URL");
-    let url = url::Url::parse(&conn_str).expect("invalid DATABASE_URL");
-
-    let bus = Arc::new(EventBus::new());
-    let cs = ConnectionService::new(bus.clone());
-    let driver = Arc::new(tempr_db_postgres::PostgresDriver::new());
-    cs.register_driver(driver);
-
-    let id = ConnectionId::new();
-    let conn = make_pg_connection(
-        id,
-        url.host_str().unwrap_or("localhost"),
-        url.port().unwrap_or(5432),
-        url.path().trim_start_matches('/'),
-        url.username(),
-        url.password().unwrap_or(""),
-    );
-
-    cs.connect(&conn).await.expect("connect failed");
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
 
     let qs = QueryService::new(bus.clone(), cs.clone());
 
@@ -121,26 +114,68 @@ async fn pg_insert_and_select() {
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
-async fn pg_streaming_large_result() {
-    let conn_str = pg_connection_string().expect("set DATABASE_URL");
-    let url = url::Url::parse(&conn_str).expect("invalid DATABASE_URL");
+async fn pg_decodes_mixed_types() {
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
 
-    let bus = Arc::new(EventBus::new());
-    let cs = ConnectionService::new(bus.clone());
-    let driver = Arc::new(tempr_db_postgres::PostgresDriver::new());
-    cs.register_driver(driver);
+    let qs = QueryService::new(bus.clone(), cs.clone());
+    let run_id = qs
+        .execute(
+            "SELECT 42::int4 AS an_int, true AS a_bool, \
+             '2025-01-15 10:30:00+00'::timestamptz AS a_timestamp, \
+             '550e8400-e29b-41d4-a716-446655440000'::uuid AS a_uuid, \
+             3.5::float8 AS a_float, '{\"k\": \"v\"}'::jsonb AS a_json",
+            id,
+        )
+        .await
+        .expect("query failed");
 
-    let id = ConnectionId::new();
-    let conn = make_pg_connection(
+    let run = qs.completed_run(run_id).expect("run stored");
+    let rs = run.result_set.expect("result set");
+    let row = &rs.rows[0];
+
+    assert_eq!(row[0], tempr_domain::Value::Int8(42));
+    assert_eq!(row[1], tempr_domain::Value::Bool(true));
+    assert!(matches!(row[2], tempr_domain::Value::Timestamp(_)));
+    assert!(matches!(row[3], tempr_domain::Value::Uuid(_)));
+    assert_eq!(row[4], tempr_domain::Value::Float8(3.5));
+    assert!(matches!(row[5], tempr_domain::Value::Json(_)));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_insert_returning_id() {
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    let qs = QueryService::new(bus.clone(), cs.clone());
+
+    qs.execute(
+        "CREATE TEMPORARY TABLE test_tempr_returning (id SERIAL PRIMARY KEY, name TEXT)",
         id,
-        url.host_str().unwrap_or("localhost"),
-        url.port().unwrap_or(5432),
-        url.path().trim_start_matches('/'),
-        url.username(),
-        url.password().unwrap_or(""),
-    );
+    )
+    .await
+    .expect("create table failed");
 
-    cs.connect(&conn).await.expect("connect failed");
+    let run_id = qs
+        .execute(
+            "INSERT INTO test_tempr_returning (name) VALUES ('Alice') RETURNING id",
+            id,
+        )
+        .await
+        .expect("insert returning failed");
+
+    let run = qs.completed_run(run_id).expect("run stored");
+    let rs = run.result_set.expect("RETURNING should yield a result set");
+    assert_eq!(rs.rows.len(), 1, "RETURNING should yield the inserted row");
+    assert_eq!(rs.rows[0][0], tempr_domain::Value::Int8(1));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_streaming_large_result() {
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
 
     let qs = QueryService::new(bus.clone(), cs.clone());
 
@@ -173,7 +208,7 @@ async fn pg_auth_failure_returns_error() {
         name: "bad-auth".to_string(),
         driver: DriverKind::Postgres,
         host: "localhost".to_string(),
-        port: 5432,
+        port: 55432,
         database: "test".to_string(),
         username: "nonexistent_user_abc123".to_string(),
         password: "wrong".to_string(),
@@ -190,25 +225,8 @@ async fn pg_auth_failure_returns_error() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_schema_refresh() {
-    let conn_str = pg_connection_string().expect("set DATABASE_URL");
-    let url = url::Url::parse(&conn_str).expect("invalid DATABASE_URL");
-
-    let bus = Arc::new(EventBus::new());
-    let cs = ConnectionService::new(bus.clone());
-    let driver = Arc::new(tempr_db_postgres::PostgresDriver::new());
-    cs.register_driver(driver);
-
-    let id = ConnectionId::new();
-    let conn = make_pg_connection(
-        id,
-        url.host_str().unwrap_or("localhost"),
-        url.port().unwrap_or(5432),
-        url.path().trim_start_matches('/'),
-        url.username(),
-        url.password().unwrap_or(""),
-    );
-
-    cs.connect(&conn).await.expect("connect failed");
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
 
     let ss = SchemaService::new(bus.clone(), cs.clone());
     let snapshot = ss.refresh(id).await.expect("schema refresh failed");
@@ -223,25 +241,8 @@ async fn pg_schema_refresh() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_query_syntax_error() {
-    let conn_str = pg_connection_string().expect("set DATABASE_URL");
-    let url = url::Url::parse(&conn_str).expect("invalid DATABASE_URL");
-
-    let bus = Arc::new(EventBus::new());
-    let cs = ConnectionService::new(bus.clone());
-    let driver = Arc::new(tempr_db_postgres::PostgresDriver::new());
-    cs.register_driver(driver);
-
-    let id = ConnectionId::new();
-    let conn = make_pg_connection(
-        id,
-        url.host_str().unwrap_or("localhost"),
-        url.port().unwrap_or(5432),
-        url.path().trim_start_matches('/'),
-        url.username(),
-        url.password().unwrap_or(""),
-    );
-
-    cs.connect(&conn).await.expect("connect failed");
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
 
     let qs = QueryService::new(bus.clone(), cs.clone());
     let result = qs.execute("SELCT INVALID SYNTAX", id).await;
@@ -251,32 +252,15 @@ async fn pg_query_syntax_error() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_events_published_during_query() {
-    let conn_str = pg_connection_string().expect("set DATABASE_URL");
-    let url = url::Url::parse(&conn_str).expect("invalid DATABASE_URL");
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
 
-    let bus = Arc::new(EventBus::new());
     let received: Arc<parking_lot::Mutex<Vec<AppEventKind>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     let r = received.clone();
     let _sub = bus.subscribe(EventFilter::All, move |event| {
         r.lock().push(event.kind());
     });
-
-    let cs = ConnectionService::new(bus.clone());
-    let driver = Arc::new(tempr_db_postgres::PostgresDriver::new());
-    cs.register_driver(driver);
-
-    let id = ConnectionId::new();
-    let conn = make_pg_connection(
-        id,
-        url.host_str().unwrap_or("localhost"),
-        url.port().unwrap_or(5432),
-        url.path().trim_start_matches('/'),
-        url.username(),
-        url.password().unwrap_or(""),
-    );
-
-    cs.connect(&conn).await.expect("connect failed");
 
     let qs = QueryService::new(bus.clone(), cs.clone());
     let _ = qs.execute("SELECT 1", id).await.expect("query failed");

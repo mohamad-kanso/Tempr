@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use tempr_db::CancelHandle;
 use tempr_domain::{
     ColumnMeta, ConnectionId, Query, QueryOutcome, QueryRun, QueryRunId, ResultSet, Value,
 };
@@ -12,6 +13,7 @@ use crate::connection::ConnectionService;
 
 struct ActiveRun {
     query_run: QueryRun,
+    cancel_handle: Option<Box<dyn CancelHandle>>,
 }
 
 pub struct QueryService {
@@ -58,9 +60,13 @@ impl QueryService {
 
         self.event_bus
             .publish(AppEvent::QueryStarted { run: run_id });
-        self.active_runs
-            .write()
-            .insert(run_id, ActiveRun { query_run });
+        self.active_runs.write().insert(
+            run_id,
+            ActiveRun {
+                query_run,
+                cancel_handle: None,
+            },
+        );
 
         let sql_owned = sql.to_string();
         let result = self
@@ -68,6 +74,13 @@ impl QueryService {
             .with_connection_fn(connection_id, |mut conn| {
                 let sql = sql_owned.clone();
                 async move {
+                    // Captured before the (potentially long-running) execute
+                    // call so a concurrent `cancel()` can reach this query
+                    // without needing exclusive access to `conn`.
+                    if let Some(active) = self.active_runs.write().get_mut(&run_id) {
+                        active.cancel_handle = Some(conn.cancel_handle());
+                    }
+
                     match conn.execute(&sql, &[]).await {
                         Ok(mut stream) => {
                             let columns: Vec<ColumnMeta> = stream
@@ -146,7 +159,18 @@ impl QueryService {
     }
 
     pub async fn cancel(&self, run_id: QueryRunId) -> Result<(), ServiceError> {
-        self.active_runs.write().remove(&run_id);
+        let handle = self
+            .active_runs
+            .write()
+            .remove(&run_id)
+            .and_then(|active| active.cancel_handle);
+
+        if let Some(handle) = handle
+            && let Err(e) = handle.cancel().await
+        {
+            tracing::warn!("failed to cancel query {run_id:?} on driver: {e}");
+        }
+
         self.event_bus.publish(AppEvent::QueryFinished {
             run: run_id,
             outcome: QueryOutcome::Cancelled,

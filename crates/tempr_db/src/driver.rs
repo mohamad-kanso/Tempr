@@ -39,8 +39,17 @@ pub trait DriverConnection: Send + Sync {
     /// and reports the affected row count via `QueryStream::rows_affected()`.
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream, DriverError>;
 
-    /// Cancel the currently executing query on this connection.
+    /// Cancel the currently executing query on this connection. Requires
+    /// exclusive access, so it can only be called by whoever currently
+    /// holds the connection — a concurrent caller should use
+    /// `cancel_handle()` instead.
     async fn cancel(&mut self) -> Result<(), DriverError>;
+
+    /// Obtain a cheap, cloneable handle that can cancel the query currently
+    /// running on this connection from a *different* task, without needing
+    /// exclusive (`&mut`) access — the connection may still be checked out
+    /// and executing a query elsewhere.
+    fn cancel_handle(&self) -> Box<dyn CancelHandle>;
 
     /// Perform a full schema introspection within the given scope.
     /// Returns structured metadata that SchemaService persists to cache.
@@ -48,6 +57,13 @@ pub trait DriverConnection: Send + Sync {
         &mut self,
         scope: SchemaScope,
     ) -> Result<Vec<SchemaSnapshotEntry>, DriverError>;
+}
+
+/// A handle capable of cancelling an in-flight query without exclusive
+/// access to its `DriverConnection`. See `DriverConnection::cancel_handle`.
+#[async_trait]
+pub trait CancelHandle: Send + Sync {
+    async fn cancel(&self) -> Result<(), DriverError>;
 }
 
 /// A single entry in a schema snapshot — flat list with implicit parent-child.

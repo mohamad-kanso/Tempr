@@ -164,6 +164,15 @@ mod tests {
     use tempr_db::EngineId;
     use tempr_domain::{DriverKind, SecretRef};
 
+    struct NoopCancelHandle;
+
+    #[async_trait::async_trait]
+    impl tempr_db::CancelHandle for NoopCancelHandle {
+        async fn cancel(&self) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
     fn make_event_bus() -> Arc<EventBus> {
         Arc::new(EventBus::new())
     }
@@ -237,6 +246,9 @@ mod tests {
             }
             async fn cancel(&mut self) -> Result<(), DriverError> {
                 Ok(())
+            }
+            fn cancel_handle(&self) -> Box<dyn tempr_db::CancelHandle> {
+                Box::new(NoopCancelHandle)
             }
             async fn snapshot_schema(
                 &mut self,
@@ -359,6 +371,9 @@ mod tests {
             }
             async fn cancel(&mut self) -> Result<(), DriverError> {
                 Ok(())
+            }
+            fn cancel_handle(&self) -> Box<dyn tempr_db::CancelHandle> {
+                Box::new(NoopCancelHandle)
             }
             async fn snapshot_schema(
                 &mut self,

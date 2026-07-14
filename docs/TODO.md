@@ -8,12 +8,12 @@
 
 ## Now
 
+- [ ] Lazy wire streaming via `query_raw()` — `PostgresStream` currently buffers full result set via `client.query()`, then yields `batch_size` chunks. True `query_raw` streaming was attempted but fails with `Error { kind: Closed }` specifically when called through `QueryService::execute()` (works fine via raw driver or closures). Root cause undetermined — suspected `Box<dyn DriverConnection>` + async trait boundary interaction. Investigate as follow-up.
+
 ## Next
 
-- [ ] Phase 1: PostgreSQL async driver (`sqlx` or custom) with TLS connection, query execution, streaming result batches
+- [ ] Phase 1: PostgreSQL async driver with TLS connection (sslmode configurable, default Prefer)
 - [ ] Phase 1: GPUI application shell — main window, text input area, scrollable result grid
-- [ ] Phase 1: Streaming result grid with bounded memory (virtualized rendering)
-- [ ] Phase 1: Integration tests for connect / auth failure / query / streaming paths
 
 ## Later
 
