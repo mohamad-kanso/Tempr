@@ -181,6 +181,7 @@ mod tests {
             port: 5432,
             database: "test".to_string(),
             username: "user".to_string(),
+            password: "pass".to_string(),
             secret_ref: SecretRef {
                 vault_key: "test".to_string(),
             },

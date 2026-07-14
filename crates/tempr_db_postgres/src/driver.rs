@@ -5,9 +5,20 @@ use tempr_db::{
 use tempr_domain::{ColumnSpec, Connection, Value};
 use tokio_postgres::NoTls;
 
+use crate::decode::decode_value;
 use crate::stream::PostgresStream;
 
 const DEFAULT_BATCH_SIZE: usize = 4000;
+
+fn decode_pg_value(col: &tokio_postgres::Column, raw: Option<&str>) -> Value {
+    match raw {
+        Some(text) => decode_value(col.type_(), Some(text)).unwrap_or_else(|e| Value::Custom {
+            type_name: format!("decode_error: {e}"),
+            raw_bytes: Vec::new(),
+        }),
+        None => Value::Null,
+    }
+}
 
 pub struct PostgresDriver;
 
@@ -37,9 +48,11 @@ impl DatabaseDriver for PostgresDriver {
         let port = connection.port;
         let dbname = &connection.database;
         let user = &connection.username;
+        let password = &connection.password;
 
-        let conn_str =
-            format!("host={host} port={port} dbname={dbname} user={user} sslmode=require");
+        let conn_str = format!(
+            "host={host} port={port} dbname={dbname} user={user} password={password} sslmode=disable"
+        );
 
         let (client, connection_handle) =
             tokio_postgres::connect(&conn_str, NoTls)
@@ -117,14 +130,32 @@ impl DriverConnection for PostgresConnection {
             })
             .collect();
 
-        let stream = self
+        let rows = self
             .client
-            .query_raw(&stmt, &[] as &[&str])
+            .query(&stmt, &[])
             .await
             .map_err(|e| DriverError::Query(e.to_string()))?;
 
+        let all_values: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|row| {
+                row.columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| {
+                        let raw: Option<String> = row.try_get(i).ok().flatten();
+                        decode_pg_value(col, raw.as_deref())
+                    })
+                    .collect()
+            })
+            .collect();
+
         Ok(QueryStream::new(
-            Box::new(PostgresStream::new(columns, stream, self.batch_size)),
+            Box::new(PostgresStream::from_rows(
+                columns,
+                all_values,
+                self.batch_size,
+            )),
             self.batch_size,
         ))
     }

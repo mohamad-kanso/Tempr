@@ -10,6 +10,7 @@ pub struct Connection {
     pub port: u16,
     pub database: String,
     pub username: String,
+    pub password: String,
     pub secret_ref: SecretRef,
 }
 
@@ -87,6 +88,7 @@ mod tests {
             port: 5432,
             database: "mydb".to_string(),
             username: "admin".to_string(),
+            password: "secret".to_string(),
             secret_ref: SecretRef {
                 vault_key: "keychain://tempr/prod".to_string(),
             },

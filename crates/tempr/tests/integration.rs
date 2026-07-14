@@ -16,6 +16,7 @@ fn make_pg_connection(
     port: u16,
     dbname: &str,
     user: &str,
+    password: &str,
 ) -> Connection {
     Connection {
         id,
@@ -25,6 +26,7 @@ fn make_pg_connection(
         port,
         database: dbname.to_string(),
         username: user.to_string(),
+        password: password.to_string(),
         secret_ref: SecretRef {
             vault_key: "test".to_string(),
         },
@@ -49,6 +51,7 @@ async fn pg_connect_and_query_select() {
         url.port().unwrap_or(5432),
         url.path().trim_start_matches('/'),
         url.username(),
+        url.password().unwrap_or(""),
     );
 
     cs.connect(&conn).await.expect("connect failed");
@@ -87,6 +90,7 @@ async fn pg_insert_and_select() {
         url.port().unwrap_or(5432),
         url.path().trim_start_matches('/'),
         url.username(),
+        url.password().unwrap_or(""),
     );
 
     cs.connect(&conn).await.expect("connect failed");
@@ -133,6 +137,7 @@ async fn pg_streaming_large_result() {
         url.port().unwrap_or(5432),
         url.path().trim_start_matches('/'),
         url.username(),
+        url.password().unwrap_or(""),
     );
 
     cs.connect(&conn).await.expect("connect failed");
@@ -171,6 +176,7 @@ async fn pg_auth_failure_returns_error() {
         port: 5432,
         database: "test".to_string(),
         username: "nonexistent_user_abc123".to_string(),
+        password: "wrong".to_string(),
         secret_ref: SecretRef {
             vault_key: "test".to_string(),
         },
@@ -199,6 +205,7 @@ async fn pg_schema_refresh() {
         url.port().unwrap_or(5432),
         url.path().trim_start_matches('/'),
         url.username(),
+        url.password().unwrap_or(""),
     );
 
     cs.connect(&conn).await.expect("connect failed");
@@ -231,6 +238,7 @@ async fn pg_query_syntax_error() {
         url.port().unwrap_or(5432),
         url.path().trim_start_matches('/'),
         url.username(),
+        url.password().unwrap_or(""),
     );
 
     cs.connect(&conn).await.expect("connect failed");
@@ -265,6 +273,7 @@ async fn pg_events_published_during_query() {
         url.port().unwrap_or(5432),
         url.path().trim_start_matches('/'),
         url.username(),
+        url.password().unwrap_or(""),
     );
 
     cs.connect(&conn).await.expect("connect failed");

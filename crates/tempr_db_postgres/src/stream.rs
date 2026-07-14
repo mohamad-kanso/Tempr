@@ -4,22 +4,33 @@ use futures::StreamExt;
 use tempr_db::{DriverError, QueryStreamImpl};
 use tempr_domain::{Batch, ColumnSpec, Value};
 
+type BatchStream = Pin<Box<dyn futures::Stream<Item = Result<Batch, DriverError>> + Send>>;
+
 pub(crate) struct PostgresStream {
     columns: Vec<ColumnSpec>,
-    stream: Option<Pin<Box<tokio_postgres::RowStream>>>,
+    stream: Option<BatchStream>,
     batch_size: usize,
     rows_affected: u64,
 }
 
 impl PostgresStream {
-    pub fn new(
-        columns: Vec<ColumnSpec>,
-        stream: tokio_postgres::RowStream,
-        batch_size: usize,
-    ) -> Self {
+    pub fn from_rows(columns: Vec<ColumnSpec>, rows: Vec<Vec<Value>>, batch_size: usize) -> Self {
+        use futures::stream;
+
+        let batches: Vec<Result<Batch, DriverError>> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                Ok(Batch {
+                    rows: vec![row],
+                    batch_index: i,
+                })
+            })
+            .collect();
+
         Self {
             columns,
-            stream: Some(Box::pin(stream)),
+            stream: Some(Box::pin(stream::iter(batches))),
             batch_size,
             rows_affected: 0,
         }
@@ -35,17 +46,6 @@ impl PostgresStream {
     }
 }
 
-fn decode_pg_value(col: &tokio_postgres::Column, raw: Option<&str>) -> Value {
-    use crate::decode::decode_value;
-    match raw {
-        Some(text) => decode_value(col.type_(), Some(text)).unwrap_or_else(|e| Value::Custom {
-            type_name: format!("decode_error: {e}"),
-            raw_bytes: Vec::new(),
-        }),
-        None => Value::Null,
-    }
-}
-
 #[async_trait::async_trait]
 impl QueryStreamImpl for PostgresStream {
     fn columns(&self) -> &[ColumnSpec] {
@@ -58,29 +58,15 @@ impl QueryStreamImpl for PostgresStream {
             None => return Ok(None),
         };
 
-        let mut rows = Vec::with_capacity(self.batch_size);
-
-        for _ in 0..self.batch_size {
-            match stream.next().await {
-                Some(Ok(row)) => {
-                    let mut values = Vec::with_capacity(row.len());
-                    for (i, col) in row.columns().iter().enumerate() {
-                        let raw: Option<String> = row.try_get(i).ok().flatten();
-                        values.push(decode_pg_value(col, raw.as_deref()));
-                    }
-                    rows.push(values);
-                }
-                Some(Err(e)) => return Err(DriverError::Query(e.to_string())),
-                None => break,
+        match stream.next().await {
+            Some(Ok(mut batch)) => {
+                self.rows_affected += batch.rows.len() as u64;
+                batch.batch_index =
+                    (self.rows_affected as usize / self.batch_size).saturating_sub(1);
+                Ok(Some(batch))
             }
-        }
-
-        if rows.is_empty() {
-            Ok(None)
-        } else {
-            let batch_index = self.rows_affected as usize / self.batch_size;
-            self.rows_affected += rows.len() as u64;
-            Ok(Some(Batch { rows, batch_index }))
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
         }
     }
 
