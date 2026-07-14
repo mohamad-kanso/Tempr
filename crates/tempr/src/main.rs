@@ -5,35 +5,37 @@ use std::sync::Arc;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
-use tempr_domain::{ConnectionId, ConnectionState, WorkspaceId};
+use tempr_db::DatabaseDriver;
+use tempr_db_postgres::PostgresDriver;
+use tempr_domain::WorkspaceId;
 use tempr_events::{AppEvent, AppEventKind, EventBus, EventFilter};
-use tempr_services::{Service, ServiceError, ServiceRegistry};
+use tempr_services::{
+    ConnectionService, QueryService, SchemaService, Service, ServiceError, ServiceRegistry,
+};
 use tempr_workspace::{FileSystemStorage, Storage, WorkspaceManifest};
 
-// ── Demo mock service ──────────────────────────────────────────────────────────
+// ── Demo service for Phase 1 ─────────────────────────────────────────────────
 
-struct MockQueryService {
-    event_bus: Arc<EventBus>,
+struct DemoService {
+    _event_bus: Arc<EventBus>,
 }
 
-impl MockQueryService {
+impl DemoService {
     fn new(event_bus: Arc<EventBus>) -> Arc<Self> {
-        Arc::new(Self { event_bus })
+        Arc::new(Self {
+            _event_bus: event_bus,
+        })
     }
 }
 
 #[async_trait]
-impl Service for MockQueryService {
+impl Service for DemoService {
     fn name(&self) -> &'static str {
-        "MockQueryService"
+        "DemoService"
     }
 
     async fn start(&self) -> Result<(), ServiceError> {
         info!(service = self.name(), "service starting");
-        self.event_bus.publish(AppEvent::ConnectionStateChanged {
-            id: ConnectionId::new(),
-            state: ConnectionState::Connected,
-        });
         Ok(())
     }
 
@@ -43,7 +45,7 @@ impl Service for MockQueryService {
     }
 }
 
-// ── Entry point ────────────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,12 +54,12 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("Tempr Phase 0 demo starting");
+    info!("Tempr Phase 1 starting");
 
     // ── 1. Event bus ──
     let bus = Arc::new(EventBus::new());
 
-    // Subscribe to all events — mirrors what structured logging / a debug panel would do
+    // Subscribe to all events for logging
     let log_sub = {
         let received: Arc<Mutex<Vec<AppEventKind>>> = Arc::new(Mutex::new(Vec::new()));
         let r = received.clone();
@@ -75,14 +77,24 @@ async fn main() -> Result<()> {
     let storage = FileSystemStorage::new(tmp_dir.path());
     storage.init_workspace_dir().await?;
 
-    let manifest = WorkspaceManifest::new("phase0-demo");
+    let manifest = WorkspaceManifest::new("phase1-demo");
     storage.save_manifest(&manifest).await?;
     let loaded = storage.load_manifest().await?;
     info!(workspace = %loaded.workspace.name, "workspace manifest loaded");
 
     // ── 3. Service registry ──
     let registry = ServiceRegistry::new();
-    registry.register(MockQueryService::new(bus.clone()));
+
+    // Register core services
+    let connection_service = ConnectionService::new(bus.clone());
+    let _query_service = QueryService::new(bus.clone(), connection_service.clone());
+    let _schema_service = SchemaService::new(bus.clone(), connection_service.clone());
+
+    // Register PostgreSQL driver
+    let pg_driver = Arc::new(PostgresDriver::new()) as Arc<dyn DatabaseDriver>;
+    connection_service.register_driver(pg_driver);
+
+    registry.register(DemoService::new(bus.clone()));
     registry.start_all().await?;
 
     // ── 4. Publish workspace lifecycle events ──
@@ -97,14 +109,15 @@ async fn main() -> Result<()> {
     info!(
         total_events = events.len(),
         ?events,
-        "Phase 0 demo complete — event bus delivered all events in order"
+        "Phase 1 demo complete — event bus delivered all events in order"
     );
 
-    // Verify ordering for the demo
-    assert_eq!(events[0], AppEventKind::ConnectionStateChanged); // from mock service start
-    assert_eq!(events[1], AppEventKind::WorkspaceOpened);
-    assert_eq!(events[2], AppEventKind::WorkspaceClosed);
+    info!(
+        "Phase 1 services wired — database driver abstraction + PostgreSQL driver + connection/query/schema services ready"
+    );
 
-    info!("Phase 0 exit criteria met — Tempr foundations verified");
+    // Note: GPUI dependency is pinned in workspace Cargo.toml (per D14).
+    // The GPUI UI shell will be built on top of these services in the next phase.
+
     Ok(())
 }

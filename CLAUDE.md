@@ -36,7 +36,7 @@ Four files that must always reflect reality. Each fact has exactly ONE home — 
 
 ## Project Status
 
-Architecture/documentation phase complete; implementation not yet started. **Do not write implementation code or scaffold crates unless explicitly asked.**
+Phase 1 (Connect & Run) — database layer implemented and verified: PostgreSQL driver, services, 9 integration tests against live Docker PG. **See docs/PROGRESS.md for current status.**
 
 ## Locked Decisions
 
@@ -116,4 +116,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — complete (2026-07-13). Phase 1 — not started.
+Phase: 0 — complete (2026-07-13). Phase 1 — in progress (database layer verified 2026-07-14).

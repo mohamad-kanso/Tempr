@@ -14,6 +14,8 @@ pub use ids::{
     ConnectionId, HistoryEntryId, PluginId, QueryId, QueryRunId, SchemaObjectId, SchemaSnapshotId,
     SqlFileId, WorkspaceId,
 };
-pub use query::{ColumnMeta, Query, QueryOutcome, QueryRun, ResultSet, Value};
+pub use query::{
+    Batch, ColumnMeta, ColumnSpec, Query, QueryOutcome, QueryRun, ResultSet, Value, ValueType,
+};
 pub use schema::{SchemaObject, SchemaSnapshot};
 pub use workspace::{SqlFile, Workspace, WorkspaceSettings};

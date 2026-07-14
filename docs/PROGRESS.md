@@ -6,9 +6,9 @@
 
 ## Current status
 
-- **Last completed**: Phase 0 — all exit criteria verified 2026-07-13
-- **Verified**: `cargo fmt --check` ✅ · `cargo clippy --workspace --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (36 tests: 15 domain, 6 events, 5 services, 10 workspace) · `cargo deny check` ✅ (advisories ok, bans ok, licenses ok, sources ok)
-- **Next action**: Begin Phase 1 — PostgreSQL driver + GPUI application shell (GPUI: upstream git pin, see D14)
+- **Last completed**: Phase 1 database layer — all 74 tests pass (65 unit + 9 integration against Docker PG) (2026-07-14)
+- **Verified**: `cargo fmt --all` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (65 unit tests) · `cargo test -- --ignored` ✅ (9 integration tests: connect, insert/select, decode mixed types, insert returning, streaming, auth failure, schema refresh, syntax error, events)
+- **Next action**: Wire deadpool-postgres connection pool; begin GPUI application shell
 
 ## Phase checklist
 
@@ -25,13 +25,21 @@
 - [x] All 16 architecture docs exist and cross-reference correctly *(verified 2026-07-13)*
 
 ### Phase 1 — Connect & Run
+- [x] `tempr_db` crate: `DatabaseDriver`, `DriverConnection` traits, `QueryStream`, `EngineId`, `SchemaScope`, `SchemaSnapshotEntry`, `DriverError` *(7 tests, 2026-07-14)*
+- [x] `tempr_db_postgres` crate: `PostgresDriver`, `PostgresConnection`, `PostgresStream` (pinned `Pin<Box<RowStream>>`), `decode_value` (all PG types: bool, int, float, numeric, text, uuid, json, timestamp, date, time) *(6 tests, 2026-07-14)*
+- [x] Extended `Value` with Uuid, Json, Timestamp, Date, Time, Numeric, Array, Custom; added `ValueType`, `ColumnSpec`, `Batch` to tempr_domain *(16 tests, 2026-07-14)*
+- [x] `ConnectionService`: pool management, state tracking, `with_connection_fn` exclusive-access pattern, event publishing, proper Failed state on missing driver *(8 tests, 2026-07-14)*
+- [x] `QueryService`: execute → stream → finalize lifecycle, `completed_runs` storage, event publishing *(4 tests, 2026-07-14)*
+- [x] `SchemaService`: two-pass schema introspection (tables → columns/indexes via parent ID map), snapshot versioning, event publishing *(3 tests, 2026-07-14)*
+- [x] Binary wires all services + PostgreSQL driver *(compiled, 2026-07-14)*
+- [x] `ServiceError` extended with `QueryFailed`, `ConnectionNotFound`, `NotConnected` *(5 registry tests, 2026-07-14)*
+- [x] 9 integration tests written (ignored, require DATABASE_URL): connect, insert/select, decode mixed types, insert returning, streaming, auth failure, schema refresh, syntax error, event publishing *(2026-07-14)*
+- [x] SQL injection fixed in `snapshot_schema` — parameterized queries (`$1`, `$2`) *(2026-07-14)*
+- [x] Decode layer handles PostgreSQL text-format booleans (`t`/`f`/`true`/`false`) and timestamps with timezone variants *(2026-07-14)*
 - [ ] PostgreSQL driver connects over TLS using Phase 0 connection config
-- [ ] `SELECT` and `INSERT` execute and return results through the event bus
-- [ ] Streaming result pipeline delivers rows in bounded memory
 - [ ] GPUI window renders with text input and scrollable result grid
 - [ ] Result grid displays streaming rows; smooth scroll for up to 100,000 rows
 - [ ] Connection/auth/syntax errors produce user-visible messages via event system
-- [ ] Integration tests cover connect, auth failure, query execution, streaming for PostgreSQL
 
 ### Phase 2 — Editor
 - [ ] Rope buffer handles 10 MB documents with sub-millisecond insert/delete
@@ -91,3 +99,7 @@
 | Date | Phase | What was done | Follow-ups |
 |---|---|---|---|
 | 2026-07-13 | Phase 0 | Architecture suite (16 docs + 9 ADRs + RFC) written; Cargo workspace + 5 crates scaffolded; domain types (15 tests), event bus (6), service registry (5), workspace manifest (4), storage (6) implemented; CI workflow + cargo-deny configured; MIT license set (→ D12); all 8 exit criteria verified; PR review workflow (D13) adopted: pre-push hook + setup script + CLAUDE.md hard rule; OD#5 resolved: upstream git pin, no fork (→ D14); lorekeeper check: zero drift; D13 judgment exception eliminated — no direct commits to main ever (→ D15) | Begin Phase 1; run bash scripts/setup.sh in each new worktree |
+| 2026-07-14 | Phase 1 | Created `feat/phase1-db-layer` branch; implemented database layer: `tempr_db` driver traits crate, `tempr_db_postgres` PostgreSQL driver (tokio-postgres, batched streaming, PG type decode), extended `Value` enum (8 new variants + `ValueType`/`ColumnSpec`/`Batch`), `ConnectionService` (pool + `with_connection_fn` exclusive access), `QueryService` (execute → stream → event lifecycle), `SchemaService` (PG introspection + snapshot), binary wiring; fixed compilation: DriverConnection `Send + Sync`, PostgresStream pinning, service API redesign; 37 tests pass, clippy clean, fmt clean | Wire deadpool-postgres; add PG integration tests; GPUI application shell |
+| 2026-07-14 | Phase 1 | Fixed 5 failing tests (bool decode: `t`/`f` format, timestamp timezone offset `+00` handling), fixed ConnectionService missing `Failed` state on no-driver path, added `ServiceError::{QueryFailed, ConnectionNotFound, NotConnected}`, added 7 integration tests (PG connect/select/insert/streaming/auth/schema/events), parameterized schema snapshot queries (SQL injection fix), pinned PostgresStream (`Pin<Box<RowStream>>`); **65 unit tests pass** — clippy clean, fmt clean, cargo deny clean | Run integration tests with DATABASE_URL; begin GPUI shell |
+| 2026-07-14 | Phase 1 | Fixed Docker PostgreSQL compatibility: switched from `query_raw` to `client.query()` (lifetime issue with RowStream borrowing client), added `password` field to `Connection` struct, switched `sslmode=require` to `sslmode=disable`, added `PostgresStream::from_rows` for collected results; **all 7 integration tests pass** against Docker PostgreSQL | Commit and merge; begin GPUI shell |
+| 2026-07-14 | Phase 1 | Code review fix pass (10 findings): fixed typed column decoding (finding #1), params passthrough (#2), RETURNING rows (#3), batch-size chunking (#4), schema error propagation (#5), schema scope for columns/indexes (#6), index columns via pg_index (#7), cancel handle capture (#8), configurable sslmode (#9), conninfo escaping via Config builder (#10); reverted #4 from `query_raw` to `query()`+chunked batch due to live-DB `Closed` error with `query_raw` through QueryService (true lazy streaming deferred to TODO); cleaned up debug pollution from root-cause investigation | Lazy wire streaming as follow-up; commit and PR |

@@ -9,6 +9,8 @@ tempr_domain.workspace    = true
 tempr_events.workspace    = true
 tempr_services.workspace  = true
 tempr_workspace.workspace = true
+tempr_db.workspace        = true
+tempr_db_postgres.workspace = true
 
 anyhow.workspace             = true
 async-trait.workspace        = true
@@ -17,6 +19,9 @@ tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 tempfile.workspace           = true
+
+[dev-dependencies]
+url = "2"
 
 [lints]
 workspace = true

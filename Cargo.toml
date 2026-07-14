@@ -5,6 +5,8 @@ members = [
     "crates/tempr_events",
     "crates/tempr_services",
     "crates/tempr_workspace",
+    "crates/tempr_db",
+    "crates/tempr_db_postgres",
 ]
 resolver = "2"
 
@@ -15,14 +17,22 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
-tempr_domain    = { path = "crates/tempr_domain" }
-tempr_events    = { path = "crates/tempr_events" }
-tempr_services  = { path = "crates/tempr_services" }
-tempr_workspace = { path = "crates/tempr_workspace" }
+tempr_domain      = { path = "crates/tempr_domain" }
+tempr_events      = { path = "crates/tempr_events" }
+tempr_services    = { path = "crates/tempr_services" }
+tempr_workspace   = { path = "crates/tempr_workspace" }
+tempr_db          = { path = "crates/tempr_db" }
+tempr_db_postgres = { path = "crates/tempr_db_postgres" }
 
 # Async
 async-trait = "0.1"
-tokio       = { version = "1", features = ["full"] }
+futures      = "0.3"
+tokio            = { version = "1", features = ["full"] }
+tokio-postgres   = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+postgres-types   = "0.2"
+rust_decimal     = { version = "1", features = ["db-postgres"] }
+bytes            = "1"
 
 # Data / serialisation
 chrono      = { version = "0.4", features = ["serde"] }
