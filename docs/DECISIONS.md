@@ -35,6 +35,7 @@
 | D13 | 2026-07-13 | PR review-based development workflow — branch → PR → /code-review → user approval → merge | User |
 | D14 | 2026-07-13 | GPUI dependency via upstream git pin (no fork) — `rev = "<sha>"`, updated deliberately | User |
 | D15 | 2026-07-13 | No direct commits to main ever — all work via branch → PR → review → merge, no exceptions | User |
+| D16 | 2026-08-17 | GPUI dependency is `gpui` + `gpui_platform` at one rev; Apache-2.0 Zed crates only, no GPL `ui`/`theme`/`markdown`/`editor` | Claude (Phase 1) |
 
 ---
 
@@ -173,3 +174,19 @@
 **Decision**: All work — feature, fix, docs, chore — must go through a branch → PR → `/code-review` → user approval → merge workflow. No direct commits to main under any circumstances. The D13 "trivial doc correction" judgment exception is eliminated.
 **Why**: Claude committed docs changes directly to main (OD#5 resolution), citing the judgment exception in D13. That exception is too wide and defeats the point of branch protection. A bright-line rule with no exceptions removes the rationalization surface.
 **Consequences**: Even single-line doc fixes go on a branch and through a PR. More process overhead for trivial changes; the tradeoff is an unambiguous rule that cannot be argued around.
+
+---
+
+## D16 — GPUI dependency surface and Zed crate licensing (2026-08-17)
+
+**By**: Claude (Phase 1, from a verified read of a local `zed-industries/zed` clone — gpui `0.2.2`).
+**Refines**: D14 (git pin, no fork — unchanged).
+**Decision**:
+1. Tempr depends on **two** Zed crates, pinned to the **same** rev: `gpui` (framework) and `gpui_platform` (platform entry point). Upstream split the crate; the app bootstraps via `gpui_platform::application()`, never `gpui::Application::new()`.
+2. Tempr uses **Apache-2.0 Zed crates only** — `gpui`, `gpui_platform`, and the `gpui_macos`/`gpui_linux`/`gpui_windows`/`gpui_web`/`gpui_wgpu` backends. `crates/ui` (component library), `crates/theme`, `crates/markdown`, and `crates/editor` are **GPL-3.0** and must never be depended on.
+3. GPUI's own executor (`cx.background_spawn` / `cx.spawn` / `Task<R>`) is the UI-side async model. Tokio DB work reaches the UI through a tokio↔GPUI bridge (`gpui_tokio` if its license permits, otherwise a Tempr reimplementation).
+4. `gpui-component` (longbridge) is not adopted — it conflicts with the custom-component mandate in D1. Adopting it would need an RFC.
+
+**Why**: Tempr is MIT (D12). Linking GPL-3.0 crates would force Tempr to become GPL, which contradicts D12 and the plugin-author-friendly stance in D8. The split into `gpui` + `gpui_platform` is a hard build fact — a single-crate dependency will not compile a window open. Zed's async model is its own scheduler, not tokio, so the DB layer (`tokio-postgres`, `deadpool-postgres`) cannot simply be awaited inside a view; the bridge is mandatory and is better documented before Phase 1 UI work than discovered mid-implementation.
+
+**Consequences**: Every component in the [11 — GPUI](11-gpui.md) catalog is Tempr-authored — there is no shortcut via `crates/ui`, and theming must be built from scratch (no `cx.theme()`). Text input is hand-rolled from `crates/gpui/examples/input.rs` as the reference. `cargo deny` must allow Apache-2.0 git sources including the transitive `zed-font-kit` fork on macOS. Zed pins toolchain `1.95.0`/`edition 2024`; Tempr must add a matching `rust-toolchain.toml` before the GPUI dependency lands. Any future need for a GPL Zed crate requires an RFC plus a superseding entry (and likely a license change to Tempr itself).
