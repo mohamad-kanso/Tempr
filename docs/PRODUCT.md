@@ -75,6 +75,8 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 - Targets: Linux (glibc 2.31+), macOS (12+), Windows (10+)
 - Single-user, local-only; no cloud sync, no telemetry without explicit opt-in
 - GPUI requires GPU with Vulkan/Metal/DX12 support
+- GPUI is consumed as `gpui` + `gpui_platform` (Apache-2.0) pinned to one Zed rev. Tempr is MIT, so Zed's GPL-3.0 crates (`ui`, `theme`, `markdown`, `editor`) are out of bounds — every UI component, the theme system, and the text input are Tempr-authored (→ D16)
+- Toolchain floor: Rust 1.95.0, edition 2024 (matches Zed's pin)
 - All I/O is async; UI thread is render-only
 - Workspace files are local directories; no remote workspace in v1
 

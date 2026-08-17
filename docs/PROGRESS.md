@@ -8,7 +8,7 @@
 
 - **Last completed**: Phase 1 database layer — all 74 tests pass (65 unit + 9 integration against Docker PG) (2026-07-14)
 - **Verified**: `cargo fmt --all` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (65 unit tests) · `cargo test -- --ignored` ✅ (9 integration tests: connect, insert/select, decode mixed types, insert returning, streaming, auth failure, schema refresh, syntax error, events)
-- **Next action**: Wire deadpool-postgres connection pool; begin GPUI application shell
+- **Next action**: Add `rust-toolchain.toml` (≥ 1.95.0, edition 2024) + pin `gpui`/`gpui_platform` at one rev (→ D16); wire deadpool-postgres connection pool; begin GPUI application shell
 
 ## Phase checklist
 
@@ -93,6 +93,7 @@
 | 2026-07-13 | PR review-based workflow adopted — branch → PR → /code-review → user approval | → D13 |
 | 2026-07-13 | GPUI dependency strategy: upstream git pin, no fork; OD#5 closed | → D14 |
 | 2026-07-13 | No direct commits to main ever — judgment exception in D13 eliminated | → D15 |
+| 2026-08-17 | GPUI dependency = `gpui` + `gpui_platform` at one rev; Apache-2.0 Zed crates only (no GPL `ui`/`theme`/`markdown`/`editor`); tokio↔GPUI bridge required | → D16 |
 
 ## Session log
 
@@ -102,4 +103,5 @@
 | 2026-07-14 | Phase 1 | Created `feat/phase1-db-layer` branch; implemented database layer: `tempr_db` driver traits crate, `tempr_db_postgres` PostgreSQL driver (tokio-postgres, batched streaming, PG type decode), extended `Value` enum (8 new variants + `ValueType`/`ColumnSpec`/`Batch`), `ConnectionService` (pool + `with_connection_fn` exclusive access), `QueryService` (execute → stream → event lifecycle), `SchemaService` (PG introspection + snapshot), binary wiring; fixed compilation: DriverConnection `Send + Sync`, PostgresStream pinning, service API redesign; 37 tests pass, clippy clean, fmt clean | Wire deadpool-postgres; add PG integration tests; GPUI application shell |
 | 2026-07-14 | Phase 1 | Fixed 5 failing tests (bool decode: `t`/`f` format, timestamp timezone offset `+00` handling), fixed ConnectionService missing `Failed` state on no-driver path, added `ServiceError::{QueryFailed, ConnectionNotFound, NotConnected}`, added 7 integration tests (PG connect/select/insert/streaming/auth/schema/events), parameterized schema snapshot queries (SQL injection fix), pinned PostgresStream (`Pin<Box<RowStream>>`); **65 unit tests pass** — clippy clean, fmt clean, cargo deny clean | Run integration tests with DATABASE_URL; begin GPUI shell |
 | 2026-07-14 | Phase 1 | Fixed Docker PostgreSQL compatibility: switched from `query_raw` to `client.query()` (lifetime issue with RowStream borrowing client), added `password` field to `Connection` struct, switched `sslmode=require` to `sslmode=disable`, added `PostgresStream::from_rows` for collected results; **all 7 integration tests pass** against Docker PostgreSQL | Commit and merge; begin GPUI shell |
+| 2026-08-17 | Phase 1 | Branch `docs/gpui-verified-api`: folded the verified GPUI API survey (local `zed-industries/zed` clone, gpui `0.2.2`) into docs/11-gpui.md — corrected `Render` trait + 2-arg `render(&mut Window, &mut Context<Self>)` signature, `Entity<T>`/`cx.new` state model, `gpui_platform::application()` entry point, dependency wiring (two crates, one rev), what GPUI actually ships (no text input, no 2D grid, no usable theme), `uniform_list`/`list`+`ListState` virtualization APIs, GPUI executor vs tokio (`gpui_tokio` bridge), Zed crate licensing (GPL `ui`/`theme`/`markdown`/`editor` out of bounds); resolved 2 open questions; **D16** recorded | Verify `gpui_tokio` license; add `rust-toolchain.toml` ≥ 1.95.0; PR |
 | 2026-07-14 | Phase 1 | Code review fix pass (10 findings): fixed typed column decoding (finding #1), params passthrough (#2), RETURNING rows (#3), batch-size chunking (#4), schema error propagation (#5), schema scope for columns/indexes (#6), index columns via pg_index (#7), cancel handle capture (#8), configurable sslmode (#9), conninfo escaping via Config builder (#10); reverted #4 from `query_raw` to `query()`+chunked batch due to live-DB `Closed` error with `query_raw` through QueryService (true lazy streaming deferred to TODO); cleaned up debug pollution from root-cause investigation | Lazy wire streaming as follow-up; commit and PR |

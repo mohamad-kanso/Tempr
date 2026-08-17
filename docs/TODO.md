@@ -10,10 +10,15 @@
 
 - [ ] Lazy wire streaming via `query_raw()` — `PostgresStream` currently buffers full result set via `client.query()`, then yields `batch_size` chunks. True `query_raw` streaming was attempted but fails with `Error { kind: Closed }` specifically when called through `QueryService::execute()` (works fine via raw driver or closures). Root cause undetermined — suspected `Box<dyn DriverConnection>` + async trait boundary interaction. Investigate as follow-up.
 
+- [ ] Add `rust-toolchain.toml` pinning `channel = "1.95.0"` (Zed's pin, edition 2024) — prerequisite for the GPUI dependency (→ D16)
+- [ ] Verify the license of Zed's `gpui_tokio` crate. Apache-2.0 → depend on it; GPL → reimplement the bridge in Tempr (tokio `Runtime` as a GPUI global + `Task` adapter) (→ D16)
+- [ ] Pick and record the `gpui`/`gpui_platform` rev SHA; add both to `[workspace.dependencies]` and confirm `cargo deny` accepts the git sources (incl. transitive `zed-font-kit` on macOS)
+
 ## Next
 
 - [ ] Phase 1: PostgreSQL async driver with TLS connection (sslmode configurable, default Prefer)
-- [ ] Phase 1: GPUI application shell — main window, text input area, scrollable result grid
+- [ ] Phase 1: GPUI application shell — main window, text input area, scrollable result grid (base on `crates/gpui/examples/hello_world.rs`; text input from `examples/input.rs`)
+- [ ] Phase 1: `gpui_compat` module — wrap `gpui` + `gpui_platform` bootstrap/window/executor calls so upstream churn stays isolated (→ D16)
 
 ## Later
 
