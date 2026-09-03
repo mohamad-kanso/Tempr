@@ -45,6 +45,11 @@ pub trait DriverConnection: Send + Sync {
     /// `cancel_handle()` instead.
     async fn cancel(&mut self) -> Result<(), DriverError>;
 
+    /// Whether the underlying transport is known to be dead (server closed
+    /// the socket, connection task exited). Cheap, no I/O; used by the pool
+    /// to evict broken connections before handing them out.
+    fn is_closed(&self) -> bool;
+
     /// Obtain a cheap, cloneable handle that can cancel the query currently
     /// running on this connection from a *different* task, without needing
     /// exclusive (`&mut`) access — the connection may still be checked out

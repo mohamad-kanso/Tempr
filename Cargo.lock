@@ -5702,6 +5702,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "deadpool",
+ "futures",
  "parking_lot",
  "tempr_db",
  "tempr_domain",

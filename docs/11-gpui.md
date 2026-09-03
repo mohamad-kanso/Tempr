@@ -205,7 +205,7 @@ GPUI does **not** run on tokio. `crates/gpui/src/executor.rs` provides its own `
 - `cx.spawn(async move |this, cx| { … })` — foreground, entity-aware; use it to hop back and `entity.update(cx, …)`.
 - `Task<R>` is the join handle; **dropping it cancels the work**.
 
-Tempr's database layer is tokio-based (`tokio-postgres`, `deadpool-postgres`). The bridge is **`gpui_tokio`**: `Tokio::init(cx)` installs a multi-thread tokio runtime as a GPUI global, and `Tokio::spawn(cx, future) -> Task<Result<R, JoinError>>` runs a tokio future as a GPUI `Task`. Canonical shape for a query:
+Tempr's database layer is tokio-based (`tokio-postgres`, `deadpool`). The bridge is **`gpui_tokio`**: `Tokio::init(cx)` installs a multi-thread tokio runtime as a GPUI global, and `Tokio::spawn(cx, future) -> Task<Result<R, JoinError>>` runs a tokio future as a GPUI `Task`. Canonical shape for a query:
 
 1. `Tokio::spawn(cx, async move { query_service.execute(…).await })` — DB work on the tokio runtime.
 2. `cx.spawn(async move |this, cx| { … })` awaits it, then `entity.update(cx, |state, cx| { state.apply(batch); cx.notify(); })`.

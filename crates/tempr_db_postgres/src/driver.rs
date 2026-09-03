@@ -26,6 +26,9 @@ impl PostgresDriver {
     }
 }
 
+/// TCP connect timeout for new connections and cancel sockets.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[async_trait::async_trait]
 impl DatabaseDriver for PostgresDriver {
     fn engine(&self) -> EngineId {
@@ -46,7 +49,10 @@ impl DatabaseDriver for PostgresDriver {
             // No TLS connector is wired up yet (see docs/09-database-engine.md
             // follow-up) — `Prefer` communicates intent without breaking
             // today's plaintext-only connections the way `Require` would.
-            .ssl_mode(SslMode::Prefer);
+            .ssl_mode(SslMode::Prefer)
+            // Bounded so an unreachable host fails fast instead of waiting
+            // for the OS SYN timeout (also bounds the cancel socket).
+            .connect_timeout(CONNECT_TIMEOUT);
 
         let (client, connection_handle) = config.connect(NoTls).await.map_err(|e| {
             if e.to_string().contains("password authentication failed")
@@ -90,6 +96,10 @@ impl CancelHandle for PostgresCancelHandle {
 
 #[async_trait::async_trait]
 impl DriverConnection for PostgresConnection {
+    fn is_closed(&self) -> bool {
+        self.client.is_closed()
+    }
+
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream, DriverError> {
         let owned_params = to_sql_params(params);
         let sql_params = as_sql_refs(&owned_params);

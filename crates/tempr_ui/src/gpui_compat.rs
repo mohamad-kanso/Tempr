@@ -65,3 +65,19 @@ where
 {
     gpui_tokio::Tokio::spawn(cx, fut)
 }
+
+/// Run a tokio future when the app quits; GPUI waits for it (bounded by its
+/// own shutdown grace period) before exiting. Use for service `stop_all`.
+pub fn on_app_quit<F>(cx: &mut App, make: impl Fn() -> F + 'static) -> gpui::Subscription
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    cx.on_app_quit(move |cx| {
+        let task = spawn_tokio(cx, make());
+        async move {
+            if let Err(e) = task.await {
+                tracing::warn!(error = %e, "quit hook task failed");
+            }
+        }
+    })
+}
