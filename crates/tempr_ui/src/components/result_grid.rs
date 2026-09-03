@@ -7,7 +7,8 @@
 //! calls `cx.notify()` after each append so the grid fills incrementally.
 
 use gpui::{
-    AnyElement, Context, IntoElement, Render, Window, div, prelude::*, px, rgb, uniform_list,
+    AnyElement, Context, IntoElement, Render, ScrollStrategy, UniformListScrollHandle, Window, div,
+    prelude::*, px, rgb, uniform_list,
 };
 use tempr_domain::{Batch, ColumnSpec, Value};
 
@@ -18,20 +19,33 @@ pub const ROW_HEIGHT: f32 = 24.0;
 pub const HEADER_HEIGHT: f32 = 28.0;
 pub const COLUMN_WIDTH: f32 = 180.0;
 
-#[derive(Default)]
 pub struct ResultGrid {
     columns: Vec<ColumnSpec>,
     rows: Vec<Vec<Value>>,
     /// Shown instead of the table when there are no columns yet.
     message: Option<String>,
+    scroll_handle: UniformListScrollHandle,
+}
+
+impl Default for ResultGrid {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ResultGrid {
     pub fn new() -> Self {
         Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
             message: Some("Run a query (Enter or ctrl-enter) to see results here.".into()),
-            ..Default::default()
+            scroll_handle: UniformListScrollHandle::new(),
         }
+    }
+
+    /// Scroll so that `row` is the first visible row (clamped by the list).
+    pub fn scroll_to_row(&self, row: usize) {
+        self.scroll_handle.scroll_to_item(row, ScrollStrategy::Top);
     }
 
     /// Start a new result set: drop rows, keep the grid empty until columns.

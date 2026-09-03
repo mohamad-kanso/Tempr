@@ -6,6 +6,7 @@
 //! view through channels drained with `cx.spawn`.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
@@ -20,9 +21,16 @@ use tempr_services::{ConnectionService, QueryService, RowSink};
 use crate::components::{Input, InputEvent, ResultGrid};
 use crate::events::{self, UiEvent};
 use crate::gpui_compat;
+use crate::scroll_bench::ScrollBench;
 use crate::theme;
 
-actions!(main_window, [RunQuery, Quit]);
+actions!(
+    main_window,
+    [RunQuery, CancelQuery, DebugScrollBenchmark, Quit]
+);
+
+/// How many frames the scroll benchmark spreads the row sweep over.
+const BENCH_TARGET_FRAMES: usize = 600;
 
 pub const KEY_CONTEXT: &str = "MainWindow";
 
@@ -31,6 +39,9 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-enter", RunQuery, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-enter", RunQuery, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", CancelQuery, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-b", DebugScrollBenchmark, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-shift-b", DebugScrollBenchmark, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
@@ -54,6 +65,17 @@ impl RowSink for ChannelSink {
     }
 }
 
+/// Developer knobs, resolved by the binary (env vars) — the UI crate never
+/// reads the environment itself.
+#[derive(Debug, Clone, Default)]
+pub struct DevOptions {
+    /// Statement to run as soon as the connection is up.
+    pub startup_sql: Option<String>,
+    /// After the first query completes, run the scroll benchmark, log the
+    /// report, and quit. Used for headless frame-time measurement.
+    pub bench_scroll_then_exit: bool,
+}
+
 /// Service handles the window needs. Built by the binary before GPUI starts.
 pub struct Services {
     pub bus: Arc<EventBus>,
@@ -71,6 +93,10 @@ pub struct MainWindow {
     status: String,
     status_is_error: bool,
     query_running: bool,
+    dev: DevOptions,
+    /// Set when a benchmark should start on the next rendered frame.
+    bench_pending: bool,
+    bench: Option<ScrollBench>,
     focus_handle: FocusHandle,
     _input_subscription: Subscription,
     _bus_subscription: tempr_events::Subscription,
@@ -80,6 +106,7 @@ impl MainWindow {
     pub fn new(
         services: Services,
         connection: Option<Connection>,
+        dev: DevOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -128,6 +155,9 @@ impl MainWindow {
             status,
             status_is_error: false,
             query_running: false,
+            dev,
+            bench_pending: false,
+            bench: None,
             focus_handle: cx.focus_handle(),
             _input_subscription,
             _bus_subscription,
@@ -167,6 +197,101 @@ impl MainWindow {
     fn run_query_action(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
         let sql = self.input.read(cx).text().to_string();
         self.run_sql(sql, cx);
+    }
+
+    fn cancel_query_action(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.query_running {
+            self.set_status("No query running.", false, cx);
+            return;
+        }
+        // One connection → at most one active run; cancel whatever is in flight.
+        let query_service = self.services.query.clone();
+        let runs = query_service.active_runs();
+        if runs.is_empty() {
+            return;
+        }
+        self.set_status("Cancelling…", false, cx);
+        gpui_compat::spawn_tokio(cx, async move {
+            for run in runs {
+                if let Err(e) = query_service.cancel(run).await {
+                    tracing::warn!(error = %e, "cancel failed");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn bench_action(
+        &mut self,
+        _: &DebugScrollBenchmark,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_bench(window, cx);
+    }
+
+    /// Sweep the grid from top to bottom, one `on_next_frame` per step, and
+    /// report frame times. Diagnostic for the 60 fps acceptance criterion.
+    fn start_bench(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.grid.read(cx).row_count();
+        if rows == 0 {
+            self.set_status("Scroll benchmark: no rows to scroll.", true, cx);
+            return;
+        }
+        if self.bench.is_some() {
+            return;
+        }
+        let bench = ScrollBench::new(rows, BENCH_TARGET_FRAMES);
+        tracing::info!(rows, step = bench.step(), "scroll bench: starting");
+        self.set_status(
+            format!(
+                "Scroll benchmark: {rows} rows, {} rows/frame…",
+                bench.step()
+            ),
+            false,
+            cx,
+        );
+        self.bench = Some(bench);
+        cx.on_next_frame(window, |this, window, cx| this.bench_tick(window, cx));
+    }
+
+    fn bench_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(bench) = self.bench.as_mut() else {
+            return;
+        };
+        match bench.tick(Instant::now()) {
+            Some(row) => {
+                if bench.frames_recorded().is_multiple_of(100) {
+                    tracing::info!(
+                        row,
+                        frames = bench.frames_recorded(),
+                        "scroll bench: progress"
+                    );
+                }
+                self.grid.update(cx, |grid, cx| {
+                    grid.scroll_to_row(row);
+                    cx.notify();
+                });
+                cx.on_next_frame(window, |this, window, cx| this.bench_tick(window, cx));
+            }
+            None => {
+                let report = bench.report();
+                self.bench = None;
+                let summary = report.summary();
+                tracing::info!(
+                    frames = report.frames,
+                    avg_ms = report.avg.as_secs_f64() * 1e3,
+                    p95_ms = report.p95.as_secs_f64() * 1e3,
+                    max_ms = report.max.as_secs_f64() * 1e3,
+                    dropped = report.dropped,
+                    "{summary}"
+                );
+                self.set_status(summary, report.dropped > 0, cx);
+                if self.dev.bench_scroll_then_exit {
+                    cx.quit();
+                }
+            }
+        }
     }
 
     fn run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
@@ -257,6 +382,11 @@ impl MainWindow {
                         } else {
                             this.set_status(format!("Done — {rows} rows"), false, cx);
                         }
+                        if this.dev.bench_scroll_then_exit && this.bench.is_none() {
+                            // No `Window` here; `render` picks this up next frame.
+                            this.bench_pending = true;
+                            cx.notify();
+                        }
                     }
                     Ok(Err(e)) => {
                         this.grid.update(cx, |g, cx| {
@@ -292,6 +422,13 @@ impl MainWindow {
                 };
                 let is_error = matches!(state, ConnectionState::Failed);
                 self.set_status(text, is_error, cx);
+                if state == ConnectionState::Connected
+                    && let Some(sql) = self.dev.startup_sql.take()
+                {
+                    self.input
+                        .update(cx, |input, cx| input.set_text(sql.clone(), cx));
+                    self.run_sql(sql, cx);
+                }
             }
             UiEvent::RowsReceived { .. } if self.query_running => {
                 let rows = self.grid.read(cx).row_count();
@@ -325,11 +462,16 @@ impl Focusable for MainWindow {
 }
 
 impl Render for MainWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.bench_pending) {
+            self.start_bench(window, cx);
+        }
         div()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::run_query_action))
+            .on_action(cx.listener(Self::cancel_query_action))
+            .on_action(cx.listener(Self::bench_action))
             .flex()
             .flex_col()
             .size_full()

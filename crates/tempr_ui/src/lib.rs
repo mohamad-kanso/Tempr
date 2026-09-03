@@ -10,7 +10,8 @@ pub mod components;
 pub mod events;
 pub mod gpui_compat;
 pub mod main_window;
+pub mod scroll_bench;
 pub mod theme;
 pub mod value_format;
 
-pub use main_window::{MainWindow, Quit, Services, bind_keys};
+pub use main_window::{DevOptions, MainWindow, Quit, Services, bind_keys};

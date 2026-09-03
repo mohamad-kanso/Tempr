@@ -12,7 +12,7 @@ use tempr_db_postgres::PostgresDriver;
 use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef};
 use tempr_events::{EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService, ServiceRegistry};
-use tempr_ui::{Services, gpui_compat};
+use tempr_ui::{DevOptions, Services, gpui_compat};
 
 /// Everything the UI needs a handle to. Built before GPUI starts.
 ///
@@ -88,6 +88,15 @@ fn main() -> Result<()> {
 
     let services = build_services();
     let connection = connection_from_env()?;
+    // Developer knobs (see tempr_ui::DevOptions). TEMPR_STARTUP_SQL runs a
+    // statement once connected; TEMPR_BENCH_SCROLL=1 then benchmarks grid
+    // scrolling, logs the report and exits.
+    let dev = DevOptions {
+        startup_sql: std::env::var("TEMPR_STARTUP_SQL")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        bench_scroll_then_exit: std::env::var("TEMPR_BENCH_SCROLL").is_ok_and(|v| v == "1"),
+    };
     let _event_log = services.bus.subscribe(EventFilter::All, |event| {
         info!(event = ?event.kind(), "event");
     });
@@ -113,7 +122,7 @@ fn main() -> Result<()> {
             query: services.query.clone(),
         };
         if let Err(e) = gpui_compat::open_main_window(cx, "Tempr", move |window, cx| {
-            tempr_ui::MainWindow::new(ui_services, connection, window, cx)
+            tempr_ui::MainWindow::new(ui_services, connection, dev, window, cx)
         }) {
             error!(error = %e, "failed to open main window");
             cx.quit();
