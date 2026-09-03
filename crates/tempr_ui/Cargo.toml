@@ -6,18 +6,13 @@ license.workspace = true
 description       = "GPUI components, views and layout for Tempr (11-gpui.md)"
 
 [dependencies]
-tempr_domain.workspace   = true
-tempr_events.workspace   = true
-tempr_services.workspace = true
-
 # GPUI — only this crate (and the binary via `tempr_ui::gpui_compat`) touches these.
 gpui.workspace          = true
 gpui_platform.workspace = true
 gpui_tokio.workspace    = true
 
-anyhow.workspace  = true
-tokio.workspace   = true
-tracing.workspace = true
+anyhow.workspace = true
+tokio.workspace  = true
 
 [lints]
 workspace = true

@@ -13,6 +13,7 @@
 - [ ] Make `ConnectionService` / `QueryService` / `SchemaService` implement the `Service` lifecycle trait so the binary registers them in `ServiceRegistry` (today only test services implement it; the GPUI shell holds plain `Arc`s)
 - [ ] Wire `deadpool-postgres` pool into `ConnectionService` (dependency declared, unused)
 - [ ] `Input` component: hand-roll single-line text input from `crates/gpui/examples/input.rs` (rev `ed8d600`) — Phase 1 editor placeholder
+- [ ] `ThemeProvider` tokens replace the placeholder palette consts in `tempr_ui::main_window` (no hard-coded colors rule, 11-gpui.md)
 - [ ] `Table` component: `uniform_list`-backed result grid fed by `QueryService` stream via `gpui_compat::spawn_tokio` — Phase 1 grid placeholder
 
 ## Next

@@ -5649,16 +5649,13 @@ name = "tempr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "parking_lot",
- "tempfile",
  "tempr_db",
  "tempr_db_postgres",
  "tempr_domain",
  "tempr_events",
  "tempr_services",
  "tempr_ui",
- "tempr_workspace",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5737,11 +5734,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_tokio",
- "tempr_domain",
- "tempr_events",
- "tempr_services",
  "tokio",
- "tracing",
 ]
 
 [[package]]

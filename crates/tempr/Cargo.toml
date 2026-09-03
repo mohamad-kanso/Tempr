@@ -5,23 +5,21 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tempr_domain.workspace    = true
-tempr_events.workspace    = true
-tempr_services.workspace  = true
-tempr_workspace.workspace = true
-tempr_db.workspace        = true
+tempr_events.workspace      = true
+tempr_services.workspace    = true
+tempr_db.workspace          = true
 tempr_db_postgres.workspace = true
 tempr_ui.workspace          = true
 
 anyhow.workspace             = true
-async-trait.workspace        = true
-parking_lot.workspace        = true
-tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
-tempfile.workspace           = true
 
 [dev-dependencies]
+# tests/integration.rs (live PostgreSQL, ignored without DATABASE_URL)
+tempr_domain.workspace = true
+tokio.workspace        = true
+parking_lot.workspace  = true
 url = "2"
 
 [lints]
