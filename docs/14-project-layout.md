@@ -174,7 +174,6 @@ graph TD
     grid --> editor
 
     editor --> domain
-    editor --> events
 
     db_postgres --> db
     db_postgres --> plugin

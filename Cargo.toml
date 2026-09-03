@@ -49,7 +49,8 @@ rust_decimal     = { version = "1", features = ["db-postgres"] }
 bytes            = "1"
 
 # Editor (D21)
-ropey = "1"
+# LF / CRLF line semantics only (no unicode_lines / cr_lines): see tempr_editor::buffer
+ropey = { version = "1", default-features = false, features = ["simd"] }
 
 # Data / serialisation
 chrono      = { version = "0.4", features = ["serde"] }

@@ -4,10 +4,14 @@
 //! tree-sitter, `StatementRange`, and the result of `str` slicing. `ropey`
 //! itself is char-indexed; the conversions live here and nowhere else.
 //!
-//! Deviation from docs/10-editor.md: `edit` returns `Result` (an edit with an
-//! out-of-range, non-char-boundary, or overlapping range is a caller bug we
-//! refuse rather than panic on), and the buffer does not publish
-//! `BufferChanged` itself — it is a pure model; the owning service publishes.
+//! Line semantics: a line ends at `\n`; a preceding `\r` belongs to the
+//! terminator (CRLF). Other Unicode separators are ordinary characters
+//! (ropey is built without `unicode_lines`/`cr_lines`).
+//!
+//! `edit` returns `Result` (an edit with an out-of-range, non-char-boundary,
+//! or overlapping range is a caller bug we refuse rather than panic on) and
+//! `Ok(None)` when the batch changes nothing. The buffer does not publish
+//! `BufferChanged` — it is a pure model; the owning service publishes.
 
 use std::ops::Range;
 
@@ -51,12 +55,14 @@ pub enum EditError {
 }
 
 /// One replacement inside a transaction, remembered for undo/redo.
+///
+/// `start` is the position in the pre-transaction text. Changes are applied
+/// highest-start-first, so while a change is being applied every change with
+/// a lower start is still unapplied and `start` is exact; undoing in LIFO
+/// order restores that same situation, so `start` is exact again.
 #[derive(Debug, Clone)]
 struct Change {
-    /// Start in the pre-transaction text.
-    original_start: usize,
-    /// Start in the post-transaction text (shifted by earlier changes).
-    final_start: usize,
+    start: usize,
     removed: String,
     inserted: String,
 }
@@ -64,7 +70,7 @@ struct Change {
 #[derive(Debug, Clone)]
 struct Transaction {
     id: EditId,
-    /// Sorted by `original_start` descending — the order they were applied.
+    /// In application order (start descending; see `edit` for tie-breaks).
     changes: Vec<Change>,
 }
 
@@ -126,24 +132,44 @@ impl Buffer {
         if line >= self.rope.len_lines() {
             return None;
         }
-        let s = self.rope.line(line).to_string();
-        Some(s.trim_end_matches(['\n', '\r']).to_string())
+        let start = self.rope.line_to_byte(line);
+        let end = start + self.line_content_len(line);
+        Some(self.rope.byte_slice(start..end).to_string())
     }
 
     /// Apply a batch of replacements expressed against the **current** text.
+    ///
     /// Ranges must lie within the buffer, start and end on char boundaries,
-    /// and not overlap (touching is fine). All-or-nothing: on error the
-    /// buffer is unchanged. A successful edit clears the redo stack.
-    pub fn edit(&mut self, edits: &[(Range<usize>, &str)]) -> Result<EditId, EditError> {
+    /// and not overlap (touching is fine). Edits sharing a start are ordered
+    /// so that a zero-width insert lands *before* a replacement at the same
+    /// offset, and several inserts at one offset appear in caller order.
+    ///
+    /// All-or-nothing: on error the buffer is unchanged. Returns `Ok(None)`
+    /// and leaves the history alone when the batch changes no text
+    /// (empty batch, or every replacement equals what it replaces); a real
+    /// change records one undo transaction and clears the redo stack.
+    pub fn edit(&mut self, edits: &[(Range<usize>, &str)]) -> Result<Option<EditId>, EditError> {
         // Validate everything before touching the rope.
         for (range, _) in edits {
             self.char_range(range)?;
         }
+        // Application order: start descending; for equal starts the longer
+        // range first (so an insert at that offset ends up in front of the
+        // replaced text), then later caller entries first (so same-offset
+        // inserts read in caller order).
         let mut order: Vec<usize> = (0..edits.len()).collect();
-        order.sort_by(|&a, &b| edits[b].0.start.cmp(&edits[a].0.start));
+        order.sort_by(|&a, &b| {
+            let (ra, rb) = (&edits[a].0, &edits[b].0);
+            rb.start
+                .cmp(&ra.start)
+                .then(rb.end.cmp(&ra.end))
+                .then(b.cmp(&a))
+        });
         for w in order.windows(2) {
             let (hi, lo) = (&edits[w[0]].0, &edits[w[1]].0);
-            if lo.end > hi.start {
+            // Two non-empty ranges sharing a start overlap by definition.
+            let same_start_both_nonempty = lo.start == hi.start && !lo.is_empty() && !hi.is_empty();
+            if lo.end > hi.start || same_start_both_nonempty {
                 return Err(EditError::Overlapping {
                     a_start: lo.start,
                     a_end: lo.end,
@@ -158,37 +184,33 @@ impl Buffer {
         for &i in &order {
             let (range, text) = &edits[i];
             let removed = self.replace_bytes(range.clone(), text);
-            changes.push(Change {
-                original_start: range.start,
-                final_start: range.start, // fixed up below
-                removed,
-                inserted: (*text).to_string(),
-            });
+            if removed != *text {
+                changes.push(Change {
+                    start: range.start,
+                    removed,
+                    inserted: (*text).to_string(),
+                });
+            }
         }
-        // Final positions: each change is shifted by the deltas of all changes
-        // that start before it (those with a lower original start).
-        for i in 0..changes.len() {
-            let shift: isize = changes
-                .iter()
-                .filter(|c| c.original_start < changes[i].original_start)
-                .map(|c| c.inserted.len() as isize - c.removed.len() as isize)
-                .sum();
-            changes[i].final_start = (changes[i].original_start as isize + shift) as usize;
+        if changes.is_empty() {
+            return Ok(None);
         }
 
         let id = EditId(self.next_edit);
         self.next_edit += 1;
         self.history.undo.push(Transaction { id, changes });
         self.history.redo.clear();
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// Revert the most recent transaction. Returns its id.
     pub fn undo(&mut self) -> Option<EditId> {
         let tx = self.history.undo.pop()?;
-        // Highest final start first, so lower positions are unaffected.
-        for change in &tx.changes {
-            let range = change.final_start..change.final_start + change.inserted.len();
+        // LIFO: the last-applied change (lowest start) goes first; by the time
+        // a change is undone, everything below it is already undone, so its
+        // original `start` is exact.
+        for change in tx.changes.iter().rev() {
+            let range = change.start..change.start + change.inserted.len();
             self.replace_bytes(range, &change.removed);
         }
         let id = tx.id;
@@ -200,7 +222,7 @@ impl Buffer {
     pub fn redo(&mut self) -> Option<EditId> {
         let tx = self.history.redo.pop()?;
         for change in &tx.changes {
-            let range = change.original_start..change.original_start + change.removed.len();
+            let range = change.start..change.start + change.removed.len();
             self.replace_bytes(range, &change.inserted);
         }
         let id = tx.id;
@@ -228,22 +250,38 @@ impl Buffer {
         }
     }
 
-    /// Byte offset for a point; the line clamps to the last line and the
-    /// column clamps to the end of that line's content (before its break).
+    /// Byte offset for a point; the line clamps to the last line, the
+    /// column clamps to the end of that line's content (before its break),
+    /// and the result is snapped down to a char boundary so it is always
+    /// valid for `edit`/`slice`.
     pub fn offset_for_point(&self, point: Point) -> usize {
         let last_line = self.rope.len_lines().saturating_sub(1);
         let line = point.line.min(last_line);
         let line_start = self.rope.line_to_byte(line);
-        let content_len = self
-            .rope
-            .line(line)
-            .to_string()
-            .trim_end_matches(['\n', '\r'])
-            .len();
-        line_start + point.column.min(content_len)
+        let byte = line_start + point.column.min(self.line_content_len(line));
+        self.rope.char_to_byte(self.rope.byte_to_char(byte))
     }
 
     // ── internals ───────────────────────────────────────────────────────
+
+    /// Byte length of `line` excluding its terminator (`\n` or `\r\n`).
+    /// O(log n): two line→byte lookups plus at most two byte reads.
+    fn line_content_len(&self, line: usize) -> usize {
+        let start = self.rope.line_to_byte(line);
+        let end = if line + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line + 1)
+        } else {
+            self.rope.len_bytes()
+        };
+        let mut len = end - start;
+        if len > 0 && self.rope.byte(end - 1) == b'\n' {
+            len -= 1;
+            if len > 0 && self.rope.byte(end - 2) == b'\r' {
+                len -= 1;
+            }
+        }
+        len
+    }
 
     /// Validate a byte range and convert it to ropey char indices.
     fn char_range(&self, range: &Range<usize>) -> Result<Range<usize>, EditError> {
@@ -322,7 +360,7 @@ mod tests {
     #[test]
     fn insert_delete_replace() {
         let mut b = buf("select 1;");
-        b.edit(&[(6..6, " *")]).unwrap(); // insert
+        b.edit(&[(6..6, " *")]).unwrap().unwrap(); // insert
         assert_eq!(b.text().to_string(), "select * 1;");
         b.edit(&[(8..10, "")]).unwrap(); // delete " 1"
         assert_eq!(b.text().to_string(), "select *;");
@@ -348,8 +386,9 @@ mod tests {
         let mut b = buf("aaa bbb ccc");
         let e1 = b
             .edit(&[(0..3, "A"), (4..7, "BBBBB"), (8..11, "")])
+            .unwrap()
             .unwrap();
-        let e2 = b.edit(&[(1..1, "-")]).unwrap();
+        let e2 = b.edit(&[(1..1, "-")]).unwrap().unwrap();
         assert_eq!(b.text().to_string(), "A- BBBBB ");
 
         assert_eq!(b.undo(), Some(e2));
@@ -379,12 +418,12 @@ mod tests {
     #[test]
     fn edit_ids_increase_and_survive_undo_redo() {
         let mut b = buf("");
-        let a = b.edit(&[(0..0, "a")]).unwrap();
-        let c = b.edit(&[(1..1, "c")]).unwrap();
+        let a = b.edit(&[(0..0, "a")]).unwrap().unwrap();
+        let c = b.edit(&[(1..1, "c")]).unwrap().unwrap();
         assert!(c > a);
         assert_eq!(b.undo(), Some(c));
         assert_eq!(b.redo(), Some(c));
-        let d = b.edit(&[(2..2, "d")]).unwrap();
+        let d = b.edit(&[(2..2, "d")]).unwrap().unwrap();
         assert!(d > c);
     }
 
@@ -516,5 +555,105 @@ mod tests {
             avg < Duration::from_millis(1),
             "average insert+delete {avg:?} exceeds 1 ms"
         );
+    }
+
+    #[test]
+    fn same_start_insert_and_replace_undo_exactly() {
+        // Zero-width insert at the start of a replaced range: the insert
+        // lands before the replacement, and undo restores the original.
+        for edits in [
+            vec![(2..5, "Z"), (2..2, "x")],
+            vec![(2..2, "x"), (2..5, "Z")],
+        ] {
+            let mut b = buf("abcdefg");
+            b.edit(&edits).unwrap().unwrap();
+            assert_eq!(b.text().to_string(), "abxZfg");
+            b.undo();
+            assert_eq!(b.text().to_string(), "abcdefg");
+            b.redo();
+            assert_eq!(b.text().to_string(), "abxZfg");
+        }
+        let mut b = buf("01234X");
+        b.edit(&[(5..6, "c"), (5..5, "ab")]).unwrap().unwrap();
+        assert_eq!(b.text().to_string(), "01234abc");
+        b.undo();
+        assert_eq!(b.text().to_string(), "01234X");
+    }
+
+    #[test]
+    fn same_offset_inserts_keep_caller_order() {
+        let mut b = buf("abcd");
+        b.edit(&[(2..2, "x"), (2..2, "y")]).unwrap().unwrap();
+        assert_eq!(b.text().to_string(), "abxycd");
+        b.undo();
+        assert_eq!(b.text().to_string(), "abcd");
+        // Two non-empty ranges at one start overlap.
+        assert!(matches!(
+            b.edit(&[(1..2, "p"), (1..3, "q")]),
+            Err(EditError::Overlapping { .. })
+        ));
+    }
+
+    #[test]
+    fn no_op_batches_do_not_touch_history() {
+        let mut b = buf("abcd");
+        b.edit(&[(2..2, "c")]).unwrap().unwrap();
+        b.undo();
+        assert!(b.can_redo());
+        assert_eq!(b.edit(&[]).unwrap(), None);
+        assert_eq!(b.edit(&[(1..1, "")]).unwrap(), None);
+        assert_eq!(
+            b.edit(&[(1..3, "bc")]).unwrap(),
+            None,
+            "identical replacement"
+        );
+        assert!(b.can_redo(), "redo history survives no-op edits");
+        assert_eq!(b.text().to_string(), "abcd");
+        // A batch with one real change and one no-op records just the change.
+        let id = b.edit(&[(0..1, "a"), (4..4, "!")]).unwrap().unwrap();
+        assert_eq!(b.text().to_string(), "abcd!");
+        assert_eq!(b.undo(), Some(id));
+        assert_eq!(b.text().to_string(), "abcd");
+    }
+
+    #[test]
+    fn offset_for_point_snaps_to_char_boundary() {
+        let b = buf("ab\ncdé"); // bytes: a0 b1 \n2 | c3 d4 é5-6
+        let off = b.offset_for_point(Point { line: 1, column: 3 });
+        assert_eq!(off, 5, "column inside é snaps back to its start");
+        let mut b2 = buf("ab\ncdé");
+        b2.edit(&[(off..off, "x")]).unwrap().unwrap();
+        assert_eq!(b2.text().to_string(), "ab\ncdxé");
+    }
+
+    #[test]
+    fn only_lf_and_crlf_are_line_breaks() {
+        let b = buf("ab\u{2028}cd\u{0c}ef\nx");
+        assert_eq!(b.len_lines(), 2, "U+2028 and form feed are not breaks");
+        assert_eq!(b.line(0).as_deref(), Some("ab\u{2028}cd\u{0c}ef"));
+        assert_eq!(
+            b.offset_for_point(Point {
+                line: 0,
+                column: 99
+            }),
+            "ab\u{2028}cd\u{0c}ef".len()
+        );
+    }
+
+    #[test]
+    fn large_batch_edit_is_fast_enough() {
+        // 20k single-char replacements in one transaction (a "replace all").
+        let text = "a".repeat(200_000);
+        let mut b = buf(&text);
+        let edits: Vec<(Range<usize>, &str)> =
+            (0..20_000).map(|i| (i * 10..i * 10 + 1, "b")).collect();
+        let t = std::time::Instant::now();
+        b.edit(&edits).unwrap().unwrap();
+        let elapsed = t.elapsed();
+        assert_eq!(b.slice(0..11).unwrap(), "baaaaaaaaab");
+        // Generous bound for debug builds; the point is no quadratic blow-up.
+        assert!(elapsed.as_millis() < 2_000, "batch edit took {elapsed:?}");
+        b.undo();
+        assert_eq!(b.text().to_string(), text);
     }
 }

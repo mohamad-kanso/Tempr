@@ -26,7 +26,7 @@
 
 ## Later
 
-- [ ] Phase 2: Rope buffer implementation (10 MB, sub-ms insert/delete)
+- [ ] `EditHistory` bounds: cap depth and coalesce typing bursts (today every keystroke stores its removed/inserted text forever; a select-all + paste on a 10 MB file retains full copies)
 - [ ] Phase 2: Tree-sitter PostgreSQL grammar integration + incremental parse
 - [ ] Phase 2: Statement boundary detector ($$ delimiters, comments, string literals)
 - [ ] Phase 2: Command palette (fuzzy search, all registered commands, configurable keybindings)

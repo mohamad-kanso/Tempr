@@ -40,7 +40,7 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 - AC: 100,000-row result set scrolls at 60 fps. Auth failure produces a user-visible error (not a crash). Peak RSS stays below 500 MB streaming 1,000,000 rows.
 
 ### 3. Editor (Phase 2)
-- ✅ Rope buffer handles documents up to 10 MB with sub-millisecond insert/delete at arbitrary positions (`tempr_editor::Buffer` on `ropey`; measured 1.96 µs avg / 37.6 µs worst in release, 2026-09-03)
+- ✅ Rope buffer handles documents up to 10 MB with sub-millisecond insert/delete at arbitrary positions (`tempr_editor::Buffer` on `ropey`; measured 1.73 µs avg / 12.1 µs worst in release, 2026-09-03)
 - 🔜 Tree-sitter PostgreSQL grammar produces an incremental syntax tree
 - 🔜 Statement detector correctly identifies statement boundaries (respecting `$$` delimiters, comments, string literals)
 - 🔜 Command palette opens via keybinding, lists all registered commands, accepts fuzzy input, executes selected command
