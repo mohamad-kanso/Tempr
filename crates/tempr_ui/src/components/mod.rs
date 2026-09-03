@@ -2,7 +2,7 @@
 //! GPUI ships no text input and no data grid; both live here.
 
 pub mod input;
-pub mod results_grid;
+pub mod result_grid;
 
 pub use input::{Input, InputEvent};
-pub use results_grid::ResultsGrid;
+pub use result_grid::ResultGrid;

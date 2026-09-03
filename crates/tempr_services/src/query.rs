@@ -15,6 +15,9 @@ use crate::connection::ConnectionService;
 struct ActiveRun {
     query_run: QueryRun,
     cancel_handle: Option<Box<dyn CancelHandle>>,
+    /// Set by `cancel()`; `finish()` then records `Cancelled` instead of the
+    /// driver's cancellation error.
+    cancelled: bool,
 }
 
 /// Receives a query's results as they stream in. Called from the query task
@@ -139,6 +142,7 @@ impl QueryService {
             ActiveRun {
                 query_run,
                 cancel_handle: None,
+                cancelled: false,
             },
         );
 
@@ -194,29 +198,51 @@ impl QueryService {
     }
 
     /// Move the run from active to completed, publish `QueryFinished`, and
-    /// map the result to the public return type.
+    /// map the result to the public return type. A run flagged by `cancel()`
+    /// completes as `Cancelled` and returns `Ok(run_id)` — partial rows the
+    /// sink already received stay valid.
     fn finish(
         &self,
         run_id: QueryRunId,
         result: Result<(Vec<ColumnMeta>, usize), ServiceError>,
         result_set: Option<ResultSet>,
     ) -> Result<QueryRunId, ServiceError> {
-        let mut active_runs = self.active_runs.write();
-        if let Some(mut active) = active_runs.remove(&run_id) {
-            let outcome = match &result {
+        // Take the entry under the lock, then release it before touching
+        // `completed_runs` or publishing — handlers may call back into us.
+        let removed = self.active_runs.write().remove(&run_id);
+        let Some(mut active) = removed else {
+            return Self::map_result(result, run_id);
+        };
+
+        let cancelled = active.cancelled;
+        let outcome = if cancelled {
+            QueryOutcome::Cancelled
+        } else {
+            match &result {
                 Ok(_) => QueryOutcome::Success,
                 Err(e) => QueryOutcome::Error(e.to_string()),
-            };
-            active.query_run.outcome = outcome.clone();
-            active.query_run.finished_at = Some(chrono::Utc::now());
-            active.query_run.result_set = result_set;
-            self.event_bus.publish(AppEvent::QueryFinished {
-                run: run_id,
-                outcome,
-            });
-            self.completed_runs.write().insert(run_id, active.query_run);
-        }
+            }
+        };
+        active.query_run.outcome = outcome.clone();
+        active.query_run.finished_at = Some(chrono::Utc::now());
+        active.query_run.result_set = result_set;
+        self.completed_runs.write().insert(run_id, active.query_run);
+        self.event_bus.publish(AppEvent::QueryFinished {
+            run: run_id,
+            outcome,
+        });
 
+        if cancelled {
+            Ok(run_id)
+        } else {
+            Self::map_result(result, run_id)
+        }
+    }
+
+    fn map_result(
+        result: Result<(Vec<ColumnMeta>, usize), ServiceError>,
+        run_id: QueryRunId,
+    ) -> Result<QueryRunId, ServiceError> {
         result.map(|_| run_id).map_err(|e| match e {
             ServiceError::QueryFailed { .. } => e,
             other => ServiceError::QueryFailed {
@@ -226,23 +252,34 @@ impl QueryService {
         })
     }
 
+    /// Cancel a run. For an in-flight run the driver-side cancel is issued and
+    /// the run is flagged so its `finish()` records `Cancelled`; for an
+    /// unknown/finished run a `QueryFinished { Cancelled }` is published
+    /// immediately so callers always observe a terminal event.
     pub async fn cancel(&self, run_id: QueryRunId) -> Result<(), ServiceError> {
-        let handle = self
-            .active_runs
-            .write()
-            .remove(&run_id)
-            .and_then(|active| active.cancel_handle);
+        let handle = {
+            let mut active_runs = self.active_runs.write();
+            match active_runs.get_mut(&run_id) {
+                Some(active) => {
+                    active.cancelled = true;
+                    active.cancel_handle.take()
+                }
+                None => {
+                    drop(active_runs);
+                    self.event_bus.publish(AppEvent::QueryFinished {
+                        run: run_id,
+                        outcome: QueryOutcome::Cancelled,
+                    });
+                    return Ok(());
+                }
+            }
+        };
 
         if let Some(handle) = handle
             && let Err(e) = handle.cancel().await
         {
             tracing::warn!("failed to cancel query {run_id:?} on driver: {e}");
         }
-
-        self.event_bus.publish(AppEvent::QueryFinished {
-            run: run_id,
-            outcome: QueryOutcome::Cancelled,
-        });
         Ok(())
     }
 
@@ -330,9 +367,13 @@ mod tests {
         }
     }
 
+    /// Optional gate: after the first batch the stream waits for `notify`
+    /// and then reports `DriverError::Cancelled` (a server-side cancel).
     struct MockStream {
         columns: Vec<ColumnSpec>,
         batches: std::collections::VecDeque<Batch>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        yielded: usize,
     }
     #[async_trait::async_trait]
     impl QueryStreamImpl for MockStream {
@@ -340,6 +381,13 @@ mod tests {
             &self.columns
         }
         async fn next_batch(&mut self) -> Result<Option<Batch>, DriverError> {
+            if self.yielded >= 1
+                && let Some(gate) = &self.gate
+            {
+                gate.notified().await;
+                return Err(DriverError::Cancelled);
+            }
+            self.yielded += 1;
             Ok(self.batches.pop_front())
         }
         fn rows_affected(&self) -> u64 {
@@ -351,6 +399,7 @@ mod tests {
     struct MockConn {
         batches: usize,
         rows_per_batch: usize,
+        gate: Option<Arc<tokio::sync::Notify>>,
     }
     #[async_trait::async_trait]
     impl DriverConnection for MockConn {
@@ -377,7 +426,12 @@ mod tests {
                 })
                 .collect();
             Ok(tempr_db::QueryStream::new(
-                Box::new(MockStream { columns, batches }),
+                Box::new(MockStream {
+                    columns,
+                    batches,
+                    gate: self.gate.clone(),
+                    yielded: 0,
+                }),
                 self.rows_per_batch,
             ))
         }
@@ -398,6 +452,7 @@ mod tests {
     struct MockDriver {
         batches: usize,
         rows_per_batch: usize,
+        gate: Option<Arc<tokio::sync::Notify>>,
     }
     #[async_trait::async_trait]
     impl DatabaseDriver for MockDriver {
@@ -411,6 +466,7 @@ mod tests {
             Ok(Box::new(MockConn {
                 batches: self.batches,
                 rows_per_batch: self.rows_per_batch,
+                gate: self.gate.clone(),
             }))
         }
     }
@@ -419,11 +475,20 @@ mod tests {
         batches: usize,
         rows_per_batch: usize,
     ) -> (Arc<EventBus>, Arc<QueryService>, ConnectionId) {
+        connected_service_gated(batches, rows_per_batch, None).await
+    }
+
+    async fn connected_service_gated(
+        batches: usize,
+        rows_per_batch: usize,
+        gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> (Arc<EventBus>, Arc<QueryService>, ConnectionId) {
         let bus = make_event_bus();
         let cs = ConnectionService::new(bus.clone());
         cs.register_driver(Arc::new(MockDriver {
             batches,
             rows_per_batch,
+            gate,
         }));
         let id = ConnectionId::new();
         let conn = Connection {
@@ -514,5 +579,45 @@ mod tests {
         assert_eq!(rs.total_rows, 10);
         assert_eq!(rs.columns[0].name, "n");
         assert_eq!(*counts.lock(), vec![5, 5]);
+    }
+
+    #[tokio::test]
+    async fn cancel_during_run_completes_as_cancelled_not_error() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (bus, svc, id) = connected_service_gated(3, 2, Some(gate.clone())).await;
+        let finished: Arc<Mutex<Vec<QueryOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let f = finished.clone();
+        let _sub = bus.subscribe(EventFilter::All, move |ev| {
+            if let AppEvent::QueryFinished { outcome, .. } = ev {
+                f.lock().push(outcome.clone());
+            }
+        });
+
+        let sink = Arc::new(RecordingSink::default());
+        let svc2 = svc.clone();
+        let sink2 = sink.clone();
+        let task = tokio::spawn(async move { svc2.execute_streaming("SELECT n", id, sink2).await });
+
+        // Wait until the first batch has been delivered, i.e. the run is in flight.
+        while sink.batches.lock().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let run_id = svc.active_runs()[0];
+        svc.cancel(run_id).await.unwrap();
+        gate.notify_one();
+
+        let result = task.await.unwrap();
+        assert_eq!(result.unwrap(), run_id, "a cancelled run is not an error");
+        let run = svc
+            .completed_run(run_id)
+            .expect("cancelled run is recorded");
+        assert_eq!(run.outcome, QueryOutcome::Cancelled);
+        assert_eq!(*finished.lock(), vec![QueryOutcome::Cancelled]);
+        assert_eq!(
+            sink.batches.lock().len(),
+            1,
+            "partial rows stay with the sink"
+        );
+        assert!(svc.active_runs().is_empty());
     }
 }

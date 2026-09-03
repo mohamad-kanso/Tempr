@@ -3,7 +3,7 @@
 //!
 //! Owns the rows it displays (Phase 1: `Vec<Vec<Value>>`; the columnar
 //! `RowStore` with spill-to-disk from docs/13-result-grid.md is a follow-up).
-//! Rows arrive as `Batch`es through [`ResultsGrid::append`]; the parent view
+//! Rows arrive as `Batch`es through [`ResultGrid::append`]; the parent view
 //! calls `cx.notify()` after each append so the grid fills incrementally.
 
 use gpui::{
@@ -12,21 +12,21 @@ use gpui::{
 use tempr_domain::{Batch, ColumnSpec, Value};
 
 use crate::theme;
-use crate::value_format::{NULL_TEXT, format_value};
+use crate::value_format::format_value;
 
 pub const ROW_HEIGHT: f32 = 24.0;
 pub const HEADER_HEIGHT: f32 = 28.0;
 pub const COLUMN_WIDTH: f32 = 180.0;
 
 #[derive(Default)]
-pub struct ResultsGrid {
+pub struct ResultGrid {
     columns: Vec<ColumnSpec>,
     rows: Vec<Vec<Value>>,
     /// Shown instead of the table when there are no columns yet.
     message: Option<String>,
 }
 
-impl ResultsGrid {
+impl ResultGrid {
     pub fn new() -> Self {
         Self {
             message: Some("Run a query (Enter or ctrl-enter) to see results here.".into()),
@@ -100,9 +100,8 @@ impl ResultsGrid {
             .w(px(self.total_width()))
             .bg(rgb(bg))
             .children(row.iter().map(|v| {
-                let text = format_value(v);
-                let is_null = text == NULL_TEXT;
-                Self::render_cell(text, is_null)
+                let is_null = matches!(v, Value::Null);
+                Self::render_cell(format_value(v), is_null)
             }))
             .into_any_element()
     }
@@ -132,7 +131,7 @@ impl ResultsGrid {
     }
 }
 
-impl Render for ResultsGrid {
+impl Render for ResultGrid {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.columns.is_empty() {
             return div()
@@ -193,7 +192,7 @@ mod tests {
 
     #[test]
     fn append_accumulates_and_reset_clears() {
-        let mut g = ResultsGrid::new();
+        let mut g = ResultGrid::new();
         g.set_columns(vec![col("a"), col("b")]);
         g.append(Batch {
             rows: vec![vec![Value::Int8(1), Value::Null]],

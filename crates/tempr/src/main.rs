@@ -57,15 +57,22 @@ fn connection_from_env() -> Result<Option<Connection>> {
     if !matches!(url.scheme(), "postgres" | "postgresql") {
         anyhow::bail!("DATABASE_URL: unsupported scheme '{}'", url.scheme());
     }
+    // `url` returns userinfo and path percent-encoded; the driver wants the
+    // decoded values (e.g. `p%40ss` is the password `p@ss`).
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
     Ok(Some(Connection {
         id: ConnectionId::new(),
         name: "DATABASE_URL".to_string(),
         driver: DriverKind::Postgres,
         host: url.host_str().unwrap_or("localhost").to_string(),
         port: url.port().unwrap_or(5432),
-        database: url.path().trim_start_matches('/').to_string(),
-        username: url.username().to_string(),
-        password: url.password().unwrap_or("").to_string(),
+        database: decode(url.path().trim_start_matches('/')),
+        username: decode(url.username()),
+        password: decode(url.password().unwrap_or("")),
         secret_ref: SecretRef {
             vault_key: "DATABASE_URL".to_string(),
         },

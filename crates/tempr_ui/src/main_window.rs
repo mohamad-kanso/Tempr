@@ -1,6 +1,6 @@
 //! Root view of the application window.
 //!
-//! Layout: SQL `Input` (top) · `ResultsGrid` (middle) · status bar (bottom).
+//! Layout: SQL `Input` (top) · `ResultGrid` (middle) · status bar (bottom).
 //! Holds service handles + render state only (D6). Query execution happens
 //! in `QueryService` on the tokio runtime; rows and bus events reach this
 //! view through channels drained with `cx.spawn`.
@@ -17,7 +17,7 @@ use tempr_domain::{Batch, ColumnSpec, Connection, ConnectionId, ConnectionState,
 use tempr_events::EventBus;
 use tempr_services::{ConnectionService, QueryService, RowSink};
 
-use crate::components::{Input, InputEvent, ResultsGrid};
+use crate::components::{Input, InputEvent, ResultGrid};
 use crate::events::{self, UiEvent};
 use crate::gpui_compat;
 use crate::theme;
@@ -67,7 +67,7 @@ pub struct MainWindow {
     connection: Option<Connection>,
     connection_state: ConnectionState,
     input: Entity<Input>,
-    grid: Entity<ResultsGrid>,
+    grid: Entity<ResultGrid>,
     status: String,
     status_is_error: bool,
     query_running: bool,
@@ -84,7 +84,7 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| Input::new("SELECT … — Enter runs the statement", cx));
-        let grid = cx.new(|_| ResultsGrid::new());
+        let grid = cx.new(|_| ResultGrid::new());
 
         let _input_subscription = cx.subscribe(&input, |this, _input, event, cx| {
             if let InputEvent::Submit(sql) = event {
@@ -234,7 +234,7 @@ impl MainWindow {
             this.update(cx, |this, cx| {
                 this.query_running = false;
                 match outcome {
-                    Ok(Ok(_run)) => {
+                    Ok(Ok(run)) => {
                         let rows = this.grid.read(cx).row_count();
                         let cols = this.grid.read(cx).column_count();
                         if cols == 0 {
@@ -243,9 +243,28 @@ impl MainWindow {
                                 cx.notify();
                             });
                         }
-                        this.set_status(format!("Done — {rows} rows"), false, cx);
+                        let cancelled = this
+                            .services
+                            .query
+                            .completed_run(run)
+                            .is_some_and(|r| r.outcome == QueryOutcome::Cancelled);
+                        if cancelled {
+                            this.set_status(
+                                format!("Cancelled — {rows} rows (partial)"),
+                                false,
+                                cx,
+                            );
+                        } else {
+                            this.set_status(format!("Done — {rows} rows"), false, cx);
+                        }
                     }
-                    Ok(Err(e)) => this.set_status(format!("Query failed: {e}"), true, cx),
+                    Ok(Err(e)) => {
+                        this.grid.update(cx, |g, cx| {
+                            g.set_message(format!("Query failed: {e}"));
+                            cx.notify();
+                        });
+                        this.set_status(format!("Query failed: {e}"), true, cx);
+                    }
                     Err(join) => this.set_status(format!("Query task failed: {join}"), true, cx),
                 }
             })
@@ -281,7 +300,10 @@ impl MainWindow {
             UiEvent::QueryFinished {
                 outcome: QueryOutcome::Cancelled,
                 ..
-            } => self.set_status("Query cancelled", false, cx),
+            } => {
+                self.query_running = false;
+                self.set_status("Query cancelled", false, cx)
+            }
             _ => {}
         }
     }

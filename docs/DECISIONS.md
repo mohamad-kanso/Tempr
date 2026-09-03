@@ -37,6 +37,7 @@
 | D15 | 2026-07-13 | No direct commits to main ever — all work via branch → PR → review → merge, no exceptions | User |
 | D16 | 2026-08-17 | GPUI dependency is `gpui` + `gpui_platform` at one rev; Apache-2.0 Zed crates only, no GPL `ui`/`theme`/`markdown`/`editor` | Claude (Phase 1) |
 | D17 | 2026-09-03 | GPUI pinned to Zed `main` `ed8d600` with floor `ac5af8b9` (zlog/ztracing relicense); `gpui_tokio` adopted; `cargo deny check licenses` is the enforcement gate; toolchain `1.97.1` | Claude (Phase 1) |
+| D18 | 2026-09-03 | Small pure-Rust utility crates are adopted without an RFC when already in the graph: `unicode-segmentation` (grapheme cursor motion), `percent-encoding` (URL userinfo decoding), `url` promoted to a runtime dep | Claude (Phase 1) |
 
 ---
 
@@ -207,4 +208,13 @@
 **Why**: At tag v1.9.0 the gpui dependency tree contained three first-party Zed crates declared `GPL-3.0-or-later` (`zlog` ← `ztracing` ← `sum_tree` ← `gpui`). Linking them would have made Tempr GPL, contradicting D12/D16, and the release tags — the "reviewed, stable" pin points D14 prefers — all predate the fix. A `main` rev after the relicense is the only option that is both buildable and license-clean. Reading manifests by hand missed this (D16 was written from a source survey); only the full-graph tool catches transitive declarations, so it becomes the gate rather than manual review.
 
 **Consequences**: The pin is a `main` snapshot, so bumps need a `cargo deny check` before merge, every time. CI fails on any new copyleft crate anywhere in the graph. The Linux CI job installs gpui's system libraries (xkbcommon, wayland, fontconfig, freetype, x11-xcb, vulkan headers); macOS/Windows runners are a TODO. `.cargo/config.toml` sets `net.git-fetch-with-cli = true` because libgit2 fetched the Zed repo at ~3 MB per 10 min on this network.
+
+---
+
+## D18 — Utility dependencies for the UI shell (2026-09-03)
+
+**By**: Claude (Phase 1, code review follow-up).
+**Decision**: Adopt `unicode-segmentation` (grapheme-cluster boundaries for `Input` cursor motion), `percent-encoding` (decoding `DATABASE_URL` userinfo/path), and promote `url` from dev- to runtime dependency. Rule going forward: a pure-Rust, permissively licensed utility crate that is *already in the dependency graph* (here: all three arrive via gpui or tokio-postgres) may be added with a PROGRESS decisions-log row only; a crate that is **new to the graph** still needs a DECISIONS entry naming its license and why no existing dependency covers it.
+**Why**: CLAUDE.md classifies "new dependency" as MAJOR. Applying a full entry to every hashing/parsing helper would bury the record in noise, while skipping it silently violates the rule. The "already in the graph" test keeps `cargo deny` as the sole license gate (D17) and adds zero new supply-chain surface.
+**Consequences**: `unicode-segmentation` is the canonical grapheme library (no `unicode-width`/ICU alternatives without superseding this). `percent-encoding` decoding is applied wherever a `url::Url` component becomes a credential or identifier. This entry is the precedent for future "already in graph" additions.
 

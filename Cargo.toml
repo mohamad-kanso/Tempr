@@ -59,6 +59,7 @@ dirs = "5"
 parking_lot = "0.12"
 unicode-segmentation = "1"
 url = "2"
+percent-encoding = "2"
 
 # Logging
 tracing            = "0.1"

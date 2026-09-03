@@ -7,7 +7,7 @@
 
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use tempr_domain::{ConnectionId, ConnectionState, QueryOutcome, QueryRunId};
-use tempr_events::{AppEvent, EventBus, EventFilter, Subscription};
+use tempr_events::{AppEvent, AppEventKind, EventBus, EventFilter, Subscription};
 
 /// UI-facing projection of the bus events a view reacts to.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,7 +54,13 @@ impl UiEvent {
 /// returned `Subscription` alive for as long as the receiver is drained.
 pub fn bridge(bus: &EventBus) -> (Subscription, UnboundedReceiver<UiEvent>) {
     let (tx, rx) = unbounded();
-    let sub = bus.subscribe(EventFilter::All, move |event| {
+    let filter = EventFilter::AnyOf(vec![
+        AppEventKind::ConnectionStateChanged,
+        AppEventKind::QueryStarted,
+        AppEventKind::RowsReceived,
+        AppEventKind::QueryFinished,
+    ]);
+    let sub = bus.subscribe(filter, move |event| {
         if let Some(ui) = UiEvent::from_app(event) {
             // Receiver gone means the view is gone; nothing to do.
             let _ = tx.unbounded_send(ui);

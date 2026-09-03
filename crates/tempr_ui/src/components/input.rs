@@ -252,6 +252,11 @@ impl Input {
         else {
             return 0;
         };
+        // The layout is from the last frame; if content changed since (an
+        // edit and a click in the same event batch) it must not be trusted.
+        if line.text != self.content {
+            return self.cursor_offset().min(self.content.len());
+        }
         if position.y < bounds.top() {
             return 0;
         }
@@ -259,6 +264,7 @@ impl Input {
             return self.content.len();
         }
         line.closest_index_for_x(position.x - bounds.left())
+            .min(self.content.len())
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -325,6 +331,31 @@ fn offset_to_utf16(text: &str, offset: usize) -> usize {
         utf16_offset += ch.len_utf16();
     }
     utf16_offset
+}
+
+/// Resolve an IME selection given relative to the text inserted at
+/// `insert_start` (UTF-8 offset into `content`, which already contains the
+/// inserted text). Result is clamped to `content` and snapped to char
+/// boundaries so it is always safe to slice with.
+fn ime_selection(
+    content: &str,
+    insert_start: usize,
+    inserted_len: usize,
+    rel_utf16: &Range<usize>,
+) -> Range<usize> {
+    let insert_start_utf16 = offset_to_utf16(content, insert_start);
+    let start = offset_from_utf16(content, insert_start_utf16 + rel_utf16.start);
+    let end = offset_from_utf16(content, insert_start_utf16 + rel_utf16.end);
+    let max = (insert_start + inserted_len).min(content.len());
+    let snap = |mut i: usize| {
+        i = i.min(max);
+        while !content.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let (start, end) = (snap(start), snap(end));
+    start.min(end)..end.max(start)
 }
 
 fn previous_boundary(text: &str, offset: usize) -> usize {
@@ -416,11 +447,11 @@ impl EntityInputHandler for Input {
                 .into();
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range = match new_selected_range_utf16 {
+            // The IME's range is relative to the inserted text (gpui contract).
+            Some(rel) => ime_selection(&self.content, range.start, new_text.len(), &rel),
+            None => range.start + new_text.len()..range.start + new_text.len(),
+        };
         cx.notify();
     }
 
@@ -456,7 +487,8 @@ impl EntityInputHandler for Input {
         if last_layout.text != self.content {
             return None;
         }
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        // `line_point` is already relative to the element's origin.
+        let utf8_index = last_layout.index_for_x(line_point.x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -711,6 +743,19 @@ mod tests {
         assert_eq!(offset_to_utf16(s, 7), 4);
         assert_eq!(offset_from_utf16(s, 4), 7);
         assert_eq!(offset_from_utf16(s, 2), 3);
+    }
+
+    #[test]
+    fn ime_selection_is_relative_to_inserted_text_and_clamped() {
+        // "abc" + composed "日本" inserted at 3; IME selects 1..1 within it.
+        let content = "abc日本";
+        assert_eq!(ime_selection(content, 3, 6, &(1..1)), 6..6);
+        // Whole composition selected.
+        assert_eq!(ime_selection(content, 3, 6, &(0..2)), 3..9);
+        // Out-of-range IME selection is clamped to the insertion.
+        assert_eq!(ime_selection(content, 3, 6, &(5..9)), 9..9);
+        // Empty insertion (composition cleared) collapses to the caret.
+        assert_eq!(ime_selection("abc", 3, 0, &(0..3)), 3..3);
     }
 
     #[test]

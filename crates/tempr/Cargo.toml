@@ -15,6 +15,7 @@ anyhow.workspace             = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 url.workspace                = true
+percent-encoding.workspace   = true
 tempr_domain.workspace       = true
 
 [dev-dependencies]

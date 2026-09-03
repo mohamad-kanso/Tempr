@@ -5650,6 +5650,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "parking_lot",
+ "percent-encoding",
  "tempr_db",
  "tempr_db_postgres",
  "tempr_domain",
