@@ -40,6 +40,7 @@
 | D18 | 2026-09-03 | Small pure-Rust utility crates are adopted without an RFC when already in the graph: `unicode-segmentation` (grapheme cursor motion), `percent-encoding` (URL userinfo decoding), `url` promoted to a runtime dep | Claude (Phase 1) |
 | D19 | 2026-09-03 | Connection pooling = `deadpool` (core, `managed`) over `Box<dyn DriverConnection>` in `ConnectionService`; user pool (max 8) + dedicated 1-slot metadata pool; `deadpool-postgres` dropped | Claude (Phase 1) |
 | D20 | 2026-09-03 | PostgreSQL TLS via rustls (`tokio-postgres-rustls`, `ring` provider, platform roots from `rustls-native-certs`); `TlsMode` on `Connection` with libpq `sslmode` semantics, default `prefer`; `verify-ca` treated as `verify-full` | Claude (Phase 1) |
+| D21 | 2026-09-03 | Editor buffer = `ropey` 1.x rope in new `tempr_editor` crate; public API is byte-offset based (ropey char indices never leak); `edit` is a validated, atomic batch returning `Result`; `Buffer` is a pure model (no event bus) | Claude (Phase 2) |
 
 ---
 
@@ -244,4 +245,21 @@
 **Why**: D2 (Rust only) and the no-system-library stance rule out OpenSSL; rustls is the standard pure-Rust stack and `ring` avoids the C toolchain `aws-lc-rs` needs. Platform roots (not a bundled Mozilla set) let corporate CAs and self-signed roots installed on the machine work without Tempr-specific configuration. libpq's mode names are what every PostgreSQL user already knows and what `psql`/connection strings emit, so inventing a Tempr vocabulary would only add translation. Defaulting to `prefer` mirrors libpq and keeps plaintext dev databases working while encrypting whenever the server allows it — the PRODUCT acceptance text since Phase 1.
 
 **Consequences**: `Connection` literals need `tls`; older manifests deserialise with `prefer`. Client certificates, custom CA files (`sslrootcert`) and CRLs are not supported yet — tracked in TODO; until then a self-signed server can only be used with `require`/`prefer` (encrypted, unverified). Integration tests need a TLS-enabled PostgreSQL (`DATABASE_URL_TLS`); the session log records the docker command. New deps: `tokio-postgres-rustls`, `rustls`, `rustls-native-certs`, transitively `ring` — all pass `cargo deny`.
+
+---
+
+## D21 — Rope buffer on `ropey`, byte-offset API (2026-09-03)
+
+**By**: Claude (Phase 2, following the recommendation in docs/10-editor.md "Rope crate choice").
+**Decision**:
+1. `tempr_editor::Buffer` stores text in a `ropey::Rope` (1.x, MIT/Apache-2.0). Zed's `sum_tree` is not used even though it is already in the dependency graph via gpui.
+2. Every public offset is a **UTF-8 byte offset** (`Range<usize>`, `Point.column` in bytes). ropey's char indexing is an implementation detail converted at the boundary; offsets that are not char boundaries are rejected.
+3. `Buffer::edit(&[(Range<usize>, &str)]) -> Result<Option<EditId>, EditError>`: ranges are expressed against the current text, validated up front (bounds, boundaries, overlap), applied highest-start-first (ties: longer range first, then later caller entries first), recorded as one undo transaction that is reverted LIFO; `Ok(None)` for a batch that changes nothing, leaving history untouched; on any error the buffer is untouched. The 10-editor sketch returned a bare `EditId`.
+4. `Buffer` does not publish `BufferChanged`: it is a pure model with no `EventBus` handle; the owner publishes — this is what 10-editor's data-flow section already required ("The Buffer never publishes events directly"); the stale statements elsewhere in that document were corrected.
+6. ropey is built with `default-features = false, features = ["simd"]`: line breaks are `\n` / `\r\n` only, matching what SQL tooling and the grid expect; U+2028, form feed etc. are ordinary characters.
+5. The Phase 2 latency criterion is checked by an `#[ignore]`d test (`perf_10mb_insert_delete_under_1ms`) run in release on demand and recorded in PROGRESS, not by a CI benchmark (15-coding-standards: benchmarks are advisory).
+
+**Why**: tree-sitter, `StatementRange`, `str` slicing and the result grid all speak bytes; leaking ropey's char indices would force every caller to convert and invite off-by-one bugs at multibyte characters. A `Result` on `edit` turns caller bugs into errors instead of panics inside a GPUI frame. Keeping the buffer free of the bus keeps it trivially testable and lets one buffer be driven from tests, services, or views alike. `ropey` over `sum_tree`: battle-tested standalone crate with a `str`-chunk API that feeds tree-sitter directly, versus coupling to Zed's internal structures.
+
+**Consequences**: Measured on this machine (release, 10 MB buffer, 200 mid-document insert+delete pairs): **avg 1.73 µs, worst 12.1 µs** — the 1 ms criterion holds with three orders of magnitude to spare. `EditHistory` is unbounded for now (cap/coalescing tracked in TODO). Syntax tree and statement detection attach to `Buffer` in the next tasks; tree-sitter edits will be fed from the same recorded `Change`s.
 

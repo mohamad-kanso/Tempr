@@ -571,7 +571,7 @@ impl QueryService {
 - [Event System](06-event-system.md) — delivery semantics, `AppEvent` taxonomy, subscription lifetime, and the `EventBus` contract that all services depend on.
 - [Plugin API](08-plugin-api.md) — extension points that `PluginService` manages; `CommandContribution`, `CompletionProvider`, and other traits that plugins register through.
 - [Database Engine](09-database-engine.md) — `DatabaseDriver` and `QueryStream` contracts consumed by `QueryService` and `SchemaService`.
-- [Editor](10-editor.md) — `Buffer` and `SyntaxTree` that produce `BufferChanged` events consumed by `IntelligenceService`.
+- [Editor](10-editor.md) — `Buffer` and `SyntaxTree`; their owner publishes the `BufferChanged` events consumed by `IntelligenceService` (the buffer itself has no event-bus dependency).
 - [GPUI](11-gpui.md) — how views hold `Arc<T>` service handles and subscribe to events; the rendering conventions that enforce the "no business logic in UI" rule.
 - [SQL Intelligence](12-sql-intelligence.md) — the `SemanticEngine` internals that `IntelligenceService` owns and exposes.
 - [Result Grid](13-result-grid.md) — the `RowStore` and `ResultGrid` that consume `RowsReceived` and `QueryFinished` events from `QueryService`.

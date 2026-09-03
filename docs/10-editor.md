@@ -28,7 +28,7 @@ The editor module owns:
 
 6. **View rendering.** `EditorView` (a GPUI view component) renders visible lines with syntax highlighting, line numbers, gutter icons, cursor indicators, and selection overlays. Only visible lines are rendered — the view virtualizes along the vertical axis, consistent with Tempr's performance pillar.
 
-7. **Event publication.** After every edit, the buffer publishes a `BufferChanged { file: SqlFileId }` event to the `EventBus`, which the `IntelligenceService` consumes for incremental re-analysis and the `HistoryService` may consume for dirty-state tracking.
+7. **Event publication.** After every edit, the buffer's owner (the editor service / view handler — never `Buffer` itself) publishes a `BufferChanged { file: SqlFileId }` event to the `EventBus`, which the `IntelligenceService` consumes for incremental re-analysis and the `HistoryService` may consume for dirty-state tracking.
 
 ---
 
@@ -94,9 +94,10 @@ pub struct StatementRange {
 
 impl Buffer {
     /// Apply a batch of edits (all within the same transaction).
-    /// Returns an EditId for undo/redo tracking. Triggers an
-    /// incremental reparse and publishes BufferChanged on the EventBus.
-    pub fn edit(&mut self, edits: &[(Range<usize>, &str)]) -> EditId;
+    /// Returns the EditId for undo/redo tracking (None when nothing
+    /// changed). Triggers an incremental reparse. Does NOT publish —
+    /// the caller publishes BufferChanged on the EventBus.
+    pub fn edit(&mut self, edits: &[(Range<usize>, &str)]) -> Result<Option<EditId>, EditError>;
 
     /// Access the underlying rope for reading. Returns a snapshot
     /// that is valid for the lifetime of this call (not buffered).
@@ -125,6 +126,8 @@ impl Buffer {
     pub fn len(&self) -> usize;
 }
 ```
+
+**Implementation notes (2026-09-03, D21):** `tempr_editor::Buffer` follows this shape; `edit` returns `Result<Option<EditId>, EditError>` (bounds / char-boundary / overlap errors instead of panics; `None` when the batch changed nothing, leaving undo/redo untouched), `Point.column` is a **byte** column, and — as this document's data-flow section already requires — the buffer never publishes events itself. Line breaks are `\n` / `\r\n` only. `syntax()` / `statement_at()` land with the tree-sitter and statement-detector tasks. Helpers present today: `len_lines`, `line(i)`, `slice(range)`, `can_undo`/`can_redo`, `file_id`.
 
 ### SyntaxTree
 
@@ -255,7 +258,7 @@ Key properties of this pipeline:
 
 3. **Highlights recomputed.** The buffer runs the tree-sitter highlights query against the new tree and produces a `HighlightCache` — a list of `(byte_range, highlight_type)` tuples covering the visible viewport. Only visible lines are queried.
 
-4. **BufferChanged published.** The view (or the buffer, depending on configuration) publishes `BufferChanged { file: SqlFileId }` to the `EventBus`. This event carries no payload beyond the file ID — per the event system's payload rule ([06-event-system.md](06-event-system.md)).
+4. **BufferChanged published.** The buffer's owner (view handler or editor service — never the buffer) publishes `BufferChanged { file: SqlFileId }` to the `EventBus`. This event carries no payload beyond the file ID — per the event system's payload rule ([06-event-system.md](06-event-system.md)).
 
 5. **IntelligenceService reacts.** The intelligence service receives `BufferChanged` and triggers incremental re-analysis of the buffer's semantic state: scope resolution, alias tracking, diagnostic generation. The parse tree is accessed through `Buffer::syntax()` without copying.
 
