@@ -21,7 +21,7 @@
 
 ## Next
 
-- [ ] Phase 1: PostgreSQL async driver with TLS connection (sslmode configurable, default Prefer)
+- [ ] TLS extras: per-connection CA file (`sslrootcert`), client certificate/key, CRL; make `verify-ca` genuinely skip hostname checks only if a user asks for it (D20 treats it as `verify-full`)
 - [ ] Phase 1: main window layout beyond placeholders — connection picker, status bar, error toasts driven by `AppEvent`
 - [ ] macOS/Windows CI runners for the gpui build (Linux-only today; transitive `zed-font-kit` git source on macOS must pass `cargo deny`)
 

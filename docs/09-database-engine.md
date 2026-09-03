@@ -568,7 +568,7 @@ pub async fn execute_prepared(&mut self, stmt: &PreparedStatement, params: &[Val
 
 ### TLS configuration
 
-v1 assumes TLS is configured via the connection string (`sslmode=require` in PostgreSQL). A future version should expose explicit TLS fields in `ConnectionConfig`: `tls_mode` (Disabled, Preferred, Required), `tls_ca_path`, `tls_client_cert_path`, `tls_client_key_path`.
+Implemented (D20): `Connection.tls: TlsMode` with libpq `sslmode` semantics — `disable`, `prefer` (default), `require`, `verify-ca`, `verify-full` — parsed from `?sslmode=` in connection strings and stored in the workspace `ConnectionConfig.tls`. The PostgreSQL driver builds a rustls connector (`ring` provider, platform root store) per mode: `prefer`/`require` encrypt without certificate verification, `verify-*` verify chain and hostname; the cancel socket reuses the connector. Not yet supported: client certificates, a per-connection CA file (`sslrootcert`), CRLs — these become `tls_ca_path` / `tls_client_cert_path` / `tls_client_key_path` on `ConnectionConfig` when needed (TODO).
 
 ---
 

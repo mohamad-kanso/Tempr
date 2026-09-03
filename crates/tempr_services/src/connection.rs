@@ -440,6 +440,7 @@ mod tests {
             secret_ref: SecretRef {
                 vault_key: "test".to_string(),
             },
+            tls: tempr_domain::TlsMode::Disable,
         }
     }
 

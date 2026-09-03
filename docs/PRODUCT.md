@@ -31,7 +31,7 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 - AC: `cargo test` exits 0. Malformed workspace manifest produces a typed error, not a panic. Event bus delivers events to all registered handlers in registration order.
 
 ### 2. Connect & Run (Phase 1)
-- ✅ PostgreSQL driver connects to a live instance using connection config from Phase 0 (TLS configurable, default Prefer)
+- ✅ PostgreSQL driver connects to a live instance using connection config from Phase 0 (TLS configurable via libpq `sslmode` values, default `prefer`; rustls with platform roots — verified against a TLS-enabled PostgreSQL 16 on 2026-09-03)
 - ✅ `SELECT` and `INSERT` execute and return rows or affected-row counts through the service layer
 - 🔜 Streaming result pipeline delivers rows in batches (`batch_size`-sized); memory usage bounded regardless of result size *(batches + `RowSink` ✅; bounded memory ✗ — the PostgreSQL driver still buffers via `client.query()` and the grid keeps all rows; see TODO "Lazy wire streaming" and `RowStore`)*
 - ✅ GPUI application window renders with a text input area and a scrollable result grid

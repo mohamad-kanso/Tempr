@@ -558,6 +558,7 @@ mod tests {
             secret_ref: SecretRef {
                 vault_key: "k".into(),
             },
+            tls: tempr_domain::TlsMode::Disable,
         };
         cs.connect(&conn).await.unwrap();
         (bus.clone(), QueryService::new(bus, cs), id)

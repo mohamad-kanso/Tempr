@@ -39,6 +39,7 @@
 | D17 | 2026-09-03 | GPUI pinned to Zed `main` `ed8d600` with floor `ac5af8b9` (zlog/ztracing relicense); `gpui_tokio` adopted; `cargo deny check licenses` is the enforcement gate; toolchain `1.97.1` | Claude (Phase 1) |
 | D18 | 2026-09-03 | Small pure-Rust utility crates are adopted without an RFC when already in the graph: `unicode-segmentation` (grapheme cursor motion), `percent-encoding` (URL userinfo decoding), `url` promoted to a runtime dep | Claude (Phase 1) |
 | D19 | 2026-09-03 | Connection pooling = `deadpool` (core, `managed`) over `Box<dyn DriverConnection>` in `ConnectionService`; user pool (max 8) + dedicated 1-slot metadata pool; `deadpool-postgres` dropped | Claude (Phase 1) |
+| D20 | 2026-09-03 | PostgreSQL TLS via rustls (`tokio-postgres-rustls`, `ring` provider, platform roots from `rustls-native-certs`); `TlsMode` on `Connection` with libpq `sslmode` semantics, default `prefer`; `verify-ca` treated as `verify-full` | Claude (Phase 1) |
 
 ---
 
@@ -227,4 +228,19 @@
 **Decision**: `ConnectionService` pools `Box<dyn DriverConnection>` with the `deadpool` core crate (`managed` feature) through a Tempr `DriverManager` (`create` = `DatabaseDriver::connect`). Each `Connection` gets a **user pool** (`PoolConfig::max_size`, default 8) borrowed by `QueryService`, and a **dedicated metadata slot** (a separate 1-connection pool) borrowed only by `SchemaService`. `connect` warms one user connection eagerly. `deadpool-postgres` is removed from the workspace.
 **Why**: `deadpool-postgres` pools `tokio_postgres::Client`, which sits *below* the `DatabaseDriver` abstraction (D4) — using it would make the pool PostgreSQL-specific and bypass the trait. Writing our own pool duplicates well-tested code for no gain; `deadpool`'s manager trait is small, runtime-agnostic, and lets the pool hold the trait object directly. The separate metadata pool is the simplest way to guarantee the "schema refresh never blocks behind a user query" rule without a custom slot scheduler.
 **Consequences**: Borrow sites take a `PooledConnection` by value and return `Result<R, DriverError>`; the connection returns to the pool on drop (move it into the future — a closure parameter the future does not capture is returned before the body runs). `DriverConnection::is_closed` (sync, no I/O) is part of the driver trait so `recycle` evicts dead idle connections; an active ping/reconnect-with-backoff is still TODO. Pools have `wait_timeout` (30 s) and `create_timeout` (15 s) via `deadpool::Runtime::Tokio1`, and the PG driver sets a 10 s `connect_timeout`, so nothing parks forever. State and pools live in one `ConnEntry` map under one lock; a `ConnectingGuard` flips an aborted `connect` to `Failed`; a `disconnect` racing a warm-up wins. `ServiceRegistry::stop_all` runs from the GPUI `on_app_quit` hook (`gpui_compat::on_app_quit`), so quitting cancels runs (bounded, concurrent) and drains pools. Pool sizing per connection will come from the workspace connection config (`pool_max_size` in 09-database-engine's `ConnectionConfig`); today `PoolConfig` is service-wide.
+
+---
+
+## D20 — PostgreSQL TLS with rustls and libpq `sslmode` semantics (2026-09-03)
+
+**By**: Claude (Phase 1, closing the last Phase 1 checklist box).
+**Decision**:
+1. TLS for `tempr_db_postgres` uses **rustls** through `tokio-postgres-rustls` (MIT) with the `ring` crypto provider, and trusts the **platform root store** via `rustls-native-certs`. No OpenSSL / native-tls.
+2. The domain `Connection` gains `tls: TlsMode` — `Disable | Prefer | Require | VerifyCa | VerifyFull` — serialised in kebab-case and parsed from libpq spellings (`allow` → `Prefer`). Default is **`Prefer`**. `DATABASE_URL?sslmode=…` and the workspace `ConnectionConfig.tls` field (defaulting when absent) carry it.
+3. Semantics follow libpq: `prefer`/`require` encrypt **without** verifying the server certificate (a custom `ServerCertVerifier` accepts any chain but still checks handshake signatures); `verify-ca`/`verify-full` verify chain **and hostname** against the platform roots. Tempr deliberately treats `verify-ca` as `verify-full`: rustls always checks the name, and the weaker mode protects nothing the stronger one does not.
+4. The cancel path (`CancelToken::cancel_query`) uses the same connector as the session.
+
+**Why**: D2 (Rust only) and the no-system-library stance rule out OpenSSL; rustls is the standard pure-Rust stack and `ring` avoids the C toolchain `aws-lc-rs` needs. Platform roots (not a bundled Mozilla set) let corporate CAs and self-signed roots installed on the machine work without Tempr-specific configuration. libpq's mode names are what every PostgreSQL user already knows and what `psql`/connection strings emit, so inventing a Tempr vocabulary would only add translation. Defaulting to `prefer` mirrors libpq and keeps plaintext dev databases working while encrypting whenever the server allows it — the PRODUCT acceptance text since Phase 1.
+
+**Consequences**: `Connection` literals need `tls`; older manifests deserialise with `prefer`. Client certificates, custom CA files (`sslrootcert`) and CRLs are not supported yet — tracked in TODO; until then a self-signed server can only be used with `require`/`prefer` (encrypted, unverified). Integration tests need a TLS-enabled PostgreSQL (`DATABASE_URL_TLS`); the session log records the docker command. New deps: `tokio-postgres-rustls`, `rustls`, `rustls-native-certs`, transitively `ring` — all pass `cargo deny`.
 

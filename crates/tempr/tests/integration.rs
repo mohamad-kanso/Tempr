@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef};
+use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode, Value};
 use tempr_events::{AppEventKind, EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService};
 
@@ -17,6 +17,7 @@ fn make_pg_connection(
     dbname: &str,
     user: &str,
     password: &str,
+    tls: TlsMode,
 ) -> Connection {
     Connection {
         id,
@@ -30,7 +31,57 @@ fn make_pg_connection(
         secret_ref: SecretRef {
             vault_key: "test".to_string(),
         },
+        tls,
     }
+}
+
+/// Build a `Connection` from a `postgres://` URL, overriding `sslmode`.
+fn connection_from_url(raw: &str, tls: TlsMode) -> Connection {
+    let url = url::Url::parse(raw).expect("invalid URL");
+    make_pg_connection(
+        ConnectionId::new(),
+        url.host_str().unwrap_or("localhost"),
+        url.port().unwrap_or(5432),
+        url.path().trim_start_matches('/'),
+        url.username(),
+        url.password().unwrap_or(""),
+        tls,
+    )
+}
+
+/// `DATABASE_URL_TLS`: a PostgreSQL with `ssl=on` and a self-signed cert
+/// (see docs/PROGRESS.md session log for the docker command).
+fn pg_tls_connection_string() -> Option<String> {
+    std::env::var("DATABASE_URL_TLS").ok()
+}
+
+/// Connect with `tls`, return `(services, id)`; panics on failure.
+async fn connect_with(
+    url: &str,
+    tls: TlsMode,
+) -> (Arc<EventBus>, Arc<ConnectionService>, ConnectionId) {
+    let (bus, cs) = setup_pg_cs();
+    let conn = connection_from_url(url, tls);
+    cs.connect(&conn).await.expect("connect failed");
+    (bus, cs, conn.id)
+}
+
+/// `pg_stat_ssl.ssl` for the current backend.
+async fn session_is_encrypted(
+    bus: Arc<EventBus>,
+    cs: Arc<ConnectionService>,
+    id: ConnectionId,
+) -> bool {
+    let qs = QueryService::new(bus, cs);
+    let run = qs
+        .execute(
+            "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            id,
+        )
+        .await
+        .expect("pg_stat_ssl query failed");
+    let rs = qs.completed_run(run).unwrap().result_set.unwrap();
+    rs.rows[0][0] == Value::Bool(true)
 }
 
 fn setup_pg_cs() -> (Arc<EventBus>, Arc<ConnectionService>) {
@@ -53,6 +104,7 @@ async fn connect_test_pg(cs: &ConnectionService) -> ConnectionId {
         url.path().trim_start_matches('/'),
         url.username(),
         url.password().unwrap_or(""),
+        TlsMode::Prefer,
     );
 
     cs.connect(&conn).await.expect("connect failed");
@@ -215,6 +267,7 @@ async fn pg_auth_failure_returns_error() {
         secret_ref: SecretRef {
             vault_key: "test".to_string(),
         },
+        tls: TlsMode::Prefer,
     };
 
     let result = cs.connect(&conn).await;
@@ -337,4 +390,81 @@ async fn pg_execute_streaming_100k_rows_in_batches() {
         run.result_set.is_none(),
         "streaming run must not retain rows"
     );
+}
+
+// ── TLS (requires DATABASE_URL_TLS → PostgreSQL with ssl=on, self-signed cert) ──
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TLS env var pointing to a TLS-enabled PostgreSQL"]
+async fn pg_tls_require_encrypts_the_session() {
+    let url = pg_tls_connection_string().expect("set DATABASE_URL_TLS");
+    let (bus, cs, id) = connect_with(&url, TlsMode::Require).await;
+    assert!(
+        session_is_encrypted(bus, cs, id).await,
+        "sslmode=require must use TLS"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TLS env var pointing to a TLS-enabled PostgreSQL"]
+async fn pg_tls_prefer_uses_tls_when_the_server_offers_it() {
+    let url = pg_tls_connection_string().expect("set DATABASE_URL_TLS");
+    let (bus, cs, id) = connect_with(&url, TlsMode::Prefer).await;
+    assert!(
+        session_is_encrypted(bus, cs, id).await,
+        "sslmode=prefer must pick TLS"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TLS env var pointing to a TLS-enabled PostgreSQL"]
+async fn pg_tls_disable_stays_plaintext_on_a_tls_server() {
+    let url = pg_tls_connection_string().expect("set DATABASE_URL_TLS");
+    let (bus, cs, id) = connect_with(&url, TlsMode::Disable).await;
+    assert!(
+        !session_is_encrypted(bus, cs, id).await,
+        "sslmode=disable must not use TLS"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TLS env var pointing to a TLS-enabled PostgreSQL"]
+async fn pg_tls_verify_full_rejects_a_self_signed_certificate() {
+    let url = pg_tls_connection_string().expect("set DATABASE_URL_TLS");
+    let (_bus, cs) = setup_pg_cs();
+    let conn = connection_from_url(&url, TlsMode::VerifyFull);
+    let err = cs
+        .connect(&conn)
+        .await
+        .expect_err("self-signed cert must be rejected");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("certificate") || msg.contains("tls") || msg.contains("unknown issuer"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(cs.state(conn.id), tempr_domain::ConnectionState::Failed);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_tls_require_fails_against_a_plaintext_only_server() {
+    let url = pg_connection_string().expect("set DATABASE_URL");
+    let (_bus, cs) = setup_pg_cs();
+    let conn = connection_from_url(&url, TlsMode::Require);
+    match cs.connect(&conn).await {
+        Ok(()) => {
+            // The plain container may also have ssl=on; then require must be encrypted.
+            let (bus2, cs2) = setup_pg_cs();
+            let conn2 = connection_from_url(&url, TlsMode::Require);
+            cs2.connect(&conn2).await.unwrap();
+            assert!(session_is_encrypted(bus2, cs2, conn2.id).await);
+        }
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            assert!(
+                msg.contains("tls") || msg.contains("ssl"),
+                "unexpected error: {e}"
+            );
+        }
+    }
 }
