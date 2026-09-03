@@ -105,10 +105,24 @@ impl QueryService {
         sink: Arc<dyn RowSink>,
     ) -> Result<QueryRunId, ServiceError>;
 
+    /// Same, with a caller-allocated id so `cancel` can target the run
+    /// before it has registered.
+    pub async fn execute_streaming_with_id(
+        &self,
+        run_id: QueryRunId,
+        sql: &str,
+        connection_id: ConnectionId,
+        sink: Arc<dyn RowSink>,
+    ) -> Result<QueryRunId, ServiceError>;
+
     /// Collect every row into the completed run's `ResultSet`.
     pub async fn execute(&self, sql: &str, connection_id: ConnectionId)
         -> Result<QueryRunId, ServiceError>;
 
+    /// In-flight run: driver-side cancel + the run completes as `Cancelled`
+    /// (returns `Ok(run_id)`, partial rows already delivered stay valid).
+    /// Not-yet-registered run: cancel is armed and applied when it starts.
+    /// Completed run: no-op, no event.
     pub async fn cancel(&self, run_id: QueryRunId) -> Result<(), ServiceError>;
 
     pub fn active_runs(&self) -> Vec<QueryRunId>;

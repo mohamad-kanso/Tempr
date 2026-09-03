@@ -97,6 +97,10 @@ fn main() -> Result<()> {
             .filter(|s| !s.trim().is_empty()),
         bench_scroll_then_exit: std::env::var("TEMPR_BENCH_SCROLL").is_ok_and(|v| v == "1"),
     };
+    if dev.bench_scroll_then_exit && (dev.startup_sql.is_none() || connection.is_none()) {
+        anyhow::bail!("TEMPR_BENCH_SCROLL=1 requires TEMPR_STARTUP_SQL and DATABASE_URL");
+    }
+    let throttle_inactive = !dev.bench_scroll_then_exit;
     let _event_log = services.bus.subscribe(EventFilter::All, |event| {
         info!(event = ?event.kind(), "event");
     });
@@ -121,9 +125,11 @@ fn main() -> Result<()> {
             connection: services.connection.clone(),
             query: services.query.clone(),
         };
-        if let Err(e) = gpui_compat::open_main_window(cx, "Tempr", move |window, cx| {
-            tempr_ui::MainWindow::new(ui_services, connection, dev, window, cx)
-        }) {
+        if let Err(e) =
+            gpui_compat::open_main_window(cx, "Tempr", throttle_inactive, move |window, cx| {
+                tempr_ui::MainWindow::new(ui_services, connection, dev, window, cx)
+            })
+        {
             error!(error = %e, "failed to open main window");
             cx.quit();
         }

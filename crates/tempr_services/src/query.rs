@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -60,6 +60,9 @@ pub struct QueryService {
     connection_service: Arc<ConnectionService>,
     active_runs: RwLock<HashMap<QueryRunId, ActiveRun>>,
     completed_runs: RwLock<HashMap<QueryRunId, QueryRun>>,
+    /// Runs cancelled before they registered (caller pre-allocated the id
+    /// and pressed cancel first). Consumed when the run starts.
+    pending_cancels: RwLock<HashSet<QueryRunId>>,
 }
 
 impl QueryService {
@@ -69,6 +72,7 @@ impl QueryService {
             connection_service,
             active_runs: RwLock::new(HashMap::new()),
             completed_runs: RwLock::new(HashMap::new()),
+            pending_cancels: RwLock::new(HashSet::new()),
         })
     }
 
@@ -81,7 +85,8 @@ impl QueryService {
         connection_id: ConnectionId,
     ) -> Result<QueryRunId, ServiceError> {
         let sink = Arc::new(CollectingSink::default());
-        let (run_id, result) = self.run(sql, connection_id, sink.clone()).await;
+        let run_id = QueryRunId::new();
+        let result = self.run(run_id, sql, connection_id, sink.clone()).await;
         let result_set = result.as_ref().ok().map(|(columns, total_rows)| {
             let rows = std::mem::take(&mut *sink.rows.lock());
             ResultSet {
@@ -103,7 +108,20 @@ impl QueryService {
         connection_id: ConnectionId,
         sink: Arc<dyn RowSink>,
     ) -> Result<QueryRunId, ServiceError> {
-        let (run_id, result) = self.run(sql, connection_id, sink).await;
+        self.execute_streaming_with_id(QueryRunId::new(), sql, connection_id, sink)
+            .await
+    }
+
+    /// [`Self::execute_streaming`] with a caller-allocated `run_id`, so the
+    /// caller can target `cancel` before the run has registered.
+    pub async fn execute_streaming_with_id(
+        &self,
+        run_id: QueryRunId,
+        sql: &str,
+        connection_id: ConnectionId,
+        sink: Arc<dyn RowSink>,
+    ) -> Result<QueryRunId, ServiceError> {
+        let result = self.run(run_id, sql, connection_id, sink).await;
         self.finish(run_id, result, None)
     }
 
@@ -111,10 +129,11 @@ impl QueryService {
     /// `sink`, returns `(columns, total_rows)` on success.
     async fn run(
         &self,
+        run_id: QueryRunId,
         sql: &str,
         connection_id: ConnectionId,
         sink: Arc<dyn RowSink>,
-    ) -> (QueryRunId, Result<(Vec<ColumnMeta>, usize), ServiceError>) {
+    ) -> Result<(Vec<ColumnMeta>, usize), ServiceError> {
         let query = Query {
             id: tempr_domain::QueryId::new(),
             text: sql.to_string(),
@@ -124,7 +143,6 @@ impl QueryService {
             fingerprint: [0u8; 32],
         };
 
-        let run_id = QueryRunId::new();
         let query_run = QueryRun {
             id: run_id,
             query,
@@ -135,6 +153,7 @@ impl QueryService {
             result_set: None,
         };
 
+        let pre_cancelled = self.pending_cancels.write().remove(&run_id);
         self.event_bus
             .publish(AppEvent::QueryStarted { run: run_id });
         self.active_runs.write().insert(
@@ -142,13 +161,18 @@ impl QueryService {
             ActiveRun {
                 query_run,
                 cancel_handle: None,
-                cancelled: false,
+                cancelled: pre_cancelled,
             },
         );
+        if pre_cancelled {
+            return Err(ServiceError::QueryFailed {
+                name: "QueryService",
+                reason: "cancelled before start".to_string(),
+            });
+        }
 
         let sql_owned = sql.to_string();
-        let result = self
-            .connection_service
+        self.connection_service
             .with_connection_fn(connection_id, |mut conn| {
                 let sql = sql_owned.clone();
                 let sink = sink.clone();
@@ -156,8 +180,18 @@ impl QueryService {
                     // Captured before the (potentially long-running) execute
                     // call so a concurrent `cancel()` can reach this query
                     // without needing exclusive access to `conn`.
-                    if let Some(active) = self.active_runs.write().get_mut(&run_id) {
-                        active.cancel_handle = Some(conn.cancel_handle());
+                    let cancelled_meanwhile = {
+                        let mut active_runs = self.active_runs.write();
+                        match active_runs.get_mut(&run_id) {
+                            Some(active) => {
+                                active.cancel_handle = Some(conn.cancel_handle());
+                                active.cancelled
+                            }
+                            None => false,
+                        }
+                    };
+                    if cancelled_meanwhile {
+                        return (conn, Err(tempr_db::DriverError::Cancelled));
                     }
 
                     match conn.execute(&sql, &[]).await {
@@ -192,9 +226,7 @@ impl QueryService {
                     }
                 }
             })
-            .await;
-
-        (run_id, result)
+            .await
     }
 
     /// Move the run from active to completed, publish `QueryFinished`, and
@@ -253,9 +285,10 @@ impl QueryService {
     }
 
     /// Cancel a run. For an in-flight run the driver-side cancel is issued and
-    /// the run is flagged so its `finish()` records `Cancelled`; for an
-    /// unknown/finished run a `QueryFinished { Cancelled }` is published
-    /// immediately so callers always observe a terminal event.
+    /// the run is flagged so its `finish()` records `Cancelled`. For a run
+    /// that has not registered yet (caller-allocated id, see
+    /// [`Self::execute_streaming_with_id`]) the cancel is armed and applied
+    /// the moment the run starts. Completed runs are unaffected.
     pub async fn cancel(&self, run_id: QueryRunId) -> Result<(), ServiceError> {
         let handle = {
             let mut active_runs = self.active_runs.write();
@@ -266,10 +299,11 @@ impl QueryService {
                 }
                 None => {
                     drop(active_runs);
-                    self.event_bus.publish(AppEvent::QueryFinished {
-                        run: run_id,
-                        outcome: QueryOutcome::Cancelled,
-                    });
+                    if self.completed_runs.read().contains_key(&run_id) {
+                        return Ok(());
+                    }
+                    // Not started yet: arm the cancel for when it registers.
+                    self.pending_cancels.write().insert(run_id);
                     return Ok(());
                 }
             }
@@ -321,7 +355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_publishes_event() {
+    async fn cancel_of_unknown_run_publishes_nothing() {
         let bus = make_event_bus();
         let received: Arc<Mutex<Vec<tempr_events::AppEventKind>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -332,16 +366,11 @@ mod tests {
 
         let cs = ConnectionService::new(bus.clone());
         let svc = QueryService::new(bus, cs);
-        let run_id = QueryRunId::new();
+        svc.cancel(QueryRunId::new()).await.unwrap();
 
-        svc.cancel(run_id).await.unwrap();
-
-        let events = received.lock();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, tempr_events::AppEventKind::QueryFinished)),
-            "expected QueryFinished event after cancel"
+            received.lock().is_empty(),
+            "no terminal event for a run that never started"
         );
     }
 
@@ -619,5 +648,35 @@ mod tests {
             "partial rows stay with the sink"
         );
         assert!(svc.active_runs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_before_start_completes_run_as_cancelled_without_executing() {
+        let (bus, svc, id) = connected_service(3, 2).await;
+        let finished: Arc<Mutex<Vec<QueryOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let f = finished.clone();
+        let _sub = bus.subscribe(EventFilter::All, move |ev| {
+            if let AppEvent::QueryFinished { outcome, .. } = ev {
+                f.lock().push(outcome.clone());
+            }
+        });
+
+        let run_id = QueryRunId::new();
+        svc.cancel(run_id).await.unwrap(); // armed: the run has not started
+        let sink = Arc::new(RecordingSink::default());
+        let result = svc
+            .execute_streaming_with_id(run_id, "SELECT n", id, sink.clone())
+            .await;
+
+        assert_eq!(result.unwrap(), run_id);
+        assert!(sink.batches.lock().is_empty(), "nothing executed");
+        assert_eq!(
+            svc.completed_run(run_id).unwrap().outcome,
+            QueryOutcome::Cancelled
+        );
+        assert_eq!(*finished.lock(), vec![QueryOutcome::Cancelled]);
+        // Cancelling a completed run is a no-op.
+        svc.cancel(run_id).await.unwrap();
+        assert_eq!(finished.lock().len(), 1);
     }
 }

@@ -4,10 +4,8 @@
 
 use std::time::{Duration, Instant};
 
-/// Frame budget at 60 Hz.
-pub const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
-/// A frame is counted as dropped when it exceeds the budget by more than
-/// vsync jitter allows (60 Hz frames land at 16.6–16.9 ms).
+/// A frame is counted as dropped when it exceeds the 60 Hz budget (16.67 ms)
+/// by more than vsync jitter allows — 60 Hz frames land at 16.6–16.9 ms.
 pub const DROP_THRESHOLD: Duration = Duration::from_millis(20);
 
 pub struct ScrollBench {

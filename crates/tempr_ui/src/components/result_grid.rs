@@ -25,6 +25,9 @@ pub struct ResultGrid {
     /// Shown instead of the table when there are no columns yet.
     message: Option<String>,
     scroll_handle: UniformListScrollHandle,
+    /// Row range rendered by the last frame (diagnostics: proves the
+    /// viewport moved during the scroll benchmark).
+    last_rendered: std::ops::Range<usize>,
 }
 
 impl Default for ResultGrid {
@@ -40,12 +43,20 @@ impl ResultGrid {
             rows: Vec::new(),
             message: Some("Run a query (Enter or ctrl-enter) to see results here.".into()),
             scroll_handle: UniformListScrollHandle::new(),
+            last_rendered: 0..0,
         }
     }
 
+    /// Row range the last frame rendered.
+    pub fn last_rendered_rows(&self) -> std::ops::Range<usize> {
+        self.last_rendered.clone()
+    }
+
     /// Scroll so that `row` is the first visible row (clamped by the list).
+    /// Strict: moves even when `row` is already visible.
     pub fn scroll_to_row(&self, row: usize) {
-        self.scroll_handle.scroll_to_item(row, ScrollStrategy::Top);
+        self.scroll_handle
+            .scroll_to_item_strict(row, ScrollStrategy::Top);
     }
 
     /// Start a new result set: drop rows, keep the grid empty until columns.
@@ -176,10 +187,12 @@ impl Render for ResultGrid {
                                 row_count,
                                 cx.processor(
                                     |this, range: std::ops::Range<usize>, _window, _cx| {
+                                        this.last_rendered = range.clone();
                                         range.map(|ix| this.render_row(ix)).collect::<Vec<_>>()
                                     },
                                 ),
                             )
+                            .track_scroll(&self.scroll_handle)
                             .h_full(),
                         ),
                     ),

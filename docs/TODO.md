@@ -13,8 +13,8 @@
 - [ ] Make `ConnectionService` / `QueryService` / `SchemaService` implement the `Service` lifecycle trait so the binary registers them in `ServiceRegistry` (today only test services implement it; the GPUI shell holds plain `Arc`s)
 - [ ] Wire `deadpool-postgres` pool into `ConnectionService` (dependency declared, unused)
 - [ ] `ThemeProvider` tokens replace the placeholder palette consts in `tempr_ui::theme` (no hard-coded colors rule, 11-gpui.md)
-- [ ] Scroll bench shows ~1% frames > 20 ms (max 83–100 ms) at 100k rows in release — profile (first-frame layout? text shaping of the incoming row window? allocator?) and add a per-frame histogram to `ScrollBench`
-- [ ] `execute_streaming` should hand back the `QueryRunId` before completion (e.g. return `(QueryRunId, impl Future)` or take a pre-allocated id) so `CancelQuery` targets one run instead of `active_runs()`
+- [ ] Run the scroll benchmark with the display on and the window focused; record fps / p95 / dropped in PROGRESS and flip the Phase 1 grid box; then profile any > 20 ms frames (per-frame histogram in `ScrollBench`)
+- [ ] `ScrollBench`: detect a throttled compositor (e.g. > 25% of frames ≥ 500 ms) and mark the report invalid instead of reporting fps
 - [ ] Connection picker in `MainWindow` (workspace connection list) replaces the `DATABASE_URL` stand-in; surface a malformed `DATABASE_URL` in the UI instead of exiting before the window opens
 - [ ] `ResultGrid`: column virtualization + resize, copy-on-select, 2D keyboard navigation (11-gpui.md Table row); columnar `RowStore` with spill-to-disk (13-result-grid.md) once result sizes demand it
 - [ ] `Input`: undo/redo, auto-resize; multi-line SQL input arrives with the Phase 2 editor (rope + tree-sitter)

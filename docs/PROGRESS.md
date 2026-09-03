@@ -6,9 +6,9 @@
 
 ## Current status
 
-- **Last completed**: Scroll frame-time probe + cancel — `DebugScrollBenchmark` (ctrl-shift-b) sweeps the grid via `on_next_frame`; release build at 100,000 rows: **58.8 fps, p95 16.8 ms, 7/603 frames > 20 ms** (Phase 1 AC met); `CancelQuery` (escape) wired to `QueryService::cancel`; dev knobs `TEMPR_STARTUP_SQL` / `TEMPR_BENCH_SCROLL=1` (2026-09-03, branch `feat/ph1-grid-perf-cancel`)
-- **Verified**: `cargo fmt --all --check` ✅ · `cargo clippy --workspace --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (81 unit) · `cargo test -p tempr --test integration -- --ignored` ✅ (10 vs Docker PG 16) · `cargo deny check` ✅ · headless bench (X11, Docker PG, `generate_series(1,100000)`): release 58.8 fps / p95 16.8 ms / 7 dropped of 603, two runs; debug 41 ms avg (not representative) (2026-09-03)
-- **Next action**: Connection picker in `MainWindow` (workspace connection list) replacing `DATABASE_URL`; core services implement `Service`; deadpool wiring; then Phase 1 TLS box
+- **Last completed**: Scroll frame-time probe + cancel — `DebugScrollBenchmark` (ctrl-shift-b) sweeps the grid via `on_next_frame` and reports fps/p95/max/dropped; `CancelQuery` (escape) targets the view-allocated `QueryRunId` via `QueryService::execute_streaming_with_id` + pending-cancel arming; dev knobs `TEMPR_STARTUP_SQL` / `TEMPR_BENCH_SCROLL=1`. Headless numbers from this session are **invalid** (display was off → compositor throttled frames to 1 s); tooling verified to scroll (`rendered_rows` moves) (2026-09-03, branch `feat/ph1-grid-perf-cancel`)
+- **Verified**: `cargo fmt --all --check` ✅ · `cargo clippy --workspace --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (82 unit) · `cargo test -p tempr --test integration -- --ignored` ✅ (10 vs Docker PG 16) · `cargo deny check` ✅ · bench tooling drives the viewport (progress log shows `rendered_rows=16434..16463` at frame 100) — fps numbers NOT yet valid: display was off during every headless run (2026-09-03)
+- **Next action**: Re-run the scroll benchmark with the display on and the window focused (`TEMPR_BENCH_SCROLL=1 TEMPR_STARTUP_SQL=… DATABASE_URL=… cargo run --release`, or ctrl-shift-b in the app) and record fps/p95/dropped in the checklist; then connection picker; core services implement `Service`; deadpool wiring
 
 ## Phase checklist
 
