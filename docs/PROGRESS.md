@@ -98,7 +98,7 @@
 | 2026-09-03 | GPUI rev pinned to Zed `main` HEAD `ed8d600` (2026-09-03), not a release tag — every tag ≤ v1.18.0 carries GPL `zlog`/`ztracing` under gpui | → D17 |
 | 2026-09-03 | `deny.toml` allows Zlib, CC0-1.0, bzip2-1.0.6, NCSA (permissive, pulled by gpui's graph); `cargo deny check licenses` is the D16 gate | → D17 |
 | 2026-09-03 | `gpui_tokio` adopted as the tokio↔GPUI bridge (Apache-2.0 verified) | → D17 |
-| 2026-09-03 | `rust-toolchain.toml` pins `1.97.1`, minimal profile + rustfmt/clippy; CI reads it via `dtolnay/rust-toolchain@master` | → D17 |
+| 2026-09-03 | `rust-toolchain.toml` pins `1.97.1`, minimal profile + rustfmt/clippy; CI installs it with `rustup show` (no action input duplicates the pin) | → D17 |
 | 2026-09-03 | `.cargo/config.toml` sets `net.git-fetch-with-cli = true` | libgit2 fetched 3 MB of the Zed repo in 10 min; system git completes the clone |
 | 2026-09-03 | GPUI code lives in new `tempr_ui` crate (per 14-project-layout.md); binary depends on it; all `gpui`/`gpui_platform`/`gpui_tokio` calls go through `tempr_ui::gpui_compat` | Isolates upstream churn to one module (11-gpui.md shim rule) |
 
