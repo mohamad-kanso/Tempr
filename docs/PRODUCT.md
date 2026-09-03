@@ -41,8 +41,8 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 
 ### 3. Editor (Phase 2)
 - ✅ Rope buffer handles documents up to 10 MB with sub-millisecond insert/delete at arbitrary positions (`tempr_editor::Buffer` on `ropey`; measured 1.73 µs avg / 12.1 µs worst in release, 2026-09-03)
-- 🔜 Tree-sitter PostgreSQL grammar produces an incremental syntax tree
-- 🔜 Statement detector correctly identifies statement boundaries (respecting `$$` delimiters, comments, string literals)
+- ✅ Tree-sitter PostgreSQL grammar produces an incremental syntax tree (`tree-sitter-sequel`; lazy incremental reparse: 1.6 ms on 10 MB of realistic statements, 150 ms worst case for a 180k-statement dump; 2026-09-03)
+- ✅ Statement detector correctly identifies statement boundaries (respecting `$$` delimiters, comments, string literals) — derived from the tree-sitter tree (2026-09-03)
 - 🔜 Command palette opens via keybinding, lists all registered commands, accepts fuzzy input, executes selected command
 - 🔜 Keybindings are configurable via the workspace format; a default keybinding map is provided
 - 🔜 Cursor movement, selection, copy/paste, undo/redo, and line operations work on the rope buffer

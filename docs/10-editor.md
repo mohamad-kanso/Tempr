@@ -127,7 +127,7 @@ impl Buffer {
 }
 ```
 
-**Implementation notes (2026-09-03, D21):** `tempr_editor::Buffer` follows this shape; `edit` returns `Result<Option<EditId>, EditError>` (bounds / char-boundary / overlap errors instead of panics; `None` when the batch changed nothing, leaving undo/redo untouched), `Point.column` is a **byte** column, and — as this document's data-flow section already requires — the buffer never publishes events itself. Line breaks are `\n` / `\r\n` only. `syntax()` / `statement_at()` land with the tree-sitter and statement-detector tasks. Helpers present today: `len_lines`, `line(i)`, `slice(range)`, `can_undo`/`can_redo`, `file_id`.
+**Implementation notes (2026-09-03, D21/D22):** `tempr_editor::Buffer` follows this shape; `edit` returns `Result<Option<EditId>, EditError>` (bounds / char-boundary / overlap errors instead of panics; `None` when the batch changed nothing, leaving undo/redo untouched), `Point.column` is a **byte** column, and — as this document's data-flow section already requires — the buffer never publishes events itself. Line breaks are `\n` / `\r\n` only. The syntax tree is updated **lazily**: `edit`/`undo`/`redo` record `InputEdit`s, and `syntax()`, `statement_at()`, `statement_ranges()`, `highlights(range)` (all `&mut self`) or an explicit `reparse()` run the incremental parse. Helpers present today: `len_lines`, `line(i)`, `slice(range)`, `can_undo`/`can_redo`, `is_syntax_dirty`, `file_id`.
 
 ### SyntaxTree
 
@@ -157,6 +157,8 @@ impl SyntaxTree {
     pub fn query(&self, query: &tree_sitter::Query) -> Vec<QueryCapture>;
 }
 ```
+
+**Implementation notes (2026-09-03, D22):** `tempr_editor::SyntaxTree` — `parse(&Rope)`, `edit(&InputEdit)`, `reparse(&Rope)` (reads rope chunks, no copy), `root_node()`, `has_error()`, `statement_ranges()` / `statement_at(offset)` (the statement detector: `program` children with `;` folded in, comments skipped, `$$` bodies and strings opaque), `highlights(query, text, range)` with the bundled `highlights.scm` via `SyntaxTree::highlight_query()`. Grammar: `tree-sitter-sequel`.
 
 ### EditorView
 

@@ -18,6 +18,9 @@ use std::ops::Range;
 use ropey::Rope;
 use tempr_domain::SqlFileId;
 use thiserror::Error;
+use tree_sitter::{InputEdit, Point as TsPoint};
+
+use crate::syntax::{Highlight, StatementRange, SyntaxTree};
 
 /// Identifier of one applied edit transaction; monotonically increasing per
 /// buffer. `undo`/`redo` return the id of the transaction they reverted or
@@ -83,24 +86,72 @@ struct EditHistory {
 pub struct Buffer {
     rope: Rope,
     history: EditHistory,
+    syntax: SyntaxTree,
+    /// Edits have been fed to the tree (`tree.edit`) but it has not been
+    /// re-parsed yet. Cleared by `reparse`.
+    syntax_dirty: bool,
     file_id: SqlFileId,
     next_edit: u64,
 }
 
 impl Buffer {
     pub fn new(file_id: SqlFileId, text: &str) -> Self {
+        let rope = Rope::from_str(text);
+        let syntax = SyntaxTree::parse(&rope);
         Self {
-            rope: Rope::from_str(text),
+            rope,
             history: EditHistory::default(),
+            syntax,
+            syntax_dirty: false,
             file_id,
             next_edit: 1,
         }
     }
 
-    pub fn file_id(&self) -> SqlFileId {
-        self.file_id
+    /// Re-parse incrementally if any edit happened since the last parse.
+    /// Edits only record their shape on the tree (O(1)); the parse itself
+    /// runs here, on demand, so `edit` stays sub-millisecond regardless of
+    /// document size. Returns `true` if a parse ran.
+    pub fn reparse(&mut self) -> bool {
+        if !self.syntax_dirty {
+            return false;
+        }
+        self.syntax.reparse(&self.rope);
+        self.syntax_dirty = false;
+        true
     }
 
+    /// True when edits are pending a `reparse`.
+    pub fn is_syntax_dirty(&self) -> bool {
+        self.syntax_dirty
+    }
+
+    /// The parse tree, brought up to date first.
+    pub fn syntax(&mut self) -> &SyntaxTree {
+        self.reparse();
+        &self.syntax
+    }
+
+    /// Byte range of the top-level statement containing `offset`
+    /// (inclusive of its terminating `;`), or `None` between statements.
+    pub fn statement_at(&mut self, offset: usize) -> Option<StatementRange> {
+        self.syntax().statement_at(offset)
+    }
+
+    /// All top-level statement ranges in document order.
+    pub fn statement_ranges(&mut self) -> Vec<StatementRange> {
+        self.syntax().statement_ranges()
+    }
+
+    /// Syntax-highlight captures within `byte_range` (the grammar's
+    /// bundled `highlights.scm`).
+    pub fn highlights(&mut self, byte_range: Range<usize>) -> Vec<Highlight> {
+        self.reparse();
+        self.syntax
+            .highlights(SyntaxTree::highlight_query(), &self.rope, byte_range)
+    }
+
+    /// Cheap snapshot of the file id.
     /// Total byte length of the content.
     pub fn len(&self) -> usize {
         self.rope.len_bytes()
@@ -181,10 +232,12 @@ impl Buffer {
 
         // Apply from the highest start down so lower offsets stay valid.
         let mut changes: Vec<Change> = Vec::with_capacity(edits.len());
+        let mut touched = false;
         for &i in &order {
             let (range, text) = &edits[i];
             let removed = self.replace_bytes(range.clone(), text);
             if removed != *text {
+                touched = true;
                 changes.push(Change {
                     start: range.start,
                     removed,
@@ -192,7 +245,7 @@ impl Buffer {
                 });
             }
         }
-        if changes.is_empty() {
+        if !touched {
             return Ok(None);
         }
 
@@ -310,8 +363,11 @@ impl Buffer {
         Ok(ch)
     }
 
-    /// Replace a validated byte range; returns the removed text.
+    /// Replace a validated byte range in the rope and tell the syntax tree;
+    /// returns the removed text. The caller reparses once per transaction.
     fn replace_bytes(&mut self, range: Range<usize>, text: &str) -> String {
+        let start_position = self.ts_point(range.start);
+        let old_end_position = self.ts_point(range.end);
         let start = self.rope.byte_to_char(range.start);
         let end = self.rope.byte_to_char(range.end);
         let removed = self.rope.slice(start..end).to_string();
@@ -321,7 +377,23 @@ impl Buffer {
         if !text.is_empty() {
             self.rope.insert(start, text);
         }
+        let new_end_byte = range.start + text.len();
+        self.syntax.edit(&InputEdit {
+            start_byte: range.start,
+            old_end_byte: range.end,
+            new_end_byte,
+            start_position,
+            old_end_position,
+            new_end_position: self.ts_point(new_end_byte),
+        });
+        self.syntax_dirty = true;
         removed
+    }
+
+    /// tree-sitter point (row, byte column) for a byte offset.
+    fn ts_point(&self, offset: usize) -> TsPoint {
+        let p = self.point_for_offset(offset);
+        TsPoint::new(p.line, p.column)
     }
 }
 
@@ -340,6 +412,7 @@ impl std::fmt::Debug for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::SyntaxTree;
 
     fn buf(text: &str) -> Buffer {
         Buffer::new(SqlFileId::new(), text)
@@ -655,5 +728,105 @@ mod tests {
         assert!(elapsed.as_millis() < 2_000, "batch edit took {elapsed:?}");
         b.undo();
         assert_eq!(b.text().to_string(), text);
+    }
+
+    #[test]
+    fn syntax_tree_tracks_edits_undo_and_redo() {
+        let mut b = buf("select 1;\nselect 2;");
+        assert_eq!(b.statement_ranges().len(), 2);
+        assert!(!b.syntax().has_error());
+
+        b.edit(&[(18..18, " + 40")]).unwrap().unwrap();
+        assert!(b.is_syntax_dirty(), "edit defers the parse");
+        let full = SyntaxTree::parse(&b.text());
+        assert_eq!(b.syntax().root_node().to_sexp(), full.root_node().to_sexp());
+        assert!(!b.is_syntax_dirty(), "reading the tree parsed it");
+        let stmt = b.statement_at(12).unwrap();
+        assert_eq!(b.slice(stmt.start..stmt.end).unwrap(), "select 2 + 40;");
+
+        // Break the syntax, then undo: the tree follows.
+        b.edit(&[(0..6, "selec")]).unwrap().unwrap();
+        assert!(b.syntax().has_error());
+        b.undo();
+        assert!(!b.syntax().has_error());
+        assert_eq!(
+            b.syntax().root_node().to_sexp(),
+            SyntaxTree::parse(&b.text()).root_node().to_sexp()
+        );
+        b.undo();
+        assert_eq!(b.statement_ranges().len(), 2);
+        b.redo();
+        assert_eq!(
+            b.syntax().root_node().to_sexp(),
+            SyntaxTree::parse(&b.text()).root_node().to_sexp()
+        );
+    }
+
+    #[test]
+    fn multibyte_edits_keep_tree_positions_consistent() {
+        let mut b = buf("select 'héllo';\nselect 2;");
+        b.edit(&[(8..14, "wörld"), (0..0, "-- ü\n")])
+            .unwrap()
+            .unwrap();
+        let full = SyntaxTree::parse(&b.text());
+        assert_eq!(b.syntax().root_node().to_sexp(), full.root_node().to_sexp());
+        let ranges = b.statement_ranges();
+        assert_eq!(
+            b.slice(ranges[0].start..ranges[0].end).unwrap(),
+            "select 'wörld';"
+        );
+        let hs = b.highlights(0..b.len());
+        assert!(hs.iter().any(|h| h.capture == "comment"));
+    }
+
+    /// Incremental reparse cost after a one-line edit, for two 10 MB
+    /// shapes: a dump of ~180k small statements (worst case for tree-sitter's
+    /// flat sibling reuse) and ~2.5k large statements. Reported, and bounded
+    /// loosely to catch regressions to a full parse. Timing-sensitive →
+    /// ignored; run in release.
+    #[test]
+    #[ignore = "timing-sensitive; run in release on a quiet machine"]
+    fn perf_10mb_incremental_reparse() {
+        use std::time::{Duration, Instant};
+        let target = 10 * 1024 * 1024;
+        let small = "select id, name, created_at from accounts where id = 42;\n".to_string();
+        let big_body = "  (1, 'alice', '2024-01-01'),\n".repeat(120);
+        let big = format!(
+            "insert into accounts (id, name, created_at) values\n{big_body}  (2, 'bob', '2024-01-02');\n"
+        );
+        for (label, unit) in [
+            ("180k small statements", small),
+            ("2.5k large statements", big),
+        ] {
+            let text = unit.repeat(target / unit.len() + 1);
+            let t0 = Instant::now();
+            let mut b = buf(&text);
+            let full = t0.elapsed();
+            let mid = b.offset_for_point(Point {
+                line: b.point_for_offset(b.len() / 2).line,
+                column: 0,
+            });
+            let mut worst = Duration::ZERO;
+            let mut total = Duration::ZERO;
+            let iterations: u32 = 20;
+            for _ in 0..iterations {
+                b.edit(&[(mid..mid, "-- x\n")]).unwrap().unwrap();
+                let t = Instant::now();
+                b.reparse();
+                let d = t.elapsed();
+                b.edit(&[(mid..mid + 5, "")]).unwrap().unwrap();
+                b.reparse();
+                total += d;
+                worst = worst.max(d);
+            }
+            let avg = total / iterations;
+            eprintln!(
+                "10 MB {label}: full parse {full:?}; incremental reparse avg {avg:?}, worst {worst:?}"
+            );
+            assert!(
+                avg * 3 < full,
+                "incremental reparse ({avg:?}) is not much cheaper than a full parse ({full:?})"
+            );
+        }
     }
 }
