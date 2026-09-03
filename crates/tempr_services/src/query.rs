@@ -9,8 +9,8 @@ use tempr_domain::{
 };
 use tempr_events::{AppEvent, EventBus};
 
-use crate::ServiceError;
 use crate::connection::ConnectionService;
+use crate::{Service, ServiceError};
 
 struct ActiveRun {
     query_run: QueryRun,
@@ -191,7 +191,7 @@ impl QueryService {
                         }
                     };
                     if cancelled_meanwhile {
-                        return (conn, Err(tempr_db::DriverError::Cancelled));
+                        return Err(tempr_db::DriverError::Cancelled);
                     }
 
                     match conn.execute(&sql, &[]).await {
@@ -218,11 +218,11 @@ impl QueryService {
                             }
 
                             match stream_err {
-                                Some(e) => (conn, Err(e)),
-                                None => (conn, Ok((columns, total_rows))),
+                                Some(e) => Err(e),
+                                None => Ok((columns, total_rows)),
                             }
                         }
-                        Err(e) => (conn, Err(e)),
+                        Err(e) => Err(e),
                     }
                 }
             })
@@ -317,12 +317,33 @@ impl QueryService {
         Ok(())
     }
 
+    /// Cancel every in-flight run (used by `stop`).
+    pub async fn cancel_all(&self) {
+        for run in self.active_runs() {
+            if let Err(e) = self.cancel(run).await {
+                tracing::warn!("cancel of {run:?} during shutdown failed: {e}");
+            }
+        }
+    }
+
     pub fn active_runs(&self) -> Vec<QueryRunId> {
         self.active_runs.read().keys().copied().collect()
     }
 
     pub fn completed_run(&self, run_id: QueryRunId) -> Option<QueryRun> {
         self.completed_runs.read().get(&run_id).cloned()
+    }
+}
+
+#[async_trait::async_trait]
+impl Service for QueryService {
+    fn name(&self) -> &'static str {
+        "QueryService"
+    }
+
+    async fn stop(&self) -> Result<(), ServiceError> {
+        self.cancel_all().await;
+        Ok(())
     }
 }
 

@@ -59,18 +59,38 @@ impl WorkspaceService {
 
 `ConnectionService` manages database connections — establishing pools, tracking connection state, handling reconnection on failure, and providing a borrowing interface so that `QueryService` and `SchemaService` can obtain a connection handle for a given `ConnectionId`. It resolves connection definitions from the workspace's `workspace.toml` at open time, delegates secret resolution to the OS keychain, and publishes state changes as events so the UI and other services can react without polling.
 
-**Owned state:** connection pool map (`ConnectionId → DriverConnection`), per-connection state (`Connecting`, `Connected`, `Reconnecting`, `Failed`), reconnection backoff state.
+**Owned state:** per-connection pool set (`ConnectionId → { user pool, metadata slot }`, both `deadpool` managed pools over `Box<dyn DriverConnection>` — D19), per-connection state (`Connecting`, `Connected`, `Reconnecting`, `Failed`), `PoolConfig` (user pool max, default 8). Reconnection/backoff and idle health checks are not implemented yet (TODO).
 
-**Key async methods:**
+**Key async methods** *(verified against `crates/tempr_services/src/connection.rs`, 2026-09-03)*:
 
 ```rust
+/// A borrowed driver connection; returns to its pool on drop.
+pub type PooledConnection = deadpool::managed::Object<DriverManager>;
+
 impl ConnectionService {
-    pub async fn connect(&self, id: ConnectionId) -> Result<(), ConnectionError>;
-    pub async fn disconnect(&self, id: ConnectionId) -> Result<(), ConnectionError>;
+    pub fn new(event_bus: Arc<EventBus>) -> Arc<Self>;
+    pub fn with_pool_config(event_bus: Arc<EventBus>, cfg: PoolConfig) -> Arc<Self>;
+    pub fn register_driver(&self, driver: Arc<dyn DatabaseDriver>);
+
+    /// Builds the pools and establishes one connection eagerly (credentials
+    /// and reachability are validated here, not on first query).
+    pub async fn connect(&self, connection: &Connection) -> Result<(), ServiceError>;
+    pub async fn disconnect(&self, id: ConnectionId) -> Result<(), ServiceError>;
     pub fn state(&self, id: ConnectionId) -> ConnectionState;
-    pub async fn borrow(&self, id: ConnectionId) -> Result<Arc<dyn DriverConnection>, ConnectionError>;
-    pub async fn reconnect(&self, id: ConnectionId) -> Result<(), ConnectionError>;
+    pub fn connection_ids(&self) -> Vec<ConnectionId>;
+    pub fn pool_status(&self, id: ConnectionId) -> Option<(usize /*in use*/, usize /*idle*/)>;
+
+    /// Borrow from the user pool (QueryService).
+    pub async fn with_connection_fn<F, Fut, R>(&self, id: ConnectionId, f: F) -> Result<R, ServiceError>
+    where F: FnOnce(PooledConnection) -> Fut, Fut: Future<Output = Result<R, DriverError>>;
+
+    /// Borrow the dedicated metadata slot (SchemaService only).
+    pub async fn with_metadata_connection_fn<F, Fut, R>(&self, id: ConnectionId, f: F) -> Result<R, ServiceError>
+    where F: FnOnce(PooledConnection) -> Fut, Fut: Future<Output = Result<R, DriverError>>;
 }
+
+// Lifecycle: `Service::stop` drains every pool. `connect` is driven by the
+// workspace open sequence, not by `start`.
 ```
 
 **Events published:** `ConnectionStateChanged { id: ConnectionId, state: ConnectionState }`, `ConnectionFailed { id: ConnectionId, error: String }`.

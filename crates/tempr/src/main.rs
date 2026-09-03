@@ -14,11 +14,8 @@ use tempr_events::{EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService, ServiceRegistry};
 use tempr_ui::{DevOptions, Services, gpui_compat};
 
-/// Everything the UI needs a handle to. Built before GPUI starts.
-///
-/// Core services are plain `Arc`s for now; they do not yet implement the
-/// `Service` lifecycle trait, so the registry only carries lifecycle-aware
-/// services (none in this shell). Tracked in docs/TODO.md.
+/// Everything the UI needs a handle to. Built before GPUI starts. The
+/// registry owns start/stop ordering: connection → query → schema.
 struct AppServices {
     bus: Arc<EventBus>,
     registry: Arc<ServiceRegistry>,
@@ -37,6 +34,10 @@ fn build_services() -> AppServices {
 
     let pg_driver = Arc::new(PostgresDriver::new()) as Arc<dyn DatabaseDriver>;
     connection.register_driver(pg_driver);
+
+    registry.register(connection.clone());
+    registry.register(query.clone());
+    registry.register(schema.clone());
 
     AppServices {
         bus,

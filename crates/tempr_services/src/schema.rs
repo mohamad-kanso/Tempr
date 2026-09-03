@@ -6,8 +6,8 @@ use tempr_db::{SchemaScope, SchemaSnapshotEntry};
 use tempr_domain::{ConnectionId, SchemaObject, SchemaObjectId, SchemaSnapshot, SchemaSnapshotId};
 use tempr_events::{AppEvent, EventBus};
 
-use crate::ServiceError;
 use crate::connection::ConnectionService;
+use crate::{Service, ServiceError};
 
 pub struct SchemaService {
     event_bus: Arc<EventBus>,
@@ -30,12 +30,8 @@ impl SchemaService {
     ) -> Result<Arc<SchemaSnapshot>, ServiceError> {
         let entries = self
             .connection_service
-            .with_connection_fn(connection_id, |mut conn| async move {
-                let result = conn.snapshot_schema(SchemaScope::All).await;
-                match result {
-                    Ok(entries) => (conn, Ok(entries)),
-                    Err(e) => (conn, Err(e)),
-                }
+            .with_metadata_connection_fn(connection_id, |mut conn| async move {
+                conn.snapshot_schema(SchemaScope::All).await
             })
             .await?;
 
@@ -155,6 +151,13 @@ impl SchemaService {
 
     pub fn version(&self, connection_id: ConnectionId) -> Option<u64> {
         self.snapshots.read().get(&connection_id).map(|s| s.version)
+    }
+}
+
+#[async_trait::async_trait]
+impl Service for SchemaService {
+    fn name(&self) -> &'static str {
+        "SchemaService"
     }
 }
 
