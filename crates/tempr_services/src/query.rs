@@ -4,7 +4,8 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tempr_db::CancelHandle;
 use tempr_domain::{
-    ColumnMeta, ConnectionId, Query, QueryOutcome, QueryRun, QueryRunId, ResultSet, Value,
+    Batch, ColumnMeta, ColumnSpec, ConnectionId, Query, QueryOutcome, QueryRun, QueryRunId,
+    ResultSet, Value,
 };
 use tempr_events::{AppEvent, EventBus};
 
@@ -14,6 +15,41 @@ use crate::connection::ConnectionService;
 struct ActiveRun {
     query_run: QueryRun,
     cancel_handle: Option<Box<dyn CancelHandle>>,
+}
+
+/// Receives a query's results as they stream in. Called from the query task
+/// (tokio), so implementations must be `Send + Sync` and must not block —
+/// hand the data to a channel or a lock-free buffer and return.
+pub trait RowSink: Send + Sync {
+    /// Column metadata, delivered exactly once before the first batch.
+    fn columns(&self, columns: &[ColumnSpec]);
+    /// One batch of rows, in arrival order.
+    fn batch(&self, batch: Batch);
+}
+
+/// Sink used by [`QueryService::execute`] to materialise a full `ResultSet`.
+#[derive(Default)]
+struct CollectingSink {
+    rows: parking_lot::Mutex<Vec<Vec<Value>>>,
+}
+
+impl RowSink for CollectingSink {
+    fn columns(&self, _columns: &[ColumnSpec]) {}
+    fn batch(&self, batch: Batch) {
+        self.rows.lock().extend(batch.rows);
+    }
+}
+
+fn column_meta(columns: &[ColumnSpec]) -> Vec<ColumnMeta> {
+    columns
+        .iter()
+        .map(|c| ColumnMeta {
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            nullable: c.nullable,
+            ordinal: c.ordinal,
+        })
+        .collect()
 }
 
 pub struct QueryService {
@@ -33,11 +69,49 @@ impl QueryService {
         })
     }
 
+    /// Execute `sql`, collecting every row into the completed run's
+    /// `ResultSet`. Prefer [`Self::execute_streaming`] for anything a user
+    /// will look at while it is still arriving.
     pub async fn execute(
         &self,
         sql: &str,
         connection_id: ConnectionId,
     ) -> Result<QueryRunId, ServiceError> {
+        let sink = Arc::new(CollectingSink::default());
+        let (run_id, result) = self.run(sql, connection_id, sink.clone()).await;
+        let result_set = result.as_ref().ok().map(|(columns, total_rows)| {
+            let rows = std::mem::take(&mut *sink.rows.lock());
+            ResultSet {
+                columns: columns.clone(),
+                rows,
+                total_rows: *total_rows,
+                truncated: false,
+            }
+        });
+        self.finish(run_id, result, result_set)
+    }
+
+    /// Execute `sql`, delivering columns and then each batch to `sink` as
+    /// they arrive; publishes `RowsReceived` per batch. The completed run
+    /// records the outcome but no `ResultSet` — the sink owns the rows.
+    pub async fn execute_streaming(
+        &self,
+        sql: &str,
+        connection_id: ConnectionId,
+        sink: Arc<dyn RowSink>,
+    ) -> Result<QueryRunId, ServiceError> {
+        let (run_id, result) = self.run(sql, connection_id, sink).await;
+        self.finish(run_id, result, None)
+    }
+
+    /// Shared execution path: registers the run, streams every batch to
+    /// `sink`, returns `(columns, total_rows)` on success.
+    async fn run(
+        &self,
+        sql: &str,
+        connection_id: ConnectionId,
+        sink: Arc<dyn RowSink>,
+    ) -> (QueryRunId, Result<(Vec<ColumnMeta>, usize), ServiceError>) {
         let query = Query {
             id: tempr_domain::QueryId::new(),
             text: sql.to_string(),
@@ -50,7 +124,7 @@ impl QueryService {
         let run_id = QueryRunId::new();
         let query_run = QueryRun {
             id: run_id,
-            query: query.clone(),
+            query,
             connection_id,
             started_at: chrono::Utc::now(),
             finished_at: None,
@@ -73,6 +147,7 @@ impl QueryService {
             .connection_service
             .with_connection_fn(connection_id, |mut conn| {
                 let sql = sql_owned.clone();
+                let sink = sink.clone();
                 async move {
                     // Captured before the (potentially long-running) execute
                     // call so a concurrent `cancel()` can reach this query
@@ -83,23 +158,19 @@ impl QueryService {
 
                     match conn.execute(&sql, &[]).await {
                         Ok(mut stream) => {
-                            let columns: Vec<ColumnMeta> = stream
-                                .columns()
-                                .iter()
-                                .map(|c| ColumnMeta {
-                                    name: c.name.clone(),
-                                    data_type: c.data_type.clone(),
-                                    nullable: c.nullable,
-                                    ordinal: c.ordinal,
-                                })
-                                .collect();
+                            let columns = column_meta(stream.columns());
+                            sink.columns(stream.columns());
 
-                            let mut all_rows: Vec<Vec<Value>> = Vec::new();
+                            let mut total_rows = 0usize;
                             let mut stream_err = None;
                             while let Some(batch_result) = stream.next_batch().await.transpose() {
                                 match batch_result {
                                     Ok(batch) => {
-                                        all_rows.extend(batch.rows);
+                                        let count = batch.rows.len();
+                                        total_rows += count;
+                                        sink.batch(batch);
+                                        self.event_bus
+                                            .publish(AppEvent::RowsReceived { run: run_id, count });
                                     }
                                     Err(e) => {
                                         stream_err = Some(e);
@@ -108,16 +179,9 @@ impl QueryService {
                                 }
                             }
 
-                            if let Some(e) = stream_err {
-                                (conn, Err(e))
-                            } else {
-                                let result_set = ResultSet {
-                                    columns,
-                                    rows: all_rows.clone(),
-                                    total_rows: all_rows.len(),
-                                    truncated: false,
-                                };
-                                (conn, Ok(result_set))
+                            match stream_err {
+                                Some(e) => (conn, Err(e)),
+                                None => (conn, Ok((columns, total_rows))),
                             }
                         }
                         Err(e) => (conn, Err(e)),
@@ -126,36 +190,40 @@ impl QueryService {
             })
             .await;
 
+        (run_id, result)
+    }
+
+    /// Move the run from active to completed, publish `QueryFinished`, and
+    /// map the result to the public return type.
+    fn finish(
+        &self,
+        run_id: QueryRunId,
+        result: Result<(Vec<ColumnMeta>, usize), ServiceError>,
+        result_set: Option<ResultSet>,
+    ) -> Result<QueryRunId, ServiceError> {
         let mut active_runs = self.active_runs.write();
         if let Some(mut active) = active_runs.remove(&run_id) {
-            match &result {
-                Ok(result_set) => {
-                    active.query_run.outcome = QueryOutcome::Success;
-                    active.query_run.finished_at = Some(chrono::Utc::now());
-                    active.query_run.result_set = Some(result_set.clone());
-                    self.event_bus.publish(AppEvent::QueryFinished {
-                        run: run_id,
-                        outcome: QueryOutcome::Success,
-                    });
-                }
-                Err(e) => {
-                    active.query_run.outcome = QueryOutcome::Error(e.to_string());
-                    active.query_run.finished_at = Some(chrono::Utc::now());
-                    self.event_bus.publish(AppEvent::QueryFinished {
-                        run: run_id,
-                        outcome: QueryOutcome::Error(e.to_string()),
-                    });
-                }
-            }
+            let outcome = match &result {
+                Ok(_) => QueryOutcome::Success,
+                Err(e) => QueryOutcome::Error(e.to_string()),
+            };
+            active.query_run.outcome = outcome.clone();
+            active.query_run.finished_at = Some(chrono::Utc::now());
+            active.query_run.result_set = result_set;
+            self.event_bus.publish(AppEvent::QueryFinished {
+                run: run_id,
+                outcome,
+            });
             self.completed_runs.write().insert(run_id, active.query_run);
         }
 
-        result
-            .map(|_| run_id)
-            .map_err(|e| ServiceError::QueryFailed {
+        result.map(|_| run_id).map_err(|e| match e {
+            ServiceError::QueryFailed { .. } => e,
+            other => ServiceError::QueryFailed {
                 name: "QueryService",
-                reason: e.to_string(),
-            })
+                reason: other.to_string(),
+            },
+        })
     }
 
     pub async fn cancel(&self, run_id: QueryRunId) -> Result<(), ServiceError> {
@@ -247,5 +315,204 @@ mod tests {
         let svc = QueryService::new(bus, cs);
         let run_id = QueryRunId::new();
         assert!(svc.completed_run(run_id).is_none());
+    }
+
+    // ── Streaming tests with a mock driver ─────────────────────────────
+
+    use tempr_db::{DatabaseDriver, DriverConnection, DriverError, EngineId, QueryStreamImpl};
+    use tempr_domain::{Connection, DriverKind, SecretRef};
+
+    struct NoopCancel;
+    #[async_trait::async_trait]
+    impl CancelHandle for NoopCancel {
+        async fn cancel(&self) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
+    struct MockStream {
+        columns: Vec<ColumnSpec>,
+        batches: std::collections::VecDeque<Batch>,
+    }
+    #[async_trait::async_trait]
+    impl QueryStreamImpl for MockStream {
+        fn columns(&self) -> &[ColumnSpec] {
+            &self.columns
+        }
+        async fn next_batch(&mut self) -> Result<Option<Batch>, DriverError> {
+            Ok(self.batches.pop_front())
+        }
+        fn rows_affected(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Yields `batches` of `rows_per_batch` single-int rows.
+    struct MockConn {
+        batches: usize,
+        rows_per_batch: usize,
+    }
+    #[async_trait::async_trait]
+    impl DriverConnection for MockConn {
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<tempr_db::QueryStream, DriverError> {
+            let columns = vec![ColumnSpec {
+                name: "n".into(),
+                ordinal: 0,
+                data_type: "int8".into(),
+                value_type: tempr_domain::ValueType::Int,
+                nullable: false,
+                table_schema: None,
+                table_name: None,
+            }];
+            let batches = (0..self.batches)
+                .map(|b| Batch {
+                    rows: (0..self.rows_per_batch)
+                        .map(|r| vec![Value::Int8((b * self.rows_per_batch + r) as i64)])
+                        .collect(),
+                    batch_index: b,
+                })
+                .collect();
+            Ok(tempr_db::QueryStream::new(
+                Box::new(MockStream { columns, batches }),
+                self.rows_per_batch,
+            ))
+        }
+        async fn cancel(&mut self) -> Result<(), DriverError> {
+            Ok(())
+        }
+        fn cancel_handle(&self) -> Box<dyn CancelHandle> {
+            Box::new(NoopCancel)
+        }
+        async fn snapshot_schema(
+            &mut self,
+            _scope: tempr_db::SchemaScope,
+        ) -> Result<Vec<tempr_db::SchemaSnapshotEntry>, DriverError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct MockDriver {
+        batches: usize,
+        rows_per_batch: usize,
+    }
+    #[async_trait::async_trait]
+    impl DatabaseDriver for MockDriver {
+        fn engine(&self) -> EngineId {
+            EngineId(DriverKind::Postgres.engine_name().to_string())
+        }
+        async fn connect(
+            &self,
+            _connection: &Connection,
+        ) -> Result<Box<dyn DriverConnection>, DriverError> {
+            Ok(Box::new(MockConn {
+                batches: self.batches,
+                rows_per_batch: self.rows_per_batch,
+            }))
+        }
+    }
+
+    async fn connected_service(
+        batches: usize,
+        rows_per_batch: usize,
+    ) -> (Arc<EventBus>, Arc<QueryService>, ConnectionId) {
+        let bus = make_event_bus();
+        let cs = ConnectionService::new(bus.clone());
+        cs.register_driver(Arc::new(MockDriver {
+            batches,
+            rows_per_batch,
+        }));
+        let id = ConnectionId::new();
+        let conn = Connection {
+            id,
+            name: "mock".into(),
+            driver: DriverKind::Postgres,
+            host: "localhost".into(),
+            port: 5432,
+            database: "db".into(),
+            username: "u".into(),
+            password: "p".into(),
+            secret_ref: SecretRef {
+                vault_key: "k".into(),
+            },
+        };
+        cs.connect(&conn).await.unwrap();
+        (bus.clone(), QueryService::new(bus, cs), id)
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        columns: Mutex<Vec<ColumnSpec>>,
+        batches: Mutex<Vec<Batch>>,
+    }
+    impl RowSink for RecordingSink {
+        fn columns(&self, columns: &[ColumnSpec]) {
+            *self.columns.lock() = columns.to_vec();
+        }
+        fn batch(&self, batch: Batch) {
+            self.batches.lock().push(batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_delivers_columns_then_batches_in_order() {
+        let (bus, svc, id) = connected_service(3, 4).await;
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let e = events.clone();
+        let _sub = bus.subscribe(EventFilter::All, move |ev| {
+            e.lock().push(match ev {
+                AppEvent::QueryStarted { .. } => "started".to_string(),
+                AppEvent::RowsReceived { count, .. } => format!("rows:{count}"),
+                AppEvent::QueryFinished { outcome, .. } => format!("finished:{outcome:?}"),
+                _ => "other".to_string(),
+            });
+        });
+
+        let sink = Arc::new(RecordingSink::default());
+        let run_id = svc
+            .execute_streaming("SELECT n", id, sink.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(sink.columns.lock().len(), 1);
+        assert_eq!(sink.columns.lock()[0].name, "n");
+        let batches = sink.batches.lock();
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[2].rows[3][0], Value::Int8(11));
+
+        assert_eq!(
+            *events.lock(),
+            vec!["started", "rows:4", "rows:4", "rows:4", "finished:Success"]
+        );
+
+        let run = svc.completed_run(run_id).unwrap();
+        assert_eq!(run.outcome, QueryOutcome::Success);
+        assert!(
+            run.result_set.is_none(),
+            "streaming runs do not retain rows"
+        );
+        assert!(svc.active_runs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_collects_all_rows_and_publishes_rows_received() {
+        let (bus, svc, id) = connected_service(2, 5).await;
+        let counts: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let c = counts.clone();
+        let _sub = bus.subscribe(EventFilter::All, move |ev| {
+            if let AppEvent::RowsReceived { count, .. } = ev {
+                c.lock().push(*count);
+            }
+        });
+
+        let run_id = svc.execute("SELECT n", id).await.unwrap();
+        let rs = svc.completed_run(run_id).unwrap().result_set.unwrap();
+        assert_eq!(rs.rows.len(), 10);
+        assert_eq!(rs.total_rows, 10);
+        assert_eq!(rs.columns[0].name, "n");
+        assert_eq!(*counts.lock(), vec![5, 5]);
     }
 }

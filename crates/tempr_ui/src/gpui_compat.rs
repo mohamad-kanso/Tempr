@@ -4,7 +4,9 @@
 //! so that when upstream renames a method or moves a type between crates, the
 //! fix is isolated to this file (docs/11-gpui.md → "GPUI compatibility shim").
 
-use gpui::{App, AppContext, Bounds, Entity, Render, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext, Bounds, Context, Entity, Render, Window, WindowBounds, WindowOptions, px, size,
+};
 use tokio::task::JoinError;
 
 /// Default main-window size in logical pixels.
@@ -20,10 +22,11 @@ pub fn run_app(init: impl FnOnce(&mut App) + 'static) {
 }
 
 /// Open a centered top-level window whose root entity is built by `build`.
+/// `build` receives the new `Window` so it can set initial focus.
 pub fn open_main_window<V: Render>(
     cx: &mut App,
     title: &str,
-    build: impl FnOnce(&mut App) -> V + 'static,
+    build: impl FnOnce(&mut Window, &mut Context<V>) -> V + 'static,
 ) -> anyhow::Result<Entity<V>> {
     let (w, h) = DEFAULT_WINDOW_SIZE;
     let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
@@ -36,8 +39,8 @@ pub fn open_main_window<V: Render>(
         ..Default::default()
     };
     let mut root: Option<Entity<V>> = None;
-    cx.open_window(options, |_window, cx| {
-        let entity = cx.new(|cx| build(cx));
+    cx.open_window(options, |window, cx| {
+        let entity = cx.new(|cx| build(window, cx));
         root = Some(entity.clone());
         entity
     })?;

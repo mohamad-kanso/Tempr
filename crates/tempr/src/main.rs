@@ -9,9 +9,10 @@ use tracing_subscriber::FmtSubscriber;
 
 use tempr_db::DatabaseDriver;
 use tempr_db_postgres::PostgresDriver;
+use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef};
 use tempr_events::{EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService, ServiceRegistry};
-use tempr_ui::gpui_compat;
+use tempr_ui::{Services, gpui_compat};
 
 /// Everything the UI needs a handle to. Built before GPUI starts.
 ///
@@ -21,8 +22,8 @@ use tempr_ui::gpui_compat;
 struct AppServices {
     bus: Arc<EventBus>,
     registry: Arc<ServiceRegistry>,
-    _connection: Arc<ConnectionService>,
-    _query: Arc<QueryService>,
+    connection: Arc<ConnectionService>,
+    query: Arc<QueryService>,
     _schema: Arc<SchemaService>,
 }
 
@@ -40,10 +41,35 @@ fn build_services() -> AppServices {
     AppServices {
         bus,
         registry,
-        _connection: connection,
-        _query: query,
+        connection,
+        query,
         _schema: schema,
     }
+}
+
+/// Build a `Connection` from `DATABASE_URL` (postgres://user:pass@host:port/db).
+/// Phase 1 stand-in for the workspace connection list.
+fn connection_from_env() -> Result<Option<Connection>> {
+    let Ok(raw) = std::env::var("DATABASE_URL") else {
+        return Ok(None);
+    };
+    let url = url::Url::parse(&raw).map_err(|e| anyhow::anyhow!("DATABASE_URL: {e}"))?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        anyhow::bail!("DATABASE_URL: unsupported scheme '{}'", url.scheme());
+    }
+    Ok(Some(Connection {
+        id: ConnectionId::new(),
+        name: "DATABASE_URL".to_string(),
+        driver: DriverKind::Postgres,
+        host: url.host_str().unwrap_or("localhost").to_string(),
+        port: url.port().unwrap_or(5432),
+        database: url.path().trim_start_matches('/').to_string(),
+        username: url.username().to_string(),
+        password: url.password().unwrap_or("").to_string(),
+        secret_ref: SecretRef {
+            vault_key: "DATABASE_URL".to_string(),
+        },
+    }))
 }
 
 fn main() -> Result<()> {
@@ -54,11 +80,15 @@ fn main() -> Result<()> {
     info!("Tempr starting");
 
     let services = build_services();
+    let connection = connection_from_env()?;
     let _event_log = services.bus.subscribe(EventFilter::All, |event| {
         info!(event = ?event.kind(), "event");
     });
 
     gpui_compat::run_app(move |cx| {
+        tempr_ui::bind_keys(cx);
+        cx.on_action(|_: &tempr_ui::Quit, cx| cx.quit());
+
         // Start services on the tokio runtime; the UI thread never blocks.
         let registry = services.registry.clone();
         gpui_compat::spawn_tokio(cx, async move {
@@ -70,8 +100,13 @@ fn main() -> Result<()> {
         })
         .detach();
 
-        if let Err(e) = gpui_compat::open_main_window(cx, "Tempr", |_cx| {
-            tempr_ui::MainWindow::new("phase1-demo")
+        let ui_services = Services {
+            bus: services.bus.clone(),
+            connection: services.connection.clone(),
+            query: services.query.clone(),
+        };
+        if let Err(e) = gpui_compat::open_main_window(cx, "Tempr", move |window, cx| {
+            tempr_ui::MainWindow::new(ui_services, connection, window, cx)
         }) {
             error!(error = %e, "failed to open main window");
             cx.quit();

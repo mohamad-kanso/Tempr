@@ -34,9 +34,9 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 - ✅ PostgreSQL driver connects to a live instance using connection config from Phase 0 (TLS configurable, default Prefer)
 - ✅ `SELECT` and `INSERT` execute and return rows or affected-row counts through the service layer
 - ✅ Streaming result pipeline delivers rows in batches (`batch_size`-sized); memory usage bounded regardless of result size
-- 🔜 GPUI application window renders with a text input area and a scrollable result grid
+- ✅ GPUI application window renders with a text input area and a scrollable result grid
 - 🔜 Result grid displays streaming rows as they arrive; scrolling is smooth for result sets up to 100,000 rows
-- 🔜 Connection errors, auth failures, and query syntax errors produce user-visible messages
+- ✅ Connection errors, auth failures, and query syntax errors produce user-visible messages (status bar)
 - AC: 100,000-row result set scrolls at 60 fps. Auth failure produces a user-visible error (not a crash). Peak RSS stays below 500 MB streaming 1,000,000 rows.
 
 ### 3. Editor (Phase 2)

@@ -81,26 +81,42 @@ impl ConnectionService {
 
 ### QueryService
 
-`QueryService` is the execution engine: it takes a SQL text and a connection, constructs a `QueryRun`, executes the statement against the driver, and streams results back through a `QueryStream`. It publishes lifecycle events (`QueryStarted`, `RowsReceived`, `QueryFinished`) that the result grid, history service, status bar, and plugins all consume. It never buffers an entire result set in memory — rows arrive in bounded batches and are appended to the `RowStore` as they arrive.
+`QueryService` is the execution engine: it takes a SQL text and a connection, constructs a `QueryRun`, executes the statement against the driver, and streams results back through a `QueryStream`. It publishes lifecycle events (`QueryStarted`, `RowsReceived`, `QueryFinished`) that the result grid, history service, status bar, and plugins all consume. The UI path is `execute_streaming`: rows arrive in bounded batches and are handed to a caller-supplied `RowSink` as they arrive, never buffered by the service. `execute` is the convenience form that collects into a `ResultSet` (tests, scripting, small internal queries).
 
 **Owned state:** active `QueryRun` map (`QueryRunId → QueryStream`), execution semaphore (limits concurrent queries per connection), cancellation handles.
 
 **Key async methods:**
 
 ```rust
+/// Receives a query's results as they stream in. Called on the query task
+/// (tokio) — implementations hand data to a channel and return immediately.
+pub trait RowSink: Send + Sync {
+    fn columns(&self, columns: &[ColumnSpec]);   // exactly once, before the first batch
+    fn batch(&self, batch: Batch);               // in arrival order
+}
+
 impl QueryService {
-    pub async fn execute(
+    /// Stream rows to `sink`; publishes `RowsReceived` per batch. The
+    /// completed `QueryRun` records the outcome but no `ResultSet`.
+    pub async fn execute_streaming(
         &self,
         sql: &str,
         connection_id: ConnectionId,
-        source_file: Option<SqlFileId>,
-    ) -> Result<QueryRunId, QueryError>;
+        sink: Arc<dyn RowSink>,
+    ) -> Result<QueryRunId, ServiceError>;
 
-    pub async fn cancel(&self, run_id: QueryRunId) -> Result<(), QueryError>;
+    /// Collect every row into the completed run's `ResultSet`.
+    pub async fn execute(&self, sql: &str, connection_id: ConnectionId)
+        -> Result<QueryRunId, ServiceError>;
+
+    pub async fn cancel(&self, run_id: QueryRunId) -> Result<(), ServiceError>;
 
     pub fn active_runs(&self) -> Vec<QueryRunId>;
+    pub fn completed_run(&self, run_id: QueryRunId) -> Option<QueryRun>;
 }
 ```
+
+*Signatures verified against `crates/tempr_services/src/query.rs` on 2026-09-03. `source_file` and the per-connection execution semaphore are not implemented yet.*
 
 **Events published:** `QueryStarted { run: QueryRunId }`, `RowsReceived { run: QueryRunId, count: usize }`, `QueryFinished { run: QueryRunId, outcome: QueryOutcome }`.
 

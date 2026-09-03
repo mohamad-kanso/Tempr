@@ -12,9 +12,12 @@
 
 - [ ] Make `ConnectionService` / `QueryService` / `SchemaService` implement the `Service` lifecycle trait so the binary registers them in `ServiceRegistry` (today only test services implement it; the GPUI shell holds plain `Arc`s)
 - [ ] Wire `deadpool-postgres` pool into `ConnectionService` (dependency declared, unused)
-- [ ] `Input` component: hand-roll single-line text input from `crates/gpui/examples/input.rs` (rev `ed8d600`) — Phase 1 editor placeholder
-- [ ] `ThemeProvider` tokens replace the placeholder palette consts in `tempr_ui::main_window` (no hard-coded colors rule, 11-gpui.md)
-- [ ] `Table` component: `uniform_list`-backed result grid fed by `QueryService` stream via `gpui_compat::spawn_tokio` — Phase 1 grid placeholder
+- [ ] `ThemeProvider` tokens replace the placeholder palette consts in `tempr_ui::theme` (no hard-coded colors rule, 11-gpui.md)
+- [ ] Measure `ResultsGrid` scroll frame time at 100k rows (Phase 1 AC: 60 fps) — needs a frame-time probe (`window.request_animation_frame` timing log) or screenshot tooling; GNOME denies CLI screenshots (memory: X11 + `xwininfo` only proves the window exists)
+- [ ] Cancel the running query — `QueryService::cancel` exists; add a `CancelQuery` action + keybinding (escape) in `MainWindow`
+- [ ] Connection picker in `MainWindow` (workspace connection list) replaces the `DATABASE_URL` stand-in; surface a malformed `DATABASE_URL` in the UI instead of exiting before the window opens
+- [ ] `ResultsGrid`: column virtualization + resize, copy-on-select, 2D keyboard navigation (11-gpui.md Table row); columnar `RowStore` with spill-to-disk (13-result-grid.md) once result sizes demand it
+- [ ] `Input`: undo/redo, auto-resize; multi-line SQL input arrives with the Phase 2 editor (rope + tree-sitter)
 
 ## Next
 

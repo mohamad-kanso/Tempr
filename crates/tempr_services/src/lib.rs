@@ -7,6 +7,6 @@ pub mod registry;
 pub mod schema;
 
 pub use connection::ConnectionService;
-pub use query::QueryService;
+pub use query::{QueryService, RowSink};
 pub use registry::{Service, ServiceError, ServiceRegistry};
 pub use schema::SchemaService;

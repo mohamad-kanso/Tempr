@@ -5731,10 +5731,16 @@ name = "tempr_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "tempr_domain",
+ "tempr_events",
+ "tempr_services",
  "tokio",
+ "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]
