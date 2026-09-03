@@ -10,15 +10,16 @@
 
 - [ ] Lazy wire streaming via `query_raw()` — `PostgresStream` currently buffers full result set via `client.query()`, then yields `batch_size` chunks. True `query_raw` streaming was attempted but fails with `Error { kind: Closed }` specifically when called through `QueryService::execute()` (works fine via raw driver or closures). Root cause undetermined — suspected `Box<dyn DriverConnection>` + async trait boundary interaction. Investigate as follow-up.
 
-- [ ] Add `rust-toolchain.toml` pinning `channel = "1.95.0"` (Zed's pin, edition 2024) — prerequisite for the GPUI dependency (→ D16)
-- [ ] Verify the license of Zed's `gpui_tokio` crate. Apache-2.0 → depend on it; GPL → reimplement the bridge in Tempr (tokio `Runtime` as a GPUI global + `Task` adapter) (→ D16)
-- [ ] Pick and record the `gpui`/`gpui_platform` rev SHA; add both to `[workspace.dependencies]` and confirm `cargo deny` accepts the git sources (incl. transitive `zed-font-kit` on macOS)
+- [ ] Make `ConnectionService` / `QueryService` / `SchemaService` implement the `Service` lifecycle trait so the binary registers them in `ServiceRegistry` (today only test services implement it; the GPUI shell holds plain `Arc`s)
+- [ ] Wire `deadpool-postgres` pool into `ConnectionService` (dependency declared, unused)
+- [ ] `Input` component: hand-roll single-line text input from `crates/gpui/examples/input.rs` (rev `ed8d600`) — Phase 1 editor placeholder
+- [ ] `Table` component: `uniform_list`-backed result grid fed by `QueryService` stream via `gpui_compat::spawn_tokio` — Phase 1 grid placeholder
 
 ## Next
 
 - [ ] Phase 1: PostgreSQL async driver with TLS connection (sslmode configurable, default Prefer)
-- [ ] Phase 1: GPUI application shell — main window, text input area, scrollable result grid (base on `crates/gpui/examples/hello_world.rs`; text input from `examples/input.rs`)
-- [ ] Phase 1: `gpui_compat` module — wrap `gpui` + `gpui_platform` bootstrap/window/executor calls so upstream churn stays isolated (→ D16)
+- [ ] Phase 1: main window layout beyond placeholders — connection picker, status bar, error toasts driven by `AppEvent`
+- [ ] macOS/Windows CI runners for the gpui build (Linux-only today; transitive `zed-font-kit` git source on macOS must pass `cargo deny`)
 
 ## Later
 

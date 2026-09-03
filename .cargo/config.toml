@@ -1,0 +1,4 @@
+# Use the system `git` for git dependencies. The pinned Zed repo (gpui) is large;
+# libgit2's transport is an order of magnitude slower than the git CLI for it.
+[net]
+git-fetch-with-cli = true

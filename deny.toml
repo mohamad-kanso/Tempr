@@ -1,5 +1,13 @@
 [advisories]
 version = 2
+# Unmaintained-crate notices pulled in transitively by gpui (font shaping / SVG
+# stack: cosmic-text → fontdb → ttf-parser; resvg → usvg → rustybuzz; xkbcommon
+# → paste). Not fixable from Tempr; revisit on every gpui rev bump.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via gpui's linux input stack" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained — transitive via gpui (cosmic-text/fontdb, usvg)" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained — transitive via gpui (resvg/usvg)" },
+]
 
 [licenses]
 version = 2
@@ -12,6 +20,11 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "Unicode-3.0",
+    # Permissive licenses pulled in transitively by gpui's dependency graph
+    "Zlib",
+    "CC0-1.0",
+    "bzip2-1.0.6",
+    "NCSA",
 ]
 
 [bans]
@@ -19,4 +32,12 @@ multiple-versions = "warn"
 
 [sources]
 unknown-registry = "deny"
-unknown-git = "warn"
+unknown-git = "deny"
+allow-git = [
+    # gpui + gpui_platform + gpui_tokio, pinned to one rev (D14/D16)
+    "https://github.com/zed-industries/zed",
+]
+
+[sources.allow-org]
+# gpui pulls transitive forks from the zed-industries org (e.g. zed-font-kit on macOS)
+github = ["zed-industries"]

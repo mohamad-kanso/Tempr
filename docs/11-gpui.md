@@ -153,14 +153,19 @@ Tempr therefore depends on **both** crates, pinned to the **same** rev ([D14](DE
 
 ```toml
 [workspace.dependencies]
-gpui          = { git = "https://github.com/zed-industries/zed", rev = "<pin>" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "<pin>" }
+# Current pin: Zed main @ 2026-09-03 (ed8d600). Must be ≥ ac5af8b9 (2026-09-01) — earlier revs, including every release tag up to v1.18.0, declare `zlog`/`ztracing`/`ztracing_macro` (transitive deps of gpui via `sum_tree`) as GPL-3.0-or-later. Bump all three together.
+gpui          = { git = "https://github.com/zed-industries/zed", rev = "ed8d6004648e4e38a6879d9c80ac4406ad3d7266" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ed8d6004648e4e38a6879d9c80ac4406ad3d7266" }
+gpui_tokio    = { git = "https://github.com/zed-industries/zed", rev = "ed8d6004648e4e38a6879d9c80ac4406ad3d7266" }
 ```
 
 - `gpui` features: `default = ["font-kit", "wayland", "x11", "windows-manifest"]`; also `screen-capture`, `inspector`, `test-support`, `bench`, `leak-detection`, `input-latency-histogram`. `gpui_platform` forwards `wayland`, `x11`, `font-kit`, `screen-capture` to the backends.
 - Core transitive deps: `taffy` (flexbox layout, exact-pinned upstream), `resvg`/`usvg`, `lyon`, cosmic-text/`ttf-parser`, `sum_tree`, `smallvec`, `futures`, `async-task`, `parking_lot`, `scheduler`, `refineable`, `accesskit`.
 - macOS pulls the Zed `font-kit` fork (`zed-font-kit`) as a transitive git dependency — `cargo deny` and `cargo vendor` must tolerate nested git sources.
-- Zed pins toolchain `1.95.0` with `edition = "2024"`. Tempr has no `rust-toolchain.toml`; adding one at ≥ `1.95.0` is a Phase 1 prerequisite (tracked in TODO).
+- Zed pins its toolchain per release (`1.95.0` at v1.9.0, `1.97.1` on `main`) with `edition = "2024"`. Tempr's `rust-toolchain.toml` pins `1.97.1`; bump it alongside the gpui rev.
+- Linux build hosts need the gpui system libraries (dev packages, not just runtime `.so.N`): `sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig-dev libfreetype-dev libx11-xcb-dev libvulkan-dev`. Missing `libxkbcommon-x11-dev` surfaces as `rust-lld: error: unable to find library -lxkbcommon-x11` at the final link. CI installs the same list.
+- `gpui_platform` must be built with `features = ["wayland", "x11"]` on Linux — without them the binary compiles but panics at startup (`At least one of the "wayland" or "x11" features must be enabled`).
+- `.cargo/config.toml` sets `net.git-fetch-with-cli = true` — the Zed repo is large and libgit2 fetches it an order of magnitude slower than the git CLI.
 
 ### Entry Point
 
@@ -205,7 +210,7 @@ Tempr's database layer is tokio-based (`tokio-postgres`, `deadpool-postgres`). T
 2. `cx.spawn(async move |this, cx| { … })` awaits it, then `entity.update(cx, |state, cx| { state.apply(batch); cx.notify(); })`.
 3. Streaming results push one `entity.update` + `cx.notify()` per batch, so the grid fills incrementally.
 
-`gpui_tokio` is a Zed crate — verify its license before depending on it; if it is not Apache-2.0, reimplement the same ~100-line bridge in Tempr (tokio `Runtime` as a GPUI global + a `Task` adapter). Tracked in TODO.
+`gpui_tokio` is Apache-2.0 (verified at the pinned rev, 2026-09-03) and is a direct dependency of `tempr_ui`. Tempr code calls it only through `tempr_ui::gpui_compat::spawn_tokio`.
 
 ### View ↔ Service Pattern
 
@@ -436,7 +441,7 @@ GPUI virtualizes rows natively — `uniform_list` for fixed row heights (the res
 
 **Settled:** `gpui`, `gpui_platform`, and the platform backends are Apache-2.0 and usable. `crates/ui`, `crates/theme`, `crates/markdown`, and `crates/editor` are **GPL-3.0** and are out of bounds for MIT-licensed Tempr — [D16](DECISIONS.md).
 
-**Still open:** the license of `gpui_tokio` (the tokio↔GPUI bridge). If it is not Apache-2.0, Tempr reimplements the bridge. Verify before adding the dependency.
+**Settled (2026-09-03):** `gpui_tokio` is Apache-2.0 and is the adopted bridge.
 
 ### Linux and Windows Platform Maturity
 

@@ -11,6 +11,7 @@ tempr_services.workspace  = true
 tempr_workspace.workspace = true
 tempr_db.workspace        = true
 tempr_db_postgres.workspace = true
+tempr_ui.workspace          = true
 
 anyhow.workspace             = true
 async-trait.workspace        = true

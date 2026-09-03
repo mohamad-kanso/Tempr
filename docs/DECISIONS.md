@@ -36,6 +36,7 @@
 | D14 | 2026-07-13 | GPUI dependency via upstream git pin (no fork) — `rev = "<sha>"`, updated deliberately | User |
 | D15 | 2026-07-13 | No direct commits to main ever — all work via branch → PR → review → merge, no exceptions | User |
 | D16 | 2026-08-17 | GPUI dependency is `gpui` + `gpui_platform` at one rev; Apache-2.0 Zed crates only, no GPL `ui`/`theme`/`markdown`/`editor` | Claude (Phase 1) |
+| D17 | 2026-09-03 | GPUI pinned to Zed `main` `ed8d600` with floor `ac5af8b9` (zlog/ztracing relicense); `gpui_tokio` adopted; `cargo deny check licenses` is the enforcement gate; toolchain `1.97.1` | Claude (Phase 1) |
 
 ---
 
@@ -190,3 +191,20 @@
 **Why**: Tempr is MIT (D12). Linking GPL-3.0 crates would force Tempr to become GPL, which contradicts D12 and the plugin-author-friendly stance in D8. The split into `gpui` + `gpui_platform` is a hard build fact — a single-crate dependency will not compile a window open. Zed's async model is its own scheduler, not tokio, so the DB layer (`tokio-postgres`, `deadpool-postgres`) cannot simply be awaited inside a view; the bridge is mandatory and is better documented before Phase 1 UI work than discovered mid-implementation.
 
 **Consequences**: Every component in the [11 — GPUI](11-gpui.md) catalog is Tempr-authored — there is no shortcut via `crates/ui`, and theming must be built from scratch (no `cx.theme()`). Text input is hand-rolled from `crates/gpui/examples/input.rs` as the reference. `cargo deny` must allow Apache-2.0 git sources including the transitive `zed-font-kit` fork on macOS. Zed pins toolchain `1.95.0`/`edition 2024`; Tempr must add a matching `rust-toolchain.toml` before the GPUI dependency lands. Any future need for a GPL Zed crate requires an RFC plus a superseding entry (and likely a license change to Tempr itself).
+
+---
+
+## D17 — GPUI pin rev, license gate, and tokio bridge (2026-09-03)
+
+**By**: Claude (Phase 1, from `cargo deny check licenses` against the fetched graph and the upstream commit history).
+**Refines**: D14 (git pin, no fork), D16 (Apache-2.0 crates only).
+**Decision**:
+1. `gpui`, `gpui_platform` and `gpui_tokio` are pinned to Zed `main` rev `ed8d6004648e4e38a6879d9c80ac4406ad3d7266` (2026-09-03). Any future pin must be **≥ `ac5af8b9e1ea3f7922fbabefe409c05b8766135c`** (2026-09-01, "Relicense zlog, ztracing, and ztracing_macro under Apache-2.0"). No Zed release tag up to and including v1.18.0 satisfies this.
+2. `cargo deny check licenses` is the mechanical gate for D16: the `[licenses].allow` list is permissive-only (MIT, Apache-2.0, BSD, ISC, MPL-2.0, Unicode-3.0, Zlib, CC0-1.0, bzip2-1.0.6, NCSA). No `GPL-*` is ever added. `[sources]` allows only the `zed-industries` GitHub org for git dependencies.
+3. `gpui_tokio` (Apache-2.0, verified at the pinned rev) is the tokio↔GPUI bridge. Application code reaches it only through `tempr_ui::gpui_compat::spawn_tokio`.
+4. `rust-toolchain.toml` pins `1.97.1` (Zed `main`'s pin at this rev) with the minimal profile plus `rustfmt`/`clippy`. It is bumped together with the gpui rev.
+
+**Why**: At tag v1.9.0 the gpui dependency tree contained three first-party Zed crates declared `GPL-3.0-or-later` (`zlog` ← `ztracing` ← `sum_tree` ← `gpui`). Linking them would have made Tempr GPL, contradicting D12/D16, and the release tags — the "reviewed, stable" pin points D14 prefers — all predate the fix. A `main` rev after the relicense is the only option that is both buildable and license-clean. Reading manifests by hand missed this (D16 was written from a source survey); only the full-graph tool catches transitive declarations, so it becomes the gate rather than manual review.
+
+**Consequences**: The pin is a `main` snapshot, so bumps need a `cargo deny check` before merge, every time. CI fails on any new copyleft crate anywhere in the graph. The Linux CI job installs gpui's system libraries (xkbcommon, wayland, fontconfig, freetype, x11-xcb, vulkan headers); macOS/Windows runners are a TODO. `.cargo/config.toml` sets `net.git-fetch-with-cli = true` because libgit2 fetched the Zed repo at ~3 MB per 10 min on this network.
+
