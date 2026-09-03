@@ -7,6 +7,7 @@ members = [
     "crates/tempr_workspace",
     "crates/tempr_db",
     "crates/tempr_db_postgres",
+    "crates/tempr_ui",
 ]
 resolver = "2"
 
@@ -23,6 +24,13 @@ tempr_services    = { path = "crates/tempr_services" }
 tempr_workspace   = { path = "crates/tempr_workspace" }
 tempr_db          = { path = "crates/tempr_db" }
 tempr_db_postgres = { path = "crates/tempr_db_postgres" }
+tempr_ui          = { path = "crates/tempr_ui" }
+
+# UI — GPUI from the Zed repo. `gpui` + `gpui_platform` + `gpui_tokio` MUST share one rev (D14/D16).
+# Rev = main @ 2026-09-03 (first rev after the zlog/ztracing Apache-2.0 relicense, ac5af8b9, 2026-09-01). Apache-2.0 crates only — never `ui`/`theme`/`editor`/`markdown` (GPL).
+gpui          = { git = "https://github.com/zed-industries/zed", rev = "ed8d6004648e4e38a6879d9c80ac4406ad3d7266" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ed8d6004648e4e38a6879d9c80ac4406ad3d7266", features = ["wayland", "x11"] }
+gpui_tokio    = { git = "https://github.com/zed-industries/zed", rev = "ed8d6004648e4e38a6879d9c80ac4406ad3d7266" }
 
 # Async
 async-trait = "0.1"

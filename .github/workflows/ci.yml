@@ -18,10 +18,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install Linux build dependencies (gpui)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libfontconfig-dev libfreetype-dev libx11-xcb-dev libvulkan-dev
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        # rustup is preinstalled on ubuntu-latest; `rustup show` installs the
+        # channel + components declared in rust-toolchain.toml.
+        run: |
+          rustup show
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
 
       - name: Cache Cargo registry and build artifacts
         uses: actions/cache@v4

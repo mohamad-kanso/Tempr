@@ -1,0 +1,6 @@
+# Pinned toolchain — matches upstream Zed (gpui) and satisfies D16 (≥ 1.95.0, edition 2024).
+# Bump deliberately alongside the gpui rev in Cargo.toml.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

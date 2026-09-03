@@ -6,9 +6,9 @@
 
 ## Current status
 
-- **Last completed**: Phase 1 database layer — all 74 tests pass (65 unit + 9 integration against Docker PG) (2026-07-14)
-- **Verified**: `cargo fmt --all` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (65 unit tests) · `cargo test -- --ignored` ✅ (9 integration tests: connect, insert/select, decode mixed types, insert returning, streaming, auth failure, schema refresh, syntax error, events)
-- **Next action**: Add `rust-toolchain.toml` (≥ 1.95.0, edition 2024) + pin `gpui`/`gpui_platform` at one rev (→ D16); wire deadpool-postgres connection pool; begin GPUI application shell
+- **Last completed**: GPUI dependency landed — `rust-toolchain.toml` 1.97.1, `gpui`/`gpui_platform`/`gpui_tokio` pinned at Zed `ed8d600`, new `tempr_ui` crate (`gpui_compat` shim + `MainWindow` placeholder), binary boots GPUI and opens a 1200×800 window with services started on the tokio bridge (2026-09-03, branch `feat/ph1-gpui-deps`)
+- **Verified**: `cargo fmt --all --check` ✅ · `cargo clippy --workspace --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (65 unit tests; 9 integration ignored without DATABASE_URL) · `cargo deny check` ✅ (advisories, bans, licenses, sources) · window opens: `xwininfo -root -tree` shows `"Tempr" 1200x800` on X11, clean 9 s run on Wayland (2026-09-03)
+- **Next action**: Replace `MainWindow` placeholders — hand-roll `Input` (from `examples/input.rs`) and a `uniform_list` `Table` fed by `QueryService` via `gpui_compat::spawn_tokio`; make core services implement `Service`; wire deadpool pool
 
 ## Phase checklist
 
@@ -36,8 +36,9 @@
 - [x] 9 integration tests written (ignored, require DATABASE_URL): connect, insert/select, decode mixed types, insert returning, streaming, auth failure, schema refresh, syntax error, event publishing *(2026-07-14)*
 - [x] SQL injection fixed in `snapshot_schema` — parameterized queries (`$1`, `$2`) *(2026-07-14)*
 - [x] Decode layer handles PostgreSQL text-format booleans (`t`/`f`/`true`/`false`) and timestamps with timezone variants *(2026-07-14)*
+- [x] GPUI dependency lands: `rust-toolchain.toml` 1.97.1, `gpui`+`gpui_platform`+`gpui_tokio` at one rev with `cargo deny` license gate, `tempr_ui` crate + `gpui_compat` shim, binary opens a 1200×800 window and starts services on the tokio bridge *(verified via `xwininfo`, 2026-09-03, → D17)*
 - [ ] PostgreSQL driver connects over TLS using Phase 0 connection config
-- [ ] GPUI window renders with text input and scrollable result grid
+- [ ] GPUI window renders with text input and scrollable result grid *(shell + placeholders only as of 2026-09-03)*
 - [ ] Result grid displays streaming rows; smooth scroll for up to 100,000 rows
 - [ ] Connection/auth/syntax errors produce user-visible messages via event system
 
@@ -94,6 +95,12 @@
 | 2026-07-13 | GPUI dependency strategy: upstream git pin, no fork; OD#5 closed | → D14 |
 | 2026-07-13 | No direct commits to main ever — judgment exception in D13 eliminated | → D15 |
 | 2026-08-17 | GPUI dependency = `gpui` + `gpui_platform` at one rev; Apache-2.0 Zed crates only (no GPL `ui`/`theme`/`markdown`/`editor`); tokio↔GPUI bridge required | → D16 |
+| 2026-09-03 | GPUI rev pinned to Zed `main` HEAD `ed8d600` (2026-09-03), not a release tag — every tag ≤ v1.18.0 carries GPL `zlog`/`ztracing` under gpui | → D17 |
+| 2026-09-03 | `deny.toml` allows Zlib, CC0-1.0, bzip2-1.0.6, NCSA (permissive, pulled by gpui's graph); `cargo deny check licenses` is the D16 gate | → D17 |
+| 2026-09-03 | `gpui_tokio` adopted as the tokio↔GPUI bridge (Apache-2.0 verified) | → D17 |
+| 2026-09-03 | `rust-toolchain.toml` pins `1.97.1`, minimal profile + rustfmt/clippy; CI installs it with `rustup show` (no action input duplicates the pin) | → D17 |
+| 2026-09-03 | `.cargo/config.toml` sets `net.git-fetch-with-cli = true` | libgit2 fetched 3 MB of the Zed repo in 10 min; system git completes the clone |
+| 2026-09-03 | GPUI code lives in new `tempr_ui` crate (per 14-project-layout.md); binary depends on it; all `gpui`/`gpui_platform`/`gpui_tokio` calls go through `tempr_ui::gpui_compat` | Isolates upstream churn to one module (11-gpui.md shim rule) |
 
 ## Session log
 
@@ -104,4 +111,5 @@
 | 2026-07-14 | Phase 1 | Fixed 5 failing tests (bool decode: `t`/`f` format, timestamp timezone offset `+00` handling), fixed ConnectionService missing `Failed` state on no-driver path, added `ServiceError::{QueryFailed, ConnectionNotFound, NotConnected}`, added 7 integration tests (PG connect/select/insert/streaming/auth/schema/events), parameterized schema snapshot queries (SQL injection fix), pinned PostgresStream (`Pin<Box<RowStream>>`); **65 unit tests pass** — clippy clean, fmt clean, cargo deny clean | Run integration tests with DATABASE_URL; begin GPUI shell |
 | 2026-07-14 | Phase 1 | Fixed Docker PostgreSQL compatibility: switched from `query_raw` to `client.query()` (lifetime issue with RowStream borrowing client), added `password` field to `Connection` struct, switched `sslmode=require` to `sslmode=disable`, added `PostgresStream::from_rows` for collected results; **all 7 integration tests pass** against Docker PostgreSQL | Commit and merge; begin GPUI shell |
 | 2026-08-17 | Phase 1 | Branch `docs/gpui-verified-api`: folded the verified GPUI API survey (local `zed-industries/zed` clone, gpui `0.2.2`) into docs/11-gpui.md — corrected `Render` trait + 2-arg `render(&mut Window, &mut Context<Self>)` signature, `Entity<T>`/`cx.new` state model, `gpui_platform::application()` entry point, dependency wiring (two crates, one rev), what GPUI actually ships (no text input, no 2D grid, no usable theme), `uniform_list`/`list`+`ListState` virtualization APIs, GPUI executor vs tokio (`gpui_tokio` bridge), Zed crate licensing (GPL `ui`/`theme`/`markdown`/`editor` out of bounds); resolved 2 open questions; **D16** recorded | Verify `gpui_tokio` license; add `rust-toolchain.toml` ≥ 1.95.0; PR |
+| 2026-09-03 | Phase 1 | Branch `feat/ph1-gpui-deps`: `rust-toolchain.toml` (1.97.1); `gpui`/`gpui_platform`(features wayland,x11)/`gpui_tokio` pinned at Zed `main` `ed8d600`; `cargo deny` caught GPL `zlog`/`ztracing`/`ztracing_macro` at tag v1.9.0 → re-pinned past upstream relicense `ac5af8b9` (→ D17); deny allowlist +Zlib/CC0-1.0/bzip2-1.0.6/NCSA, 3 unmaintained advisories ignored with reasons, yanked `chacha20` bumped; `.cargo/config.toml` git-CLI fetch; CI installs Linux gpui libs + reads toolchain file; new `tempr_ui` crate (`gpui_compat`: `run_app`/`open_main_window`/`spawn_tokio`; `MainWindow` placeholder view); binary rewritten: sync `main`, services built pre-GPUI, started via `Tokio::spawn`; fmt/clippy/test/deny green; window verified 1200×800 | Local link needs `libxkbcommon-x11-dev` (user install); `Input` + `Table` components; core services → `Service` trait; deadpool wiring |
 | 2026-07-14 | Phase 1 | Code review fix pass (10 findings): fixed typed column decoding (finding #1), params passthrough (#2), RETURNING rows (#3), batch-size chunking (#4), schema error propagation (#5), schema scope for columns/indexes (#6), index columns via pg_index (#7), cancel handle capture (#8), configurable sslmode (#9), conninfo escaping via Config builder (#10); reverted #4 from `query_raw` to `query()`+chunked batch due to live-DB `Closed` error with `query_raw` through QueryService (true lazy streaming deferred to TODO); cleaned up debug pollution from root-cause investigation | Lazy wire streaming as follow-up; commit and PR |

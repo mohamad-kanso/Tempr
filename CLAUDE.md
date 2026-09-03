@@ -116,4 +116,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — complete (2026-07-13). Phase 1 — in progress (database layer verified 2026-07-14).
+Phase: 0 — complete (2026-07-13). Phase 1 — in progress (database layer verified 2026-07-14; GPUI dependency + window shell landed 2026-09-03).
