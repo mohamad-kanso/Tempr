@@ -275,3 +275,66 @@ async fn pg_events_published_during_query() {
         "expected QueryFinished event"
     );
 }
+
+/// Streaming path: 100,000 rows arrive in batches through a `RowSink`, with a
+/// `RowsReceived` event per batch, and the completed run keeps no rows.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_execute_streaming_100k_rows_in_batches() {
+    use tempr_domain::{Batch, ColumnSpec};
+    use tempr_services::RowSink;
+
+    #[derive(Default)]
+    struct CountingSink {
+        columns: parking_lot::Mutex<Vec<ColumnSpec>>,
+        batches: parking_lot::Mutex<usize>,
+        rows: parking_lot::Mutex<usize>,
+        last: parking_lot::Mutex<Option<tempr_domain::Value>>,
+    }
+    impl RowSink for CountingSink {
+        fn columns(&self, columns: &[ColumnSpec]) {
+            *self.columns.lock() = columns.to_vec();
+        }
+        fn batch(&self, batch: Batch) {
+            *self.batches.lock() += 1;
+            *self.rows.lock() += batch.rows.len();
+            if let Some(row) = batch.rows.last() {
+                *self.last.lock() = row.first().cloned();
+            }
+        }
+    }
+
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+    let qs = QueryService::new(bus.clone(), cs.clone());
+
+    let events: Arc<parking_lot::Mutex<usize>> = Arc::new(parking_lot::Mutex::new(0));
+    let e = events.clone();
+    let _sub = bus.subscribe(EventFilter::All, move |ev| {
+        if ev.kind() == AppEventKind::RowsReceived {
+            *e.lock() += 1;
+        }
+    });
+
+    let sink = Arc::new(CountingSink::default());
+    let run_id = qs
+        .execute_streaming(
+            "SELECT g AS n, 'row ' || g AS label FROM generate_series(1, 100000) g",
+            id,
+            sink.clone(),
+        )
+        .await
+        .expect("streaming select failed");
+
+    assert_eq!(sink.columns.lock().len(), 2);
+    assert_eq!(*sink.rows.lock(), 100_000);
+    assert!(*sink.batches.lock() > 1, "expected multiple batches");
+    assert_eq!(*events.lock(), *sink.batches.lock());
+    assert_eq!(*sink.last.lock(), Some(tempr_domain::Value::Int8(100_000)));
+
+    let run = qs.completed_run(run_id).expect("run stored");
+    assert!(
+        run.result_set.is_none(),
+        "streaming run must not retain rows"
+    );
+}
