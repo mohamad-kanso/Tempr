@@ -42,6 +42,7 @@
 - [ ] Phase 4: Layout persistence across restarts
 - [ ] Phase 4: Platform-native packaging (.deb, .rpm, AppImage, .dmg, MSI)
 - [ ] Resolve Open Decisions #1 (name/branding), #3 (telemetry), #4 (beta timing) before Phase 4
+- [ ] SSH tunnel connections (user request 2026-09-03; sketched in 09-database-engine.md "SSH tunnels"): `ConnectionConfig` gains optional `ssh_host`/`ssh_port`/`ssh_user`/`ssh_key_ref`; `ConnectionService`'s `DriverManager::create` establishes the tunnel (keepalive/reconnect owned by the service) and hands the tunneled stream to the driver, TLS composing inside it; needs a pure-Rust SSH client crate (`russh` candidate → DECISIONS entry), key/passphrase via the keychain path, and a per-bastion vs per-connection tunnel decision
 
 ## Ideas
 
