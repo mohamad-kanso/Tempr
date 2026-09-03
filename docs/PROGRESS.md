@@ -7,7 +7,7 @@
 ## Current status
 
 - **Last completed**: Phase 1 UI — `Input` (ported from gpui `examples/input.rs`) + `ResultGrid` (`uniform_list`) + status bar in `MainWindow`; `QueryService::execute_streaming` + `RowSink` stream batches to the grid over a channel with `RowsReceived` per batch; bus→UI `UiEvent` bridge; connection from `DATABASE_URL` (2026-09-03, branch `feat/ph1-input-grid`)
-- **Verified**: `cargo fmt --all --check` ✅ · `cargo clippy --workspace --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (76 unit) · `cargo test -p tempr --test integration -- --ignored` ✅ (10 tests vs Docker PG 16, incl. `pg_execute_streaming_100k_rows_in_batches`) · `cargo deny check` ✅ · app launched against Docker PG: window opens, `ConnectionStateChanged` Connecting→Connected; wrong password → Connecting→Failed (status bar path) (2026-09-03)
+- **Verified**: `cargo fmt --all --check` ✅ · `cargo clippy --workspace --all-targets -- -D warnings` ✅ · `cargo test --workspace` ✅ (76 unit) · `cargo test -p tempr --test integration -- --ignored` ✅ (10 tests vs Docker PG 16, incl. `pg_execute_streaming_100k_rows_in_batches`) · `cargo deny check` ✅ · app launched against Docker PG: window opens, `ConnectionStateChanged` Connecting→Connected; wrong password → Connecting→Failed (status bar path); user screenshot of `generate_series(1,100000)` rendering 100000 rows (2026-09-03)
 - **Next action**: Measure grid scroll frame time at 100k rows (needs a frame-time probe or screenshot tooling); then cancel-query keybinding + connection picker replacing `DATABASE_URL`; core services implement `Service`; deadpool wiring
 
 ## Phase checklist
@@ -38,9 +38,9 @@
 - [x] Decode layer handles PostgreSQL text-format booleans (`t`/`f`/`true`/`false`) and timestamps with timezone variants *(2026-07-14)*
 - [x] GPUI dependency lands: `rust-toolchain.toml` 1.97.1, `gpui`+`gpui_platform`+`gpui_tokio` at one rev with `cargo deny` license gate, `tempr_ui` crate + `gpui_compat` shim, binary opens a 1200×800 window and starts services on the tokio bridge *(verified via `xwininfo`, 2026-09-03, → D17)*
 - [ ] PostgreSQL driver connects over TLS using Phase 0 connection config
-- [x] GPUI window renders with text input and scrollable result grid *(`Input` + `ResultGrid` + status bar; builds, opens against Docker PG; 2026-09-03 — pixel output not screenshot-verified: GNOME denies CLI screenshots)*
+- [x] GPUI window renders with text input and scrollable result grid *(`Input` + `ResultGrid` + status bar; builds, opens against Docker PG; 2026-09-03; rendering confirmed by user screenshot: input, typed column headers, rows, status bar "Done — 100000 rows")*
 - [x] Connection/auth/syntax errors produce user-visible messages *(status bar + grid pane: connection failures arrive as `ConnectionStateChanged{Failed}` through the `UiEvent` bridge — verified with wrong password; query errors arrive through the `execute_streaming` task result (the `QueryFinished{Error}` bus event is published too but the view does not consume it); syntax-error path covered by `pg_query_syntax_error`; 2026-09-03)*
-- [ ] Result grid displays streaming rows; smooth scroll for up to 100,000 rows *(streaming half done: 100k rows in batches through `RowSink` → channel → `uniform_list`, verified by integration test 2026-09-03; 60 fps scroll unmeasured)*
+- [ ] Result grid displays streaming rows; smooth scroll for up to 100,000 rows *(streaming done: 100k rows in batches through `RowSink` → channel → `uniform_list`, integration test + user screenshot 2026-09-03; 60 fps scroll unmeasured)*
 
 ### Phase 2 — Editor
 - [ ] Rope buffer handles 10 MB documents with sub-millisecond insert/delete
