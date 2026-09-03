@@ -38,29 +38,6 @@ pub enum TlsMode {
     VerifyFull,
 }
 
-impl TlsMode {
-    /// The `sslmode` spelling used in connection strings and configs.
-    pub fn as_sslmode(&self) -> &'static str {
-        match self {
-            TlsMode::Disable => "disable",
-            TlsMode::Prefer => "prefer",
-            TlsMode::Require => "require",
-            TlsMode::VerifyCa => "verify-ca",
-            TlsMode::VerifyFull => "verify-full",
-        }
-    }
-
-    /// Whether this mode encrypts unconditionally (fails without TLS).
-    pub fn requires_tls(&self) -> bool {
-        !matches!(self, TlsMode::Disable | TlsMode::Prefer)
-    }
-
-    /// Whether the server certificate is verified against trusted roots.
-    pub fn verifies_certificate(&self) -> bool {
-        matches!(self, TlsMode::VerifyCa | TlsMode::VerifyFull)
-    }
-}
-
 impl std::str::FromStr for TlsMode {
     type Err = String;
 
@@ -71,11 +48,11 @@ impl std::str::FromStr for TlsMode {
             "disable" => TlsMode::Disable,
             "allow" | "prefer" => TlsMode::Prefer,
             "require" => TlsMode::Require,
-            "verify-ca" | "verify_ca" => TlsMode::VerifyCa,
-            "verify-full" | "verify_full" => TlsMode::VerifyFull,
+            "verify-ca" => TlsMode::VerifyCa,
+            "verify-full" => TlsMode::VerifyFull,
             other => {
                 return Err(format!(
-                    "unknown sslmode '{other}' (expected disable, prefer, require, verify-ca, verify-full)"
+                    "unknown sslmode '{other}' (expected disable, allow, prefer, require, verify-ca, verify-full)"
                 ));
             }
         })
@@ -194,13 +171,13 @@ mod tests {
             "VERIFY-FULL".parse::<TlsMode>().unwrap(),
             TlsMode::VerifyFull
         );
-        assert_eq!("verify_ca".parse::<TlsMode>().unwrap(), TlsMode::VerifyCa);
+        assert_eq!("verify-ca".parse::<TlsMode>().unwrap(), TlsMode::VerifyCa);
         assert_eq!("allow".parse::<TlsMode>().unwrap(), TlsMode::Prefer);
+        assert!(
+            "verify_ca".parse::<TlsMode>().is_err(),
+            "libpq spellings only"
+        );
         assert!("tls-please".parse::<TlsMode>().is_err());
-        assert_eq!(TlsMode::VerifyFull.as_sslmode(), "verify-full");
-        assert!(TlsMode::Require.requires_tls() && !TlsMode::Require.verifies_certificate());
-        assert!(TlsMode::VerifyCa.verifies_certificate());
-        assert!(!TlsMode::Prefer.requires_tls());
     }
 
     #[test]

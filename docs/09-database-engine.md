@@ -194,6 +194,7 @@ pub struct ConnectionConfig {
     pub database: String,
     pub username: String,
     pub secret_ref: SecretRef,            // resolved by ConnectionService
+    pub tls: TlsMode,                     // sslmode semantics (D20)
     pub pool_min_size: usize,
     pub pool_max_size: usize,
     pub connect_timeout_ms: u64,

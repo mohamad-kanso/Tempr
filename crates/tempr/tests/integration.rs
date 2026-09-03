@@ -270,8 +270,15 @@ async fn pg_auth_failure_returns_error() {
         tls: TlsMode::Prefer,
     };
 
-    let result = cs.connect(&conn).await;
-    assert!(result.is_err());
+    let err = cs
+        .connect(&conn)
+        .await
+        .expect_err("wrong password must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("authentication failed"),
+        "auth failure must classify as AuthFailed, got: {msg}"
+    );
     assert_eq!(cs.state(id), tempr_domain::ConnectionState::Failed);
 }
 
@@ -437,10 +444,10 @@ async fn pg_tls_verify_full_rejects_a_self_signed_certificate() {
         .connect(&conn)
         .await
         .expect_err("self-signed cert must be rejected");
-    let msg = err.to_string().to_lowercase();
+    let msg = err.to_string();
     assert!(
-        msg.contains("certificate") || msg.contains("tls") || msg.contains("unknown issuer"),
-        "unexpected error: {err}"
+        msg.contains("UnknownIssuer"),
+        "verify-full must fail on the certificate chain, got: {msg}"
     );
     assert_eq!(cs.state(conn.id), tempr_domain::ConnectionState::Failed);
 }
@@ -449,22 +456,25 @@ async fn pg_tls_verify_full_rejects_a_self_signed_certificate() {
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_tls_require_fails_against_a_plaintext_only_server() {
     let url = pg_connection_string().expect("set DATABASE_URL");
+    // Only meaningful against a server with ssl=off: check first.
+    let (bus0, cs0, id0) = connect_with(&url, TlsMode::Disable).await;
+    let qs = QueryService::new(bus0, cs0);
+    let run = qs.execute("SHOW ssl", id0).await.unwrap();
+    let ssl_on = qs.completed_run(run).unwrap().result_set.unwrap().rows[0][0]
+        == Value::Text("on".to_string());
+    if ssl_on {
+        eprintln!("skipping: DATABASE_URL server has ssl=on");
+        return;
+    }
     let (_bus, cs) = setup_pg_cs();
     let conn = connection_from_url(&url, TlsMode::Require);
-    match cs.connect(&conn).await {
-        Ok(()) => {
-            // The plain container may also have ssl=on; then require must be encrypted.
-            let (bus2, cs2) = setup_pg_cs();
-            let conn2 = connection_from_url(&url, TlsMode::Require);
-            cs2.connect(&conn2).await.unwrap();
-            assert!(session_is_encrypted(bus2, cs2, conn2.id).await);
-        }
-        Err(e) => {
-            let msg = e.to_string().to_lowercase();
-            assert!(
-                msg.contains("tls") || msg.contains("ssl"),
-                "unexpected error: {e}"
-            );
-        }
-    }
+    let err = cs
+        .connect(&conn)
+        .await
+        .expect_err("sslmode=require must fail when the server cannot do TLS");
+    assert!(
+        err.to_string().contains("TLS"),
+        "expected a TLS error, got: {err}"
+    );
+    assert_eq!(cs.state(conn.id), tempr_domain::ConnectionState::Failed);
 }
