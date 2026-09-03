@@ -9,7 +9,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use tempr_db::DatabaseDriver;
 use tempr_db_postgres::PostgresDriver;
-use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef};
+use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode};
 use tempr_events::{EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService, ServiceRegistry};
 use tempr_ui::{DevOptions, Services, gpui_compat};
@@ -66,6 +66,12 @@ fn connection_from_env() -> Result<Option<Connection>> {
             .decode_utf8_lossy()
             .into_owned()
     };
+    let tls = match url.query_pairs().find(|(k, _)| k == "sslmode") {
+        Some((_, v)) => v
+            .parse::<TlsMode>()
+            .map_err(|e| anyhow::anyhow!("DATABASE_URL: {e}"))?,
+        None => TlsMode::default(),
+    };
     Ok(Some(Connection {
         id: ConnectionId::new(),
         name: "DATABASE_URL".to_string(),
@@ -78,6 +84,7 @@ fn connection_from_env() -> Result<Option<Connection>> {
         secret_ref: SecretRef {
             vault_key: "DATABASE_URL".to_string(),
         },
+        tls,
     }))
 }
 

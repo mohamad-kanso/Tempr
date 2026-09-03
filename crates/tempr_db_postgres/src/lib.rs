@@ -11,6 +11,7 @@ pub(crate) mod decode;
 pub(crate) mod driver;
 pub(crate) mod params;
 pub(crate) mod stream;
+mod tls;
 
 pub use driver::PostgresDriver;
 

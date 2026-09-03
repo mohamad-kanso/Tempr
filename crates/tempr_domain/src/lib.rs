@@ -8,7 +8,7 @@ pub mod query;
 pub mod schema;
 pub mod workspace;
 
-pub use connection::{Connection, ConnectionState, DriverKind, SecretRef};
+pub use connection::{Connection, ConnectionState, DriverKind, SecretRef, TlsMode};
 pub use history::HistoryEntry;
 pub use ids::{
     ConnectionId, HistoryEntryId, PluginId, QueryId, QueryRunId, SchemaObjectId, SchemaSnapshotId,

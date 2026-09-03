@@ -119,8 +119,14 @@ pub struct Connection {
     pub database: String,
     pub username: String,
     pub secret_ref: SecretRef,          // vault key, never the secret
+    pub tls: TlsMode,                   // libpq sslmode semantics, default Prefer (D20)
     pub schema_snapshot: Option<SchemaSnapshot>,
 }
+
+/// Transport security policy — the libpq `sslmode` values, so connection
+/// strings carry over unchanged. `verify-ca` is treated as `verify-full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsMode { Disable, #[default] Prefer, Require, VerifyCa, VerifyFull }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub Uuid);

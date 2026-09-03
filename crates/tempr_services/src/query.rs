@@ -55,6 +55,9 @@ fn column_meta(columns: &[ColumnSpec]) -> Vec<ColumnMeta> {
         .collect()
 }
 
+/// Upper bound for a single driver-side cancel (it opens a new socket and,
+/// with TLS, performs a handshake — neither is bounded by the driver).
+pub const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Upper bound for `cancel_all` during shutdown.
 pub const CANCEL_ALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -295,10 +298,14 @@ impl QueryService {
             }
         };
 
-        if let Some(handle) = handle
-            && let Err(e) = handle.cancel().await
-        {
-            tracing::warn!("failed to cancel query {run_id:?} on driver: {e}");
+        if let Some(handle) = handle {
+            match tokio::time::timeout(CANCEL_TIMEOUT, handle.cancel()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("failed to cancel query {run_id:?} on driver: {e}"),
+                Err(_) => tracing::warn!(
+                    "cancel of query {run_id:?} timed out after {CANCEL_TIMEOUT:?}; the run stays flagged cancelled"
+                ),
+            }
         }
         Ok(())
     }
@@ -558,6 +565,7 @@ mod tests {
             secret_ref: SecretRef {
                 vault_key: "k".into(),
             },
+            tls: tempr_domain::TlsMode::Disable,
         };
         cs.connect(&conn).await.unwrap();
         (bus.clone(), QueryService::new(bus, cs), id)

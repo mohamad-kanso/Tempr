@@ -36,7 +36,7 @@ Four files that must always reflect reality. Each fact has exactly ONE home — 
 
 ## Project Status
 
-Phase 1 (Connect & Run) — database layer implemented and verified: PostgreSQL driver, services, 9 integration tests against live Docker PG. **See docs/PROGRESS.md for current status.**
+Phase 1 (Connect & Run) — complete 2026-09-03: PostgreSQL driver with TLS, pooled services with lifecycle, GPUI window with SQL input and streaming result grid, 15 integration tests against Docker PG. Phase 2 (Editor) next. **See docs/PROGRESS.md for current status.**
 
 ## Locked Decisions
 
@@ -116,4 +116,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — complete (2026-07-13). Phase 1 — in progress (database layer verified 2026-07-14; GPUI dependency, window shell, `Input` + streaming `ResultGrid` landed 2026-09-03).
+Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 (Editor) — not started.

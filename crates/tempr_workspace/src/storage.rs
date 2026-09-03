@@ -136,6 +136,7 @@ mod tests {
             database: "dev".to_string(),
             username: "postgres".to_string(),
             secret_ref: "keychain://tempr/local".to_string(),
+            tls: tempr_domain::TlsMode::Prefer,
         });
         storage.save_manifest(&manifest).await.expect("save");
 

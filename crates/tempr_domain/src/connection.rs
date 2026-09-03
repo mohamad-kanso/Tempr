@@ -12,6 +12,51 @@ pub struct Connection {
     pub username: String,
     pub password: String,
     pub secret_ref: SecretRef,
+    /// Transport security, libpq `sslmode` semantics. Default `Prefer`.
+    #[serde(default)]
+    pub tls: TlsMode,
+}
+
+/// TLS policy for a connection — mirrors PostgreSQL's `sslmode` values so
+/// connection strings and user expectations carry over unchanged.
+///
+/// | mode | encrypted | server cert verified | hostname verified |
+/// |---|---|---|---|
+/// | `Disable` | no | — | — |
+/// | `Prefer` (default) | if the server supports it | no | no |
+/// | `Require` | yes, or fail | no | no |
+/// | `VerifyCa` | yes | yes (system roots) | **yes** (Tempr is stricter than libpq here) |
+/// | `VerifyFull` | yes | yes (system roots) | yes |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    Disable,
+    #[default]
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl std::str::FromStr for TlsMode {
+    type Err = String;
+
+    /// Accepts libpq spellings; `allow` (libpq's "TLS only if the server
+    /// insists") is mapped to `Prefer`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "disable" => TlsMode::Disable,
+            "allow" | "prefer" => TlsMode::Prefer,
+            "require" => TlsMode::Require,
+            "verify-ca" => TlsMode::VerifyCa,
+            "verify-full" => TlsMode::VerifyFull,
+            other => {
+                return Err(format!(
+                    "unknown sslmode '{other}' (expected disable, allow, prefer, require, verify-ca, verify-full)"
+                ));
+            }
+        })
+    }
 }
 
 impl std::fmt::Debug for Connection {
@@ -26,6 +71,7 @@ impl std::fmt::Debug for Connection {
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
             .field("secret_ref", &self.secret_ref)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -108,11 +154,44 @@ mod tests {
             secret_ref: SecretRef {
                 vault_key: "keychain://tempr/prod".to_string(),
             },
+            tls: TlsMode::VerifyFull,
         };
         let json = serde_json::to_string(&conn).expect("serialize");
         let back: Connection = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(conn.id, back.id);
         assert_eq!(conn.driver, back.driver);
         assert_eq!(conn.port, back.port);
+    }
+
+    #[test]
+    fn tls_mode_parses_libpq_spellings_and_defaults_to_prefer() {
+        assert_eq!(TlsMode::default(), TlsMode::Prefer);
+        assert_eq!("require".parse::<TlsMode>().unwrap(), TlsMode::Require);
+        assert_eq!(
+            "VERIFY-FULL".parse::<TlsMode>().unwrap(),
+            TlsMode::VerifyFull
+        );
+        assert_eq!("verify-ca".parse::<TlsMode>().unwrap(), TlsMode::VerifyCa);
+        assert_eq!("allow".parse::<TlsMode>().unwrap(), TlsMode::Prefer);
+        assert!(
+            "verify_ca".parse::<TlsMode>().is_err(),
+            "libpq spellings only"
+        );
+        assert!("tls-please".parse::<TlsMode>().is_err());
+    }
+
+    #[test]
+    fn tls_mode_serde_is_kebab_case_and_defaults_when_missing() {
+        assert_eq!(
+            serde_json::to_string(&TlsMode::VerifyFull).unwrap(),
+            "\"verify-full\""
+        );
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default)]
+            tls: TlsMode,
+        }
+        let w: Wrap = serde_json::from_str("{}").unwrap();
+        assert_eq!(w.tls, TlsMode::Prefer);
     }
 }

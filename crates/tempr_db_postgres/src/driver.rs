@@ -3,12 +3,15 @@ use tempr_db::{
     CancelHandle, DatabaseDriver, DriverConnection, DriverError, EngineId, SchemaScope,
     SchemaSnapshotEntry,
 };
-use tempr_domain::{ColumnSpec, Connection, Value};
+use tempr_domain::{ColumnSpec, Connection, TlsMode, Value};
 use tokio_postgres::NoTls;
 use tokio_postgres::config::SslMode;
+use tokio_postgres::error::SqlState;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::params::{as_sql_refs, to_sql_params};
 use crate::stream::PostgresStream;
+use crate::tls::{connector, ssl_mode};
 
 const DEFAULT_BATCH_SIZE: usize = 4000;
 
@@ -46,51 +49,103 @@ impl DatabaseDriver for PostgresDriver {
             .dbname(&connection.database)
             .user(&connection.username)
             .password(&connection.password)
-            // No TLS connector is wired up yet (see docs/09-database-engine.md
-            // follow-up) — `Prefer` communicates intent without breaking
-            // today's plaintext-only connections the way `Require` would.
-            .ssl_mode(SslMode::Prefer)
-            // Bounded so an unreachable host fails fast instead of waiting
-            // for the OS SYN timeout (also bounds the cancel socket).
+            .ssl_mode(ssl_mode(connection.tls))
+            // Bounds the TCP connect only (not the TLS handshake) so an
+            // unreachable host fails fast instead of waiting for the OS SYN
+            // timeout. Callers bound the whole operation (pool create
+            // timeout, cancel timeout).
             .connect_timeout(CONNECT_TIMEOUT);
 
-        let (client, connection_handle) = config.connect(NoTls).await.map_err(|e| {
-            if e.to_string().contains("password authentication failed")
-                || e.to_string().contains("Authentication failure")
-            {
-                DriverError::AuthFailed(e.to_string())
-            } else {
-                DriverError::ConnectionRefused(e.to_string())
+        let tls = connector(connection.tls).await?;
+        let client = match config.connect(tls.clone()).await {
+            Ok((client, conn)) => {
+                spawn_connection(conn);
+                client
             }
-        })?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection_handle.await {
-                tracing::error!("Postgres connection task failed: {e:?}");
+            // libpq `prefer`: a server that offers TLS but whose handshake we
+            // cannot complete still gets a plaintext connection.
+            Err(e) if connection.tls == TlsMode::Prefer && is_tls_error(&e) => {
+                tracing::warn!(
+                    error = %describe(&e),
+                    "TLS handshake failed with sslmode=prefer; retrying in plaintext"
+                );
+                config.ssl_mode(SslMode::Disable);
+                let (client, conn) = config.connect(NoTls).await.map_err(classify)?;
+                spawn_connection(conn);
+                client
             }
-        });
+            Err(e) => return Err(classify(e)),
+        };
 
         Ok(Box::new(PostgresConnection {
             client,
+            tls,
             batch_size: DEFAULT_BATCH_SIZE,
         }))
     }
 }
 
+/// Drive the connection's I/O task to completion in the background.
+fn spawn_connection<F>(conn: F)
+where
+    F: std::future::Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::error!("Postgres connection task failed: {e:?}");
+        }
+    });
+}
+
+/// `Display` of a tokio-postgres error is only the kind ("db error", "error
+/// performing TLS handshake"); the useful part is in the source chain.
+fn describe(e: &tokio_postgres::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = cur {
+        parts.push(err.to_string());
+        cur = err.source();
+    }
+    parts.join(": ")
+}
+
+fn is_tls_error(e: &tokio_postgres::Error) -> bool {
+    e.to_string().starts_with("error performing TLS handshake")
+}
+
+/// Map a connect-time error onto the driver error taxonomy.
+fn classify(e: tokio_postgres::Error) -> DriverError {
+    let text = describe(&e);
+    match e.as_db_error().map(|d| d.code()) {
+        Some(code)
+            if *code == SqlState::INVALID_PASSWORD
+                || *code == SqlState::INVALID_AUTHORIZATION_SPECIFICATION =>
+        {
+            DriverError::AuthFailed(text)
+        }
+        _ if is_tls_error(&e) => DriverError::ConnectionRefused(format!("TLS: {text}")),
+        _ => DriverError::ConnectionRefused(text),
+    }
+}
+
 struct PostgresConnection {
     client: tokio_postgres::Client,
+    tls: MakeRustlsConnect,
     batch_size: usize,
 }
 
-struct PostgresCancelHandle(tokio_postgres::CancelToken);
+struct PostgresCancelHandle {
+    token: tokio_postgres::CancelToken,
+    tls: MakeRustlsConnect,
+}
 
 #[async_trait::async_trait]
 impl CancelHandle for PostgresCancelHandle {
     async fn cancel(&self) -> Result<(), DriverError> {
-        self.0
-            .cancel_query(NoTls)
+        self.token
+            .cancel_query(self.tls.clone())
             .await
-            .map_err(|e| DriverError::Internal(format!("cancel failed: {e}")))
+            .map_err(|e| DriverError::Internal(format!("cancel failed: {}", describe(&e))))
     }
 }
 
@@ -155,7 +210,10 @@ impl DriverConnection for PostgresConnection {
     }
 
     fn cancel_handle(&self) -> Box<dyn CancelHandle> {
-        Box::new(PostgresCancelHandle(self.client.cancel_token()))
+        Box::new(PostgresCancelHandle {
+            token: self.client.cancel_token(),
+            tls: self.tls.clone(),
+        })
     }
 
     async fn snapshot_schema(

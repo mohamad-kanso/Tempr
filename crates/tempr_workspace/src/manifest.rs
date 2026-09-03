@@ -30,6 +30,10 @@ pub struct ConnectionConfig {
     pub username: String,
     /// Opaque reference resolved by the OS keychain at runtime — never a raw password.
     pub secret_ref: String,
+    /// TLS policy (libpq `sslmode` names: disable, prefer, require, verify-ca, verify-full).
+    /// Missing in older manifests → `prefer`.
+    #[serde(default)]
+    pub tls: tempr_domain::TlsMode,
 }
 
 impl WorkspaceManifest {
@@ -70,6 +74,7 @@ mod tests {
             database: "production".to_string(),
             username: "admin".to_string(),
             secret_ref: "keychain://tempr/prod-db".to_string(),
+            tls: tempr_domain::TlsMode::Require,
         });
 
         let toml_str = toml::to_string(&manifest).expect("serialize");
