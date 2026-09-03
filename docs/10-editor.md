@@ -126,6 +126,8 @@ impl Buffer {
 }
 ```
 
+**Implementation notes (2026-09-03, D21):** `tempr_editor::Buffer` follows this shape with three deviations — `edit` returns `Result<EditId, EditError>` (bounds / char-boundary / overlap errors instead of panics), the buffer does **not** publish `BufferChanged` itself (the owning service does), and `Point.column` is a **byte** column. `syntax()` / `statement_at()` land with the tree-sitter and statement-detector tasks. Helpers present today: `len_lines`, `line(i)`, `slice(range)`, `can_undo`/`can_redo`, `file_id`.
+
 ### SyntaxTree
 
 `SyntaxTree` wraps tree-sitter's incremental parser output. It is produced by `Buffer` on every edit and consumed by both the editor's highlight layer and the semantic engine.

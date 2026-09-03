@@ -8,6 +8,7 @@ members = [
     "crates/tempr_db",
     "crates/tempr_db_postgres",
     "crates/tempr_ui",
+    "crates/tempr_editor",
 ]
 resolver = "2"
 
@@ -25,6 +26,7 @@ tempr_workspace   = { path = "crates/tempr_workspace" }
 tempr_db          = { path = "crates/tempr_db" }
 tempr_db_postgres = { path = "crates/tempr_db_postgres" }
 tempr_ui          = { path = "crates/tempr_ui" }
+tempr_editor      = { path = "crates/tempr_editor" }
 
 # UI — GPUI from the Zed repo. `gpui` + `gpui_platform` + `gpui_tokio` MUST share one rev (D14/D16).
 # Rev = main @ 2026-09-03 (first rev after the zlog/ztracing Apache-2.0 relicense, ac5af8b9, 2026-09-01). Apache-2.0 crates only — never `ui`/`theme`/`editor`/`markdown` (GPL).
@@ -45,6 +47,9 @@ rustls                = { version = "0.23", default-features = false, features =
 rustls-native-certs   = "0.8"
 rust_decimal     = { version = "1", features = ["db-postgres"] }
 bytes            = "1"
+
+# Editor (D21)
+ropey = "1"
 
 # Data / serialisation
 chrono      = { version = "0.4", features = ["serde"] }
