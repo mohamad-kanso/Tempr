@@ -445,8 +445,10 @@ async fn pg_tls_verify_full_rejects_a_self_signed_certificate() {
         .await
         .expect_err("self-signed cert must be rejected");
     let msg = err.to_string();
+    // rustls names the reason: UnknownIssuer for a plain self-signed leaf,
+    // CaUsedAsEndEntity when the self-signed cert carries CA:TRUE.
     assert!(
-        msg.contains("UnknownIssuer"),
+        msg.contains("invalid peer certificate"),
         "verify-full must fail on the certificate chain, got: {msg}"
     );
     assert_eq!(cs.state(conn.id), tempr_domain::ConnectionState::Failed);
