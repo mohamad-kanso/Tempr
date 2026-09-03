@@ -6,7 +6,7 @@ pub mod query;
 pub mod registry;
 pub mod schema;
 
-pub use connection::ConnectionService;
+pub use connection::{ConnectionService, PoolConfig, PooledConnection};
 pub use query::{QueryService, RowSink};
 pub use registry::{Service, ServiceError, ServiceRegistry};
 pub use schema::SchemaService;

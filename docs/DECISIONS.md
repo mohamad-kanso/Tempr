@@ -38,6 +38,7 @@
 | D16 | 2026-08-17 | GPUI dependency is `gpui` + `gpui_platform` at one rev; Apache-2.0 Zed crates only, no GPL `ui`/`theme`/`markdown`/`editor` | Claude (Phase 1) |
 | D17 | 2026-09-03 | GPUI pinned to Zed `main` `ed8d600` with floor `ac5af8b9` (zlog/ztracing relicense); `gpui_tokio` adopted; `cargo deny check licenses` is the enforcement gate; toolchain `1.97.1` | Claude (Phase 1) |
 | D18 | 2026-09-03 | Small pure-Rust utility crates are adopted without an RFC when already in the graph: `unicode-segmentation` (grapheme cursor motion), `percent-encoding` (URL userinfo decoding), `url` promoted to a runtime dep | Claude (Phase 1) |
+| D19 | 2026-09-03 | Connection pooling = `deadpool` (core, `managed`) over `Box<dyn DriverConnection>` in `ConnectionService`; user pool (max 8) + dedicated 1-slot metadata pool; `deadpool-postgres` dropped | Claude (Phase 1) |
 
 ---
 
@@ -217,4 +218,13 @@
 **Decision**: Adopt `unicode-segmentation` (grapheme-cluster boundaries for `Input` cursor motion), `percent-encoding` (decoding `DATABASE_URL` userinfo/path), and promote `url` from dev- to runtime dependency. Rule going forward: a pure-Rust, permissively licensed utility crate that is *already in the dependency graph* (here: all three arrive via gpui or tokio-postgres) may be added with a PROGRESS decisions-log row only; a crate that is **new to the graph** still needs a DECISIONS entry naming its license and why no existing dependency covers it.
 **Why**: CLAUDE.md classifies "new dependency" as MAJOR. Applying a full entry to every hashing/parsing helper would bury the record in noise, while skipping it silently violates the rule. The "already in the graph" test keeps `cargo deny` as the sole license gate (D17) and adds zero new supply-chain surface.
 **Consequences**: `unicode-segmentation` is the canonical grapheme library (no `unicode-width`/ICU alternatives without superseding this). `percent-encoding` decoding is applied wherever a `url::Url` component becomes a credential or identifier. This entry is the precedent for future "already in graph" additions.
+
+---
+
+## D19 — Driver-agnostic connection pooling with `deadpool` (2026-09-03)
+
+**By**: Claude (Phase 1, implementing the pooling model of docs/09-database-engine.md).
+**Decision**: `ConnectionService` pools `Box<dyn DriverConnection>` with the `deadpool` core crate (`managed` feature) through a Tempr `DriverManager` (`create` = `DatabaseDriver::connect`). Each `Connection` gets a **user pool** (`PoolConfig::max_size`, default 8) borrowed by `QueryService`, and a **dedicated metadata slot** (a separate 1-connection pool) borrowed only by `SchemaService`. `connect` warms one user connection eagerly. `deadpool-postgres` is removed from the workspace.
+**Why**: `deadpool-postgres` pools `tokio_postgres::Client`, which sits *below* the `DatabaseDriver` abstraction (D4) — using it would make the pool PostgreSQL-specific and bypass the trait. Writing our own pool duplicates well-tested code for no gain; `deadpool`'s manager trait is small, runtime-agnostic, and lets the pool hold the trait object directly. The separate metadata pool is the simplest way to guarantee the "schema refresh never blocks behind a user query" rule without a custom slot scheduler.
+**Consequences**: Borrow sites take a `PooledConnection` by value and return `Result<R, DriverError>`; the connection returns to the pool on drop (move it into the future — a closure parameter the future does not capture is returned before the body runs). `DriverConnection::is_closed` (sync, no I/O) is part of the driver trait so `recycle` evicts dead idle connections; an active ping/reconnect-with-backoff is still TODO. Pools have `wait_timeout` (30 s) and `create_timeout` (15 s) via `deadpool::Runtime::Tokio1`, and the PG driver sets a 10 s `connect_timeout`, so nothing parks forever. State and pools live in one `ConnEntry` map under one lock; a `ConnectingGuard` flips an aborted `connect` to `Failed`; a `disconnect` racing a warm-up wins. `ServiceRegistry::stop_all` runs from the GPUI `on_app_quit` hook (`gpui_compat::on_app_quit`), so quitting cancels runs (bounded, concurrent) and drains pools. Pool sizing per connection will come from the workspace connection config (`pool_max_size` in 09-database-engine's `ConnectionConfig`); today `PoolConfig` is service-wide.
 

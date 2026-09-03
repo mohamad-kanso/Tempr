@@ -9,8 +9,8 @@ use tempr_domain::{
 };
 use tempr_events::{AppEvent, EventBus};
 
-use crate::ServiceError;
 use crate::connection::ConnectionService;
+use crate::{Service, ServiceError};
 
 struct ActiveRun {
     query_run: QueryRun,
@@ -54,6 +54,9 @@ fn column_meta(columns: &[ColumnSpec]) -> Vec<ColumnMeta> {
         })
         .collect()
 }
+
+/// Upper bound for `cancel_all` during shutdown.
+pub const CANCEL_ALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct QueryService {
     event_bus: Arc<EventBus>,
@@ -191,39 +194,22 @@ impl QueryService {
                         }
                     };
                     if cancelled_meanwhile {
-                        return (conn, Err(tempr_db::DriverError::Cancelled));
+                        return Err(tempr_db::DriverError::Cancelled);
                     }
 
-                    match conn.execute(&sql, &[]).await {
-                        Ok(mut stream) => {
-                            let columns = column_meta(stream.columns());
-                            sink.columns(stream.columns());
+                    let mut stream = conn.execute(&sql, &[]).await?;
+                    let columns = column_meta(stream.columns());
+                    sink.columns(stream.columns());
 
-                            let mut total_rows = 0usize;
-                            let mut stream_err = None;
-                            while let Some(batch_result) = stream.next_batch().await.transpose() {
-                                match batch_result {
-                                    Ok(batch) => {
-                                        let count = batch.rows.len();
-                                        total_rows += count;
-                                        sink.batch(batch);
-                                        self.event_bus
-                                            .publish(AppEvent::RowsReceived { run: run_id, count });
-                                    }
-                                    Err(e) => {
-                                        stream_err = Some(e);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            match stream_err {
-                                Some(e) => (conn, Err(e)),
-                                None => (conn, Ok((columns, total_rows))),
-                            }
-                        }
-                        Err(e) => (conn, Err(e)),
+                    let mut total_rows = 0usize;
+                    while let Some(batch) = stream.next_batch().await? {
+                        let count = batch.rows.len();
+                        total_rows += count;
+                        sink.batch(batch);
+                        self.event_bus
+                            .publish(AppEvent::RowsReceived { run: run_id, count });
                     }
+                    Ok((columns, total_rows))
                 }
             })
             .await
@@ -317,12 +303,49 @@ impl QueryService {
         Ok(())
     }
 
+    /// Cancel every in-flight run concurrently, bounded by
+    /// [`CANCEL_ALL_TIMEOUT`] (used by `stop`; a PostgreSQL cancel opens a
+    /// fresh socket, so an unreachable host must not stall shutdown).
+    pub async fn cancel_all(&self) {
+        let runs = self.active_runs();
+        if runs.is_empty() {
+            return;
+        }
+        let cancels = runs.iter().map(|run| async move {
+            if let Err(e) = self.cancel(*run).await {
+                tracing::warn!("cancel of {run:?} during shutdown failed: {e}");
+            }
+        });
+        if tokio::time::timeout(CANCEL_ALL_TIMEOUT, futures::future::join_all(cancels))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "cancel_all timed out after {:?} with {} run(s) still active",
+                CANCEL_ALL_TIMEOUT,
+                self.active_runs().len()
+            );
+        }
+    }
+
     pub fn active_runs(&self) -> Vec<QueryRunId> {
         self.active_runs.read().keys().copied().collect()
     }
 
     pub fn completed_run(&self, run_id: QueryRunId) -> Option<QueryRun> {
         self.completed_runs.read().get(&run_id).cloned()
+    }
+}
+
+#[async_trait::async_trait]
+impl Service for QueryService {
+    fn name(&self) -> &'static str {
+        "QueryService"
+    }
+
+    async fn stop(&self) -> Result<(), ServiceError> {
+        self.cancel_all().await;
+        Ok(())
     }
 }
 
@@ -466,6 +489,9 @@ mod tests {
         }
         async fn cancel(&mut self) -> Result<(), DriverError> {
             Ok(())
+        }
+        fn is_closed(&self) -> bool {
+            false
         }
         fn cancel_handle(&self) -> Box<dyn CancelHandle> {
             Box::new(NoopCancel)

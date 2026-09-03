@@ -14,11 +14,9 @@ use tempr_events::{EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService, ServiceRegistry};
 use tempr_ui::{DevOptions, Services, gpui_compat};
 
-/// Everything the UI needs a handle to. Built before GPUI starts.
-///
-/// Core services are plain `Arc`s for now; they do not yet implement the
-/// `Service` lifecycle trait, so the registry only carries lifecycle-aware
-/// services (none in this shell). Tracked in docs/TODO.md.
+/// Everything the UI needs a handle to. Built before GPUI starts. The
+/// registry owns start/stop ordering: connection → query → schema; `stop_all`
+/// runs from the app-quit hook (cancels runs, drains pools).
 struct AppServices {
     bus: Arc<EventBus>,
     registry: Arc<ServiceRegistry>,
@@ -37,6 +35,10 @@ fn build_services() -> AppServices {
 
     let pg_driver = Arc::new(PostgresDriver::new()) as Arc<dyn DatabaseDriver>;
     connection.register_driver(pg_driver);
+
+    registry.register(connection.clone());
+    registry.register(query.clone());
+    registry.register(schema.clone());
 
     AppServices {
         bus,
@@ -108,6 +110,20 @@ fn main() -> Result<()> {
     gpui_compat::run_app(move |cx| {
         tempr_ui::bind_keys(cx);
         cx.on_action(|_: &tempr_ui::Quit, cx| cx.quit());
+
+        // Stop services (cancel runs, drain pools) when the app quits.
+        let registry_for_quit = services.registry.clone();
+        gpui_compat::on_app_quit(cx, move || {
+            let registry = registry_for_quit.clone();
+            async move {
+                if let Err(e) = registry.stop_all().await {
+                    error!(error = %e, "service shutdown failed");
+                } else {
+                    info!("all services stopped");
+                }
+            }
+        })
+        .detach();
 
         // Start services on the tokio runtime; the UI thread never blocks.
         let registry = services.registry.clone();

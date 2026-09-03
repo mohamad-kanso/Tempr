@@ -59,18 +59,40 @@ impl WorkspaceService {
 
 `ConnectionService` manages database connections — establishing pools, tracking connection state, handling reconnection on failure, and providing a borrowing interface so that `QueryService` and `SchemaService` can obtain a connection handle for a given `ConnectionId`. It resolves connection definitions from the workspace's `workspace.toml` at open time, delegates secret resolution to the OS keychain, and publishes state changes as events so the UI and other services can react without polling.
 
-**Owned state:** connection pool map (`ConnectionId → DriverConnection`), per-connection state (`Connecting`, `Connected`, `Reconnecting`, `Failed`), reconnection backoff state.
+**Owned state:** one `ConnEntry { state, pools }` per `ConnectionId` under a single lock — `pools` is `{ user pool, metadata slot }`, both `deadpool` managed pools over `Box<dyn DriverConnection>` (D19); `PoolConfig` (user pool max 8, `wait_timeout` 30 s, `create_timeout` 15 s). Dead idle connections are evicted on recycle via `DriverConnection::is_closed`; active ping and reconnection/backoff are TODO.
 
-**Key async methods:**
+**Key async methods** *(verified against `crates/tempr_services/src/connection.rs`, 2026-09-03)*:
 
 ```rust
+/// A borrowed driver connection; returns to its pool on drop.
+pub type PooledConnection = deadpool::managed::Object<DriverManager>;
+
 impl ConnectionService {
-    pub async fn connect(&self, id: ConnectionId) -> Result<(), ConnectionError>;
-    pub async fn disconnect(&self, id: ConnectionId) -> Result<(), ConnectionError>;
+    pub fn new(event_bus: Arc<EventBus>) -> Arc<Self>;
+    pub fn with_pool_config(event_bus: Arc<EventBus>, cfg: PoolConfig) -> Arc<Self>;
+    pub fn register_driver(&self, driver: Arc<dyn DatabaseDriver>);
+
+    /// Builds the pools and establishes one connection eagerly (credentials
+    /// and reachability are validated here, not on first query).
+    pub async fn connect(&self, connection: &Connection) -> Result<(), ServiceError>;
+    pub async fn disconnect(&self, id: ConnectionId) -> Result<(), ServiceError>;
     pub fn state(&self, id: ConnectionId) -> ConnectionState;
-    pub async fn borrow(&self, id: ConnectionId) -> Result<Arc<dyn DriverConnection>, ConnectionError>;
-    pub async fn reconnect(&self, id: ConnectionId) -> Result<(), ConnectionError>;
+    /// Connections currently holding pools (i.e. `Connected`).
+    pub fn connected_ids(&self) -> Vec<ConnectionId>;
+    pub fn pool_status(&self, id: ConnectionId) -> Option<(usize /*in use*/, usize /*idle*/)>;
+
+    /// Borrow from the user pool (QueryService).
+    pub async fn with_connection_fn<F, Fut, R>(&self, id: ConnectionId, f: F) -> Result<R, ServiceError>
+    where F: FnOnce(PooledConnection) -> Fut, Fut: Future<Output = Result<R, DriverError>>;
+
+    /// Borrow the dedicated metadata slot (SchemaService only).
+    pub async fn with_metadata_connection_fn<F, Fut, R>(&self, id: ConnectionId, f: F) -> Result<R, ServiceError>
+    where F: FnOnce(PooledConnection) -> Fut, Fut: Future<Output = Result<R, DriverError>>;
 }
+
+// Lifecycle: `Service::stop` drains every pool; the binary runs
+// `ServiceRegistry::stop_all` from the GPUI app-quit hook. `connect` is driven
+// by the workspace open sequence, not by `start`.
 ```
 
 **Events published:** `ConnectionStateChanged { id: ConnectionId, state: ConnectionState }`, `ConnectionFailed { id: ConnectionId, error: String }`.
@@ -140,7 +162,7 @@ impl QueryService {
 
 ### SchemaService
 
-`SchemaService` triggers and tracks schema refreshes for each connection, holds the latest `SchemaSnapshot` per connection in memory, and publishes `SchemaRefreshed` events so that the intelligence engine and schema explorer can update without polling. It delegates the actual introspection to the database driver via `ConnectionService::borrow` and persists refreshed snapshots to the catalog cache (see [Storage](07-storage.md)). Schema refreshes are triggered on three occasions: connection established, explicit user action, and detected DDL change (future).
+`SchemaService` triggers and tracks schema refreshes for each connection, holds the latest `SchemaSnapshot` per connection in memory, and publishes `SchemaRefreshed` events so that the intelligence engine and schema explorer can update without polling. It delegates the actual introspection to the database driver via `ConnectionService::with_connection_fn` / `with_metadata_connection_fn` and persists refreshed snapshots to the catalog cache (see [Storage](07-storage.md)). Schema refreshes are triggered on three occasions: connection established, explicit user action, and detected DDL change (future).
 
 **Owned state:** in-memory snapshot map (`ConnectionId → SchemaSnapshot`), refresh task handles, staleness timestamps.
 
@@ -375,8 +397,8 @@ graph TD
     Bus(EventBus)
 
     %% Direct-call dependencies (solid)
-    QS -->|borrow connection| CS
-    SS -->|borrow connection| CS
+    QS -->|borrow pooled connection| CS
+    SS -->|borrow pooled connection| CS
     WS -->|resolve settings| Set
     WS -->|restore layout| LS
     PS -->|register commands| Cmd
@@ -398,7 +420,7 @@ graph TD
 
 Reading the diagram:
 
-- `QueryService` and `SchemaService` call `ConnectionService::borrow` directly — this is a synchronous request/response pattern where a connection handle is needed to execute work.
+- `QueryService` and `SchemaService` call `ConnectionService::with_connection_fn` / `with_metadata_connection_fn` directly — this is a synchronous request/response pattern where a connection handle is needed to execute work.
 - `WorkspaceService` calls `SettingsService` and `LayoutService` directly to resolve settings and restore layout during the open sequence.
 - `PluginService` calls `CommandService` and `IntelligenceService` directly during plugin activation to register contributed commands and completion providers.
 - All other cross-service communication flows through the `EventBus` — services publish events and other services subscribe without holding direct references to the publisher.

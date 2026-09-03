@@ -9,6 +9,9 @@ tempr_domain.workspace = true
 tempr_events.workspace = true
 tempr_db.workspace     = true
 
+deadpool.workspace     = true
+futures.workspace      = true
+
 async-trait.workspace  = true
 chrono.workspace       = true
 parking_lot.workspace  = true
