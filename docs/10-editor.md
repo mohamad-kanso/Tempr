@@ -191,6 +191,8 @@ impl EditorView {
 }
 ```
 
+**Implementation notes (2026-09-05):** `tempr_ui::components::EditorView` owns the `Buffer` and `Vec<Selection>` (primary = last), renders visible lines with `uniform_list` and a custom per-line element (highlight `TextRun`s, selection quads, cursors), registers the IME handler on the primary cursor's line, and maps every action in 10-editor's list to `tempr_editor` motions / edit ops. "Run statement" is `EditorEvent::Run(sql)` — the owner (`MainWindow`) executes; `StatementKind::Error` ranges produce a `Notice` instead. Not yet: horizontal scrolling / wrapping, search, adding cursors, gutter run buttons.
+
 ### StatementRange
 
 `StatementRange` is the bridge between the editor and the query execution pipeline. It identifies the boundaries of a single SQL statement, enabling the "run statement under cursor" pattern and the per-statement gutter run buttons.

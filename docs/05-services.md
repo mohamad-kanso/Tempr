@@ -267,13 +267,16 @@ A `CommandContribution` is the registration record that core code and plugins su
 
 ```rust
 pub struct CommandContribution {
-    pub id: CommandId,
-    pub title: String,
-    pub keybinding: Option<KeyBinding>,
-    pub category: CommandCategory,   // e.g. "Query", "View", "Edit"
-    pub handler: Box<dyn Fn(CommandContext) -> BoxFuture<'static, Result<(), CommandError>> + Send + Sync>,
+    pub id: CommandId,                     // GPUI action name, e.g. "main_window::RunQuery"
+    pub title: String,                     // palette title
+    pub category: String,                  // "Query", "View", "Editor", …
+    pub context: Option<String>,           // GPUI key context predicate, None = global
+    pub default_keystrokes: Vec<String>,   // GPUI syntax; overridable per layer
+    pub hidden: bool,                      // bindable but not offered in palette search
 }
 ```
+
+There is no handler closure: a command *is* a GPUI action type, dispatched by the UI (D23). Core commands come from the typed catalog `tempr_ui::commands::core_commands()`; plugin commands will register the same record (their action shape is an open TODO).
 
 Commands contributed by plugins are namespaced (`plugin_id::command_id`) to prevent collisions and are unregistered on plugin deactivation.
 

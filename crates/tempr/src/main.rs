@@ -106,7 +106,14 @@ fn main() -> Result<()> {
 
     // Keybinding layers: user settings (~/.config/tempr/settings.toml) now;
     // the workspace layer joins when workspace open lands.
-    let user_settings = tempr_workspace::load_user_settings()?;
+    // A broken settings file must not prevent the window from opening.
+    let user_settings = match tempr_workspace::load_user_settings() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "ignoring user settings; using defaults");
+            tempr_workspace::UserSettings::default()
+        }
+    };
     services
         .command
         .set_keybinding_layers(vec![user_settings.keybindings.clone()]);

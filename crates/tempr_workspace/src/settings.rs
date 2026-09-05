@@ -2,21 +2,18 @@
 //! the three-layer settings model in docs/04-workspace.md. Workspace-level
 //! overrides live in `workspace.toml` (`WorkspaceManifest::keybindings`).
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::WorkspaceError;
 
-/// `command id → keystrokes` (GPUI syntax, e.g. `"ctrl-enter"`). An empty
-/// list unbinds the command.
-pub type KeybindingMap = BTreeMap<String, Vec<String>>;
+pub use tempr_domain::KeybindingOverrides;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserSettings {
     #[serde(default)]
-    pub keybindings: KeybindingMap,
+    pub keybindings: KeybindingOverrides,
 }
 
 /// `~/.config/tempr/settings.toml` (platform config dir), if resolvable.

@@ -9,7 +9,7 @@ pub mod query;
 pub mod schema;
 pub mod workspace;
 
-pub use command::CommandId;
+pub use command::{CommandId, KeybindingOverrides};
 pub use connection::{Connection, ConnectionState, DriverKind, SecretRef, TlsMode};
 pub use history::HistoryEntry;
 pub use ids::{

@@ -29,6 +29,9 @@ pub struct CommandContribution {
     pub context: Option<String>,
     /// Default keystrokes in GPUI syntax ("ctrl-enter", "cmd-shift-p").
     pub default_keystrokes: Vec<String>,
+    /// Keep out of palette search results (e.g. the palette's own
+    /// navigation commands, or "toggle palette" itself). Still bindable.
+    pub hidden: bool,
 }
 
 /// A command as the palette sees it: contribution + resolved keystrokes.
@@ -40,6 +43,7 @@ pub struct CommandMeta {
     pub context: Option<String>,
     /// Effective keystrokes after user/workspace overrides.
     pub keystrokes: Vec<String>,
+    pub hidden: bool,
 }
 
 /// A palette search hit.
@@ -51,8 +55,7 @@ pub struct CommandMatch {
     pub indices: Vec<usize>,
 }
 
-/// `command id → keystrokes` overrides. An empty list unbinds the command.
-pub type KeybindingOverrides = BTreeMap<String, Vec<String>>;
+pub use tempr_domain::KeybindingOverrides;
 
 pub struct CommandService {
     event_bus: Arc<EventBus>,
@@ -108,13 +111,11 @@ impl CommandService {
 
     /// Every command, sorted by category then title.
     pub fn commands(&self) -> Vec<CommandMeta> {
-        let mut all: Vec<CommandMeta> = self
-            .commands
-            .read()
-            .values()
-            .cloned()
-            .map(|c| self.meta(c))
-            .collect();
+        // Snapshot under the lock, then resolve keys without holding it
+        // (`meta` re-reads the map; parking_lot read locks are not reentrant
+        // once a writer is queued).
+        let snapshot: Vec<CommandContribution> = self.commands.read().values().cloned().collect();
+        let mut all: Vec<CommandMeta> = snapshot.into_iter().map(|c| self.meta(c)).collect();
         all.sort_by(|a, b| a.category.cmp(&b.category).then(a.title.cmp(&b.title)));
         all
     }
@@ -126,6 +127,7 @@ impl CommandService {
         let mut hits: Vec<CommandMatch> = self
             .commands()
             .into_iter()
+            .filter(|meta| !meta.hidden)
             .filter_map(|meta| {
                 let m = fuzzy_match(query, &meta.title).or_else(|| {
                     fuzzy_match(query, meta.id.as_str()).map(|FuzzyMatch { score, .. }| {
@@ -161,6 +163,7 @@ impl CommandService {
             category: c.category,
             context: c.context,
             keystrokes,
+            hidden: c.hidden,
         }
     }
 }
@@ -189,6 +192,7 @@ mod tests {
             category: cat.into(),
             context: Some("MainWindow".into()),
             default_keystrokes: keys.iter().map(|k| k.to_string()).collect(),
+            hidden: false,
         }
     }
 
@@ -256,6 +260,15 @@ mod tests {
         assert_eq!(hits[0].indices, vec![0, 4]);
         assert!(svc.search("zzz").is_empty());
         assert_eq!(svc.search("").len(), 3, "empty query lists everything");
+        let mut hidden = contrib("palette::Dismiss", "Palette: Close", "Palette", &["escape"]);
+        hidden.hidden = true;
+        svc.register(hidden);
+        assert_eq!(
+            svc.search("").len(),
+            3,
+            "hidden commands are not searchable"
+        );
+        assert_eq!(svc.commands().len(), 4, "but still listed in the catalog");
         // id fallback: "main_window" is not in any title
         assert_eq!(svc.search("main_window").len(), 3);
     }

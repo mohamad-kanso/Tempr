@@ -378,6 +378,20 @@ impl Buffer {
         }
     }
 
+    /// UTF-16 code-unit offset for a byte offset (IME / platform text APIs).
+    pub fn offset_to_utf16(&self, offset: usize) -> usize {
+        let ch = self.rope.byte_to_char(offset.min(self.len()));
+        self.rope.char_to_utf16_cu(ch)
+    }
+
+    /// Byte offset for a UTF-16 code-unit offset; clamps to the text.
+    pub fn offset_from_utf16(&self, utf16: usize) -> usize {
+        let ch = self
+            .rope
+            .utf16_cu_to_char(utf16.min(self.rope.len_utf16_cu()));
+        self.rope.char_to_byte(ch)
+    }
+
     /// Byte offset for a point; the line clamps to the last line, the
     /// column clamps to the end of that line's content (before its break),
     /// and the result is snapped down to a char boundary so it is always
@@ -792,8 +806,25 @@ mod tests {
     }
 
     #[test]
-    fn large_batch_edit_is_fast_enough() {
-        // 20k single-char replacements in one transaction (a "replace all").
+    fn large_batch_edit_applies_and_undoes_correctly() {
+        // 2k single-char replacements in one transaction (a "replace all").
+        let text = "a".repeat(20_000);
+        let mut b = buf(&text);
+        let edits: Vec<(Range<usize>, &str)> =
+            (0..2_000).map(|i| (i * 10..i * 10 + 1, "b")).collect();
+        b.edit(&edits).unwrap().unwrap();
+        assert_eq!(b.slice(0..11).unwrap(), "baaaaaaaaab");
+        assert_eq!(b.text().to_string().matches('b').count(), 2_000);
+        b.undo();
+        assert_eq!(b.text().to_string(), text);
+    }
+
+    /// Batch edits must scale linearly in the number of edits (a "replace
+    /// all" of 20k hits). Timing-sensitive → ignored; run in release:
+    /// `cargo test -p tempr_editor --release -- --ignored`.
+    #[test]
+    #[ignore = "timing-sensitive; run in release on a quiet machine"]
+    fn perf_large_batch_edit_is_linear() {
         let text = "a".repeat(200_000);
         let mut b = buf(&text);
         let edits: Vec<(Range<usize>, &str)> =
@@ -801,11 +832,8 @@ mod tests {
         let t = std::time::Instant::now();
         b.edit(&edits).unwrap().unwrap();
         let elapsed = t.elapsed();
-        assert_eq!(b.slice(0..11).unwrap(), "baaaaaaaaab");
-        // Generous bound for debug builds; the point is no quadratic blow-up.
-        assert!(elapsed.as_millis() < 2_000, "batch edit took {elapsed:?}");
-        b.undo();
-        assert_eq!(b.text().to_string(), text);
+        eprintln!("20k-edit batch: {elapsed:?}");
+        assert!(elapsed.as_millis() < 500, "batch edit took {elapsed:?}");
     }
 
     #[test]
@@ -885,9 +913,13 @@ mod tests {
             ("2.5k large statements", big),
         ] {
             let text = unit.repeat(target / unit.len() + 1);
-            let t0 = Instant::now();
             let mut b = buf(&text);
+            // `Buffer::new` does not parse: time a real full parse, then warm
+            // the buffer's own tree so the loop below measures increments.
+            let t0 = Instant::now();
+            let _ = SyntaxTree::parse(&b.text());
             let full = t0.elapsed();
+            b.reparse();
             let mid = b.offset_for_point(Point {
                 line: b.point_for_offset(b.len() / 2).line,
                 column: 0,
@@ -914,5 +946,15 @@ mod tests {
                 "incremental reparse ({avg:?}) is not much cheaper than a full parse ({full:?})"
             );
         }
+    }
+
+    #[test]
+    fn utf16_offsets_round_trip() {
+        let b = buf("aé😀b"); // bytes 1,2,4,1 ; utf16 1,1,2,1
+        assert_eq!(b.offset_to_utf16(3), 2);
+        assert_eq!(b.offset_to_utf16(7), 4);
+        assert_eq!(b.offset_from_utf16(4), 7);
+        assert_eq!(b.offset_from_utf16(2), 3);
+        assert_eq!(b.offset_from_utf16(99), 8, "clamps");
     }
 }

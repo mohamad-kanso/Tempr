@@ -5910,6 +5910,7 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "tempr_domain",
+ "tempr_editor",
  "tempr_events",
  "tempr_services",
  "tokio",

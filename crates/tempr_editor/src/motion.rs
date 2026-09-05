@@ -8,6 +8,19 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::buffer::{Buffer, Point};
 
 impl Buffer {
+    /// Byte offset of the start of line `line` (clamped to the last line).
+    pub fn line_start_of(&self, line: usize) -> usize {
+        self.offset_for_point(Point { line, column: 0 })
+    }
+
+    /// Byte offset of the end of line `line`'s content (before its break).
+    pub fn line_end_of(&self, line: usize) -> usize {
+        self.offset_for_point(Point {
+            line,
+            column: usize::MAX,
+        })
+    }
+
     /// Byte offset of the start of the line containing `offset`.
     pub fn line_start(&self, offset: usize) -> usize {
         let p = self.point_for_offset(offset);

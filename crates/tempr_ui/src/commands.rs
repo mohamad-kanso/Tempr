@@ -13,6 +13,7 @@ use gpui::{Action, App, KeyBinding, Keystroke, Window};
 use tempr_domain::CommandId;
 use tempr_services::{CommandContribution, CommandService};
 
+use crate::components::editor_view as ed;
 use crate::components::input;
 use crate::components::palette;
 use crate::main_window;
@@ -24,6 +25,8 @@ pub struct CommandSpec {
     pub category: &'static str,
     pub context: Option<&'static str>,
     pub default_keystrokes: &'static [&'static str],
+    /// Not offered in palette search (palette navigation, toggle itself).
+    pub hidden: bool,
     make_action: fn() -> Box<dyn Action>,
     make_binding: fn(&str, Option<&str>) -> KeyBinding,
 }
@@ -54,7 +57,13 @@ impl CommandSpec {
                 .iter()
                 .map(|k| k.to_string())
                 .collect(),
+            hidden: self.hidden,
         }
+    }
+
+    fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
     }
 }
 
@@ -70,14 +79,18 @@ fn spec<A: Action + Default>(
         category,
         context,
         default_keystrokes,
+        hidden: false,
         make_action: || Box::new(A::default()),
         make_binding: |keys, ctx| KeyBinding::new(keys, A::default(), ctx),
     }
 }
 
-const MW: Option<&str> = Some(main_window::KEY_CONTEXT);
+/// Main-window commands are suspended while the palette overlay is open
+/// (the palette is rendered inside the main window's dispatch node).
+const MW: Option<&str> = Some(main_window::KEY_CONTEXT_NOT_PALETTE);
 const IN: Option<&str> = Some(input::KEY_CONTEXT);
 const PAL: Option<&str> = Some(palette::KEY_CONTEXT);
+const ED: Option<&str> = Some(ed::KEY_CONTEXT);
 
 /// Every core command. Order here is only the fallback for the palette
 /// (it sorts by category/title anyway).
@@ -93,7 +106,8 @@ pub fn core_commands() -> Vec<CommandSpec> {
             "View",
             None,
             &["ctrl-shift-p", "cmd-shift-p"],
-        ),
+        )
+        .hidden(),
         spec::<mw::DebugScrollBenchmark>(
             "Debug: Scroll Benchmark",
             "View",
@@ -103,9 +117,100 @@ pub fn core_commands() -> Vec<CommandSpec> {
         // Application
         spec::<mw::Quit>("Quit", "Application", None, &["ctrl-q", "cmd-q"]),
         // Palette (only while it is open)
-        spec::<palette::SelectNext>("Palette: Next Item", "Palette", PAL, &["down", "ctrl-n"]),
-        spec::<palette::SelectPrev>("Palette: Previous Item", "Palette", PAL, &["up", "ctrl-p"]),
-        spec::<palette::Dismiss>("Palette: Close", "Palette", PAL, &["escape"]),
+        spec::<palette::SelectNext>("Palette: Next Item", "Palette", PAL, &["down", "ctrl-n"])
+            .hidden(),
+        spec::<palette::SelectPrev>("Palette: Previous Item", "Palette", PAL, &["up", "ctrl-p"])
+            .hidden(),
+        spec::<palette::Dismiss>("Palette: Close", "Palette", PAL, &["escape"]).hidden(),
+        // Editor (multi-line SQL editor)
+        spec::<ed::RunAll>(
+            "Run All Statements",
+            "Query",
+            ED,
+            &["ctrl-shift-enter", "cmd-shift-enter"],
+        ),
+        spec::<ed::MoveLeft>("Editor: Move Left", "Editor", ED, &["left"]),
+        spec::<ed::MoveRight>("Editor: Move Right", "Editor", ED, &["right"]),
+        spec::<ed::MoveUp>("Editor: Move Up", "Editor", ED, &["up"]),
+        spec::<ed::MoveDown>("Editor: Move Down", "Editor", ED, &["down"]),
+        spec::<ed::SelectLeft>("Editor: Select Left", "Editor", ED, &["shift-left"]),
+        spec::<ed::SelectRight>("Editor: Select Right", "Editor", ED, &["shift-right"]),
+        spec::<ed::SelectUp>("Editor: Select Up", "Editor", ED, &["shift-up"]),
+        spec::<ed::SelectDown>("Editor: Select Down", "Editor", ED, &["shift-down"]),
+        spec::<ed::WordLeft>(
+            "Editor: Word Left",
+            "Editor",
+            ED,
+            &["ctrl-left", "alt-left"],
+        ),
+        spec::<ed::WordRight>(
+            "Editor: Word Right",
+            "Editor",
+            ED,
+            &["ctrl-right", "alt-right"],
+        ),
+        spec::<ed::SelectWordLeft>(
+            "Editor: Select Word Left",
+            "Editor",
+            ED,
+            &["ctrl-shift-left", "alt-shift-left"],
+        ),
+        spec::<ed::SelectWordRight>(
+            "Editor: Select Word Right",
+            "Editor",
+            ED,
+            &["ctrl-shift-right", "alt-shift-right"],
+        ),
+        spec::<ed::LineStart>("Editor: Line Start", "Editor", ED, &["home"]),
+        spec::<ed::LineEnd>("Editor: Line End", "Editor", ED, &["end"]),
+        spec::<ed::SelectLineStart>(
+            "Editor: Select to Line Start",
+            "Editor",
+            ED,
+            &["shift-home"],
+        ),
+        spec::<ed::SelectLineEnd>("Editor: Select to Line End", "Editor", ED, &["shift-end"]),
+        spec::<ed::DocumentStart>(
+            "Editor: Document Start",
+            "Editor",
+            ED,
+            &["ctrl-home", "cmd-up"],
+        ),
+        spec::<ed::DocumentEnd>(
+            "Editor: Document End",
+            "Editor",
+            ED,
+            &["ctrl-end", "cmd-down"],
+        ),
+        spec::<ed::SelectAll>("Editor: Select All", "Editor", ED, &["ctrl-a", "cmd-a"]),
+        spec::<ed::Backspace>("Editor: Backspace", "Editor", ED, &["backspace"]),
+        spec::<ed::Delete>("Editor: Delete", "Editor", ED, &["delete"]),
+        spec::<ed::Newline>("Editor: New Line", "Editor", ED, &["enter"]),
+        spec::<ed::Tab>("Editor: Indent", "Editor", ED, &["tab"]),
+        spec::<ed::Undo>("Editor: Undo", "Editor", ED, &["ctrl-z", "cmd-z"]),
+        spec::<ed::Redo>(
+            "Editor: Redo",
+            "Editor",
+            ED,
+            &["ctrl-shift-z", "ctrl-y", "cmd-shift-z"],
+        ),
+        spec::<ed::Copy>("Editor: Copy", "Editor", ED, &["ctrl-c", "cmd-c"]),
+        spec::<ed::Cut>("Editor: Cut", "Editor", ED, &["ctrl-x", "cmd-x"]),
+        spec::<ed::Paste>("Editor: Paste", "Editor", ED, &["ctrl-v", "cmd-v"]),
+        spec::<ed::DeleteLine>(
+            "Editor: Delete Line",
+            "Editor",
+            ED,
+            &["ctrl-shift-k", "cmd-shift-k"],
+        ),
+        spec::<ed::DuplicateLine>(
+            "Editor: Duplicate Line",
+            "Editor",
+            ED,
+            &["ctrl-shift-d", "cmd-shift-d"],
+        ),
+        spec::<ed::MoveLineUp>("Editor: Move Line Up", "Editor", ED, &["alt-up"]),
+        spec::<ed::MoveLineDown>("Editor: Move Line Down", "Editor", ED, &["alt-down"]),
         // Edit (single-line Input)
         spec::<input::Backspace>("Edit: Backspace", "Edit", IN, &["backspace"]),
         spec::<input::Delete>("Edit: Delete", "Edit", IN, &["delete"]),
@@ -150,7 +255,9 @@ pub fn find(id: &CommandId) -> Option<CommandSpec> {
 
 /// Dispatch `id` as a GPUI action into `window` (as if its keybinding had
 /// been pressed) and record the execution on the service. Returns `false`
-/// for an unknown id.
+/// for an unknown id or one no focused element currently handles — nothing
+/// is recorded then. GPUI defers the dispatch against the focus at *call*
+/// time, so call this before moving focus elsewhere.
 pub fn dispatch(
     id: &CommandId,
     service: &Arc<CommandService>,
@@ -160,7 +267,11 @@ pub fn dispatch(
     let Some(spec) = find(id) else {
         return false;
     };
-    window.dispatch_action(spec.action(), cx);
+    let action = spec.action();
+    if !window.is_action_available(&*action, cx) {
+        return false;
+    }
+    window.dispatch_action(action, cx);
     service.record_executed(id.clone());
     true
 }
@@ -180,6 +291,23 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), n, "duplicate command ids");
+    }
+
+    #[test]
+    fn palette_navigation_and_toggle_are_hidden_from_search() {
+        let hidden: Vec<String> = core_commands()
+            .iter()
+            .filter(|s| s.hidden)
+            .map(|s| s.id.to_string())
+            .collect();
+        for id in [
+            "main_window::TogglePalette",
+            "palette::Dismiss",
+            "palette::SelectNext",
+            "palette::SelectPrev",
+        ] {
+            assert!(hidden.iter().any(|h| h == id), "{id} must be hidden");
+        }
     }
 
     #[test]

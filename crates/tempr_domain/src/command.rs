@@ -30,3 +30,8 @@ impl From<&str> for CommandId {
         Self(s.to_string())
     }
 }
+
+/// `command id → keystrokes` (GPUI syntax, e.g. `"ctrl-enter"`; chords are
+/// space-separated). An empty list unbinds the command. Used for user and
+/// workspace keybinding overrides (D23).
+pub type KeybindingOverrides = std::collections::BTreeMap<String, Vec<String>>;

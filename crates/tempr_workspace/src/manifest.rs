@@ -13,7 +13,7 @@ pub struct WorkspaceManifest {
     /// Workspace-level keybinding overrides (`command id → keystrokes`);
     /// the highest settings layer (docs/04-workspace.md → Settings layering).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub keybindings: crate::settings::KeybindingMap,
+    pub keybindings: tempr_domain::KeybindingOverrides,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
