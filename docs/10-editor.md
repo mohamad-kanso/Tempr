@@ -158,11 +158,15 @@ impl SyntaxTree {
 }
 ```
 
-**Implementation notes (2026-09-03, D22):** `tempr_editor::SyntaxTree` — `parse(&Rope)`, `edit(&InputEdit)`, `reparse(&Rope)` (reads rope chunks, no copy), `root_node()`, `has_error()`, `statement_ranges()` / `statement_at(offset)` (the statement detector: `statement`/`transaction`/`block` children of `program` with a following `;` folded in, `ERROR` recovery fragments returned with `StatementKind::Error` so executors can refuse them, comments and stray `;` skipped, `$$` bodies and strings opaque; a `BEGIN … END` block is one range — inner-statement execution is a TODO), `highlights(query, text, range)` with the bundled `highlights.scm` via `SyntaxTree::highlight_query()`. Grammar: `tree-sitter-sequel`.
+**Implementation notes (2026-09-05):** the editing model behind `EditorView` lives in `tempr_editor` and is UI-free — `Selection { anchor, head }` (byte offsets; `selection::normalize` sorts and merges overlaps), motions on `Buffer` (`next/prev_grapheme_boundary`, `next/prev_word_boundary`, `line_start/line_end`, `move_vertically(offset, delta, goal_column)`), and cursor-based edit ops (`insert_at`, `backspace`, `delete_forward`, `selected_text`, `delete_lines`, `duplicate_lines`, `move_lines`) that each apply one atomic `Buffer::edit` batch and return the resulting selections (`EditOutcome`). `edit_with_selections` records the cursors around a transaction so `undo_with_selections`/`redo_with_selections` restore them. Clipboard access stays in the view.
+
+**Implementation notes (2026-09-03, D22):** `tempr_editor::SyntaxTree` — `parse(&Rope)`, `edit(&InputEdit)`, `reparse(&Rope)` (reads rope chunks, no copy), `root_node()`, `has_error()`, `statement_ranges()` / `statement_at(offset)` (the statement detector: `statement`/`transaction`/`block` children of `program` with a following `;` folded in, `ERROR` recovery fragments returned with `StatementKind::Error` so executors can refuse them, comments and stray `;` skipped, `$$` bodies and strings opaque; a `BEGIN … END` block is one range — inner-statement execution is a TODO), `highlights(text, range)` returning `Highlight { range, kind: HighlightKind }` — the capture names of the Tempr-owned `queries/highlights.scm` are mapped to the closed `HighlightKind` enum once (`syntax::highlight_query()`), so the view matches on a type, never on strings. Grammar: `tree-sitter-sequel`.
 
 ### EditorView
 
 `EditorView` is a GPUI view component. It owns cursor state, scroll position, and rendering logic. It holds a reference (or handle) to the `Buffer` and subscribes to `BufferChanged` events to trigger re-renders.
+
+**Implementation notes (2026-09-05):** `tempr_ui::components::EditorView` owns the `Buffer` directly for now (no `BufferChanged` publisher yet — TODO) and renders a `uniform_list` of lines: gutter numbers with a current-line tint, tree-sitter highlights via `theme::highlight_color(HighlightKind)` (nested captures override enclosing ones), multi-cursor selections/cursors painted per line (a selection covering only a newline paints a strip to the right edge), IME through `EntityInputHandler` — the input handler is hosted by the primary cursor's line, or by the first visible line when that cursor is scrolled off-screen, so typing is never dropped. Mouse click places the cursor. 33 keyboard commands (key context `Editor`) drive motions (plain left/right collapse a selection to its edge; word/line/document motions move from the head), edit ops, undo/redo (selections restored), clipboard and line ops; `EditorEvent::{Changed, Run(sql), Notice}` — ctrl-enter runs the statement under the cursor (selection wins; `StatementKind::Error` is refused; cursor at end of the last statement counts as inside it), ctrl-shift-enter runs everything. Not yet: horizontal scroll/wrapping, search, adding cursors, gutter run buttons.
 
 ```rust
 pub struct EditorView {
@@ -188,6 +192,8 @@ impl EditorView {
     pub fn run_statement(&mut self, cx: &mut Context<Self>);
 }
 ```
+
+**Implementation notes (2026-09-05):** `tempr_ui::components::EditorView` owns the `Buffer` and `Vec<Selection>` (primary = last), renders visible lines with `uniform_list` and a custom per-line element (highlight `TextRun`s, selection quads, cursors), registers the IME handler on the primary cursor's line, and maps every action in 10-editor's list to `tempr_editor` motions / edit ops. "Run statement" is `EditorEvent::Run(sql)` — the owner (`MainWindow`) executes; `StatementKind::Error` ranges produce a `Notice` instead. Not yet: horizontal scrolling / wrapping, search, adding cursors, gutter run buttons.
 
 ### StatementRange
 

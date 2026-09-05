@@ -28,6 +28,13 @@
 
 - [ ] Parse strategy for pathological files: a 10 MB dump of ~180k one-line statements re-parses in ~150 ms (tree-sitter re-walks the flat `program` sibling list); options — parse on a background thread from a `Tree` clone, or viewport-scoped `set_included_ranges`; realistic files (2.5k statements) are at 1.6 ms already
 - [ ] Inner-statement execution inside `BEGIN … END` blocks / transactions: `StatementRange` reports the whole block as one range (kind `Block`/`Transaction`); descend into children when the cursor is inside
+- [ ] Palette: highlight matched characters (`CommandMatch::indices`) in titles; show "no keybinding" hint; remember last query per session
+- [ ] Apply the workspace keybinding layer (`WorkspaceManifest::keybindings`) when workspace open lands (`CommandService::set_keybinding_layers([user, workspace])`); rebind live on settings change (`cx.clear_key_bindings()` + `commands::install`)
+- [ ] Plugin commands need a GPUI action shape (a generic `PluginCommand { id }` action or per-plugin `actions!`) before `CommandContribution` from 08-plugin-api can register through `CommandService`
+- [ ] `EditorView` follow-ups: horizontal scroll / soft wrap (long lines are clipped today), find/replace, add cursor above/below and select-next-occurrence, gutter run buttons per statement, `BufferChanged` publisher so other views can observe the buffer (10-editor data flow), shaped-line cache keyed by (line, text, highlights) if profiling shows re-shaping visible lines each frame matters
+- [ ] `AppEvent::CommandExecuted` keymap semantics: today it fires only for palette-dispatched commands; key-driven actions bypass the service, so listeners (history, plugins) see a partial stream — either record from a global action observer or document it as palette-only
+- [ ] Live rebind on settings change and a `settings.toml` validation command (today invalid keystrokes are logged, the command falls back to its defaults, and the parse error is shown once in the status bar)
+- [ ] Editing ops follow-ups: indent/outdent, join lines, transpose, select word/line, add cursor above/below, word motions across line breaks for `prev_word_boundary` when the previous line is empty
 - [ ] `EditHistory` bounds: cap depth and coalesce typing bursts (today every keystroke stores its removed/inserted text forever; a select-all + paste on a 10 MB file retains full copies)
 - [ ] Phase 2: Tree-sitter PostgreSQL grammar integration + incremental parse
 - [ ] Phase 2: Statement boundary detector ($$ delimiters, comments, string literals)

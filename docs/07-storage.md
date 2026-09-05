@@ -59,6 +59,7 @@ Out of scope: network transport of query results, in-memory cache eviction polic
 | `workspace.toml` | TOML | Yes | Project manifest — name, format version, connection definitions (ID + keychain ref, type, options). |
 | `*.sql` | Plain UTF-8 text | Yes | User-authored SQL files, arbitrarily organized into subdirectories. |
 | `.tempr/settings.toml` | TOML | No (gitignored) | Workspace-scoped setting overrides that should not leave the machine. |
+| `~/.config/tempr/settings.toml` *(outside the workspace)* | TOML | — | User-level settings, the middle layer of 04-workspace's settings model. Today: `[keybindings]` — `"main_window::RunQuery" = ["f5", "ctrl-enter"]`, GPUI keystroke syntax, `[]` unbinds (D23). Loaded by `tempr_workspace::load_user_settings`; missing file = defaults. |
 | `.tempr/layout.json` | JSON | No | Serialized panel/dock layout. Ephemeral; regenerated if missing. |
 | `.tempr/history.db` | SQLite | No | Append-only query execution history. |
 | `.tempr/cache/catalog/` | Binary (see [Open Questions](#open-questions)) | No | One file per connection, versioned by schema hash. Fast-load format for instant startup. |

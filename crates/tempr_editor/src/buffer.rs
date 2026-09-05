@@ -20,6 +20,7 @@ use tempr_domain::SqlFileId;
 use thiserror::Error;
 use tree_sitter::{InputEdit, Point as TsPoint};
 
+use crate::selection::Selection;
 use crate::syntax::{Highlight, StatementRange, SyntaxTree};
 
 /// Identifier of one applied edit transaction; monotonically increasing per
@@ -75,6 +76,16 @@ struct Transaction {
     id: EditId,
     /// In application order (start descending; see `edit` for tie-breaks).
     changes: Vec<Change>,
+    /// Cursor state around the transaction, when the caller supplied it
+    /// (`edit_with_selections`); restored by `undo_with_selections` /
+    /// `redo_with_selections`.
+    selections: Option<SelectionSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionSnapshot {
+    before: Vec<Selection>,
+    after: Vec<Selection>,
 }
 
 #[derive(Debug, Default)]
@@ -158,8 +169,7 @@ impl Buffer {
     /// bundled `highlights.scm`).
     pub fn highlights(&mut self, byte_range: Range<usize>) -> Vec<Highlight> {
         let rope = self.rope.clone();
-        self.syntax()
-            .highlights(SyntaxTree::highlight_query(), &rope, byte_range)
+        self.syntax().highlights(&rope, byte_range)
     }
 
     /// Total byte length of the content.
@@ -210,6 +220,31 @@ impl Buffer {
     /// (empty batch, or every replacement equals what it replaces); a real
     /// change records one undo transaction and clears the redo stack.
     pub fn edit(&mut self, edits: &[(Range<usize>, &str)]) -> Result<Option<EditId>, EditError> {
+        self.edit_inner(edits, None)
+    }
+
+    /// Like `edit`, additionally remembering the selections before and
+    /// after the transaction so undo/redo can restore the cursors.
+    pub fn edit_with_selections(
+        &mut self,
+        edits: &[(Range<usize>, &str)],
+        before: &[Selection],
+        after: &[Selection],
+    ) -> Result<Option<EditId>, EditError> {
+        self.edit_inner(
+            edits,
+            Some(SelectionSnapshot {
+                before: before.to_vec(),
+                after: after.to_vec(),
+            }),
+        )
+    }
+
+    fn edit_inner(
+        &mut self,
+        edits: &[(Range<usize>, &str)],
+        selections: Option<SelectionSnapshot>,
+    ) -> Result<Option<EditId>, EditError> {
         // Validate everything before touching the rope.
         for (range, _) in edits {
             self.char_range(range)?;
@@ -262,9 +297,37 @@ impl Buffer {
 
         let id = EditId(self.next_edit);
         self.next_edit += 1;
-        self.history.undo.push(Transaction { id, changes });
+        self.history.undo.push(Transaction {
+            id,
+            changes,
+            selections,
+        });
         self.history.redo.clear();
         Ok(Some(id))
+    }
+
+    /// `undo`, also returning the selections that were active *before* the
+    /// reverted transaction (if it recorded them).
+    pub fn undo_with_selections(&mut self) -> Option<(EditId, Option<Vec<Selection>>)> {
+        let id = self.undo()?;
+        let sel = self
+            .history
+            .redo
+            .last()
+            .and_then(|tx| tx.selections.as_ref().map(|s| s.before.clone()));
+        Some((id, sel))
+    }
+
+    /// `redo`, also returning the selections that were active *after* the
+    /// re-applied transaction (if it recorded them).
+    pub fn redo_with_selections(&mut self) -> Option<(EditId, Option<Vec<Selection>>)> {
+        let id = self.redo()?;
+        let sel = self
+            .history
+            .undo
+            .last()
+            .and_then(|tx| tx.selections.as_ref().map(|s| s.after.clone()));
+        Some((id, sel))
     }
 
     /// Revert the most recent transaction. Returns its id.
@@ -312,6 +375,30 @@ impl Buffer {
             line,
             column: offset - line_start,
         }
+    }
+
+    /// UTF-16 code-unit range for a byte range.
+    pub fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    /// Byte range for a UTF-16 code-unit range.
+    pub fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+    }
+
+    /// UTF-16 code-unit offset for a byte offset (IME / platform text APIs).
+    pub fn offset_to_utf16(&self, offset: usize) -> usize {
+        let ch = self.rope.byte_to_char(offset.min(self.len()));
+        self.rope.char_to_utf16_cu(ch)
+    }
+
+    /// Byte offset for a UTF-16 code-unit offset; clamps to the text.
+    pub fn offset_from_utf16(&self, utf16: usize) -> usize {
+        let ch = self
+            .rope
+            .utf16_cu_to_char(utf16.min(self.rope.len_utf16_cu()));
+        self.rope.char_to_byte(ch)
     }
 
     /// Byte offset for a point; the line clamps to the last line, the
@@ -426,7 +513,7 @@ impl std::fmt::Debug for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::SyntaxTree;
+    use crate::syntax::{HighlightKind, SyntaxTree};
 
     fn buf(text: &str) -> Buffer {
         Buffer::new(SqlFileId::new(), text)
@@ -728,8 +815,25 @@ mod tests {
     }
 
     #[test]
-    fn large_batch_edit_is_fast_enough() {
-        // 20k single-char replacements in one transaction (a "replace all").
+    fn large_batch_edit_applies_and_undoes_correctly() {
+        // 2k single-char replacements in one transaction (a "replace all").
+        let text = "a".repeat(20_000);
+        let mut b = buf(&text);
+        let edits: Vec<(Range<usize>, &str)> =
+            (0..2_000).map(|i| (i * 10..i * 10 + 1, "b")).collect();
+        b.edit(&edits).unwrap().unwrap();
+        assert_eq!(b.slice(0..11).unwrap(), "baaaaaaaaab");
+        assert_eq!(b.text().to_string().matches('b').count(), 2_000);
+        b.undo();
+        assert_eq!(b.text().to_string(), text);
+    }
+
+    /// Batch edits must scale linearly in the number of edits (a "replace
+    /// all" of 20k hits). Timing-sensitive → ignored; run in release:
+    /// `cargo test -p tempr_editor --release -- --ignored`.
+    #[test]
+    #[ignore = "timing-sensitive; run in release on a quiet machine"]
+    fn perf_large_batch_edit_is_linear() {
         let text = "a".repeat(200_000);
         let mut b = buf(&text);
         let edits: Vec<(Range<usize>, &str)> =
@@ -737,11 +841,8 @@ mod tests {
         let t = std::time::Instant::now();
         b.edit(&edits).unwrap().unwrap();
         let elapsed = t.elapsed();
-        assert_eq!(b.slice(0..11).unwrap(), "baaaaaaaaab");
-        // Generous bound for debug builds; the point is no quadratic blow-up.
-        assert!(elapsed.as_millis() < 2_000, "batch edit took {elapsed:?}");
-        b.undo();
-        assert_eq!(b.text().to_string(), text);
+        eprintln!("20k-edit batch: {elapsed:?}");
+        assert!(elapsed.as_millis() < 500, "batch edit took {elapsed:?}");
     }
 
     #[test]
@@ -798,7 +899,7 @@ mod tests {
             "select 'wörld';"
         );
         let hs = b.highlights(0..b.len());
-        assert!(hs.iter().any(|h| h.capture == "comment"));
+        assert!(hs.iter().any(|h| h.kind == HighlightKind::Comment));
     }
 
     /// Incremental reparse cost after a one-line edit, for two 10 MB
@@ -821,9 +922,13 @@ mod tests {
             ("2.5k large statements", big),
         ] {
             let text = unit.repeat(target / unit.len() + 1);
-            let t0 = Instant::now();
             let mut b = buf(&text);
+            // `Buffer::new` does not parse: time a real full parse, then warm
+            // the buffer's own tree so the loop below measures increments.
+            let t0 = Instant::now();
+            let _ = SyntaxTree::parse(&b.text());
             let full = t0.elapsed();
+            b.reparse();
             let mid = b.offset_for_point(Point {
                 line: b.point_for_offset(b.len() / 2).line,
                 column: 0,
@@ -850,5 +955,15 @@ mod tests {
                 "incremental reparse ({avg:?}) is not much cheaper than a full parse ({full:?})"
             );
         }
+    }
+
+    #[test]
+    fn utf16_offsets_round_trip() {
+        let b = buf("aé😀b"); // bytes 1,2,4,1 ; utf16 1,1,2,1
+        assert_eq!(b.offset_to_utf16(3), 2);
+        assert_eq!(b.offset_to_utf16(7), 4);
+        assert_eq!(b.offset_from_utf16(4), 7);
+        assert_eq!(b.offset_from_utf16(2), 3);
+        assert_eq!(b.offset_from_utf16(99), 8, "clamps");
     }
 }

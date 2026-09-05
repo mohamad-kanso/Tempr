@@ -42,6 +42,7 @@
 | D20 | 2026-09-03 | PostgreSQL TLS via rustls (`tokio-postgres-rustls`, `ring` provider, platform roots from `rustls-native-certs`); `TlsMode` on `Connection` with libpq `sslmode` semantics, default `prefer`; `verify-ca` treated as `verify-full` | Claude (Phase 1) |
 | D21 | 2026-09-03 | Editor buffer = `ropey` 1.x rope in new `tempr_editor` crate; public API is byte-offset based (ropey char indices never leak); `edit` is a validated, atomic batch returning `Result`; `Buffer` is a pure model (no event bus) | Claude (Phase 2) |
 | D22 | 2026-09-03 | SQL grammar = `tree-sitter-sequel` (DerekStride, MIT) on `tree-sitter` 0.25; `Buffer` records `InputEdit`s eagerly but re-parses **lazily** on read, so `edit` stays sub-ms on any document size | Claude (Phase 2) |
+| D23 | 2026-09-05 | Commands = GPUI action types in one typed catalog (`tempr_ui::commands`); `CommandService` owns metadata + layered keybindings (defaults ← `~/.config/tempr/settings.toml` ← `workspace.toml` `[keybindings]`, command → keystrokes, empty = unbind); palette = `Input` + `uniform_list` over in-house fuzzy search; execution stays in the UI, service records `CommandExecuted` | Claude (Phase 2) |
 
 ---
 
@@ -279,4 +280,19 @@
 **Why**: Measured in release on a 10 MB buffer: full parse 2.0–2.7 s; incremental reparse after a one-line edit **1.6 ms** for realistic statement sizes but **~150 ms** for a dump of 180k one-line statements (tree-sitter re-walks the flat sibling list). Running the parse inside `edit` would have turned the rope's 6 µs edit into hundreds of milliseconds on such files and violated the Phase 2 "< 1 ms insert/delete" criterion; deferring it keeps typing cheap and lets the owner decide when (and later, on which thread) to parse. tree-sitter itself is the settled choice (10-editor, ADR-0003); the grammar was picked for PostgreSQL coverage, maintenance, and license.
 
 **Consequences**: Tree readers take `&mut Buffer` (they may parse). A background/incremental-by-viewport parse strategy for pathological dumps is a TODO; so is `SyntaxTree` sharing with the semantic engine (tree-sitter `Tree` is a cheap ref-counted clone). Grammar and runtime versions are bumped together. `cc` compiles the generated `parser.c` at build time — accepted as part of the tree-sitter choice (the parser is generated, not hand-written C), consistent with D2's intent.
+
+---
+
+## D23 — Command catalog, palette, and configurable keybindings (2026-09-05)
+
+**By**: Claude (Phase 2, boxes 4, 5 and 8).
+**Decision**:
+1. Every user action is a GPUI action type declared with `actions!` and listed exactly once in the typed catalog `tempr_ui::commands::core_commands()` — id (`CommandId` = the GPUI action name, e.g. `main_window::RunQuery`), title, category, key context, default keystrokes, and constructors for the action and its `KeyBinding`. The catalog is the keyboard-only audit: a unit test fails if any command lacks a default keystroke, and `TEMPR_LIST_COMMANDS=1` prints the effective table.
+2. `tempr_services::CommandService` owns the *data*: registered `CommandContribution`s and the resolved keybinding map. Keybindings are layered lowest → highest: catalog defaults, user settings (`~/.config/tempr/settings.toml`, `[keybindings]`), workspace (`workspace.toml`, `[keybindings]`, wired when workspace open lands). Format: `"main_window::RunQuery" = ["f5", "ctrl-enter"]`, keystrokes in GPUI syntax (`ctrl-shift-p`, chords space-separated); `[]` unbinds. Invalid keystrokes are skipped with a warning, never a panic.
+3. Execution stays in the UI layer: the palette emits the chosen `CommandId`; `MainWindow` builds the typed action from the catalog and dispatches it into the window (same path as a keypress), then calls `CommandService::record_executed`, which publishes `CommandExecuted { id }`.
+4. The palette is `Input` + a virtualized list of `CommandService::search` hits; search is the in-house `fuzzy_match` (case-insensitive subsequence; consecutive-run and word-start bonuses, gap penalty; id fallback), no external matcher crate.
+
+**Why**: GPUI actions already give type-safe dispatch, key contexts and bindings; inventing a parallel closure-based command runtime (as 05-services sketched) would duplicate that and drag GPUI types into the service layer (D6 forbids UI in services, and services must stay testable without a window). Keeping metadata + configuration in the service and the typed constructors in the UI splits along the existing crate boundary. `KeyBinding::new` needs a concrete action type, which is why the catalog stores monomorphized constructors rather than building actions by name. Command → keystrokes (not keystroke → command) makes an override replace *that command's* keys without silently stealing another command's key, and matches how users think ("rebind Run Query").
+
+**Consequences**: Plugin commands (08-plugin-api `CommandContribution`) will register through the same service; their actions need a GPUI action type or a generic `PluginCommand { id }` action — decided when plugins land. `05-services.md` CommandService signatures updated to the real ones; `by_keybinding`/`execute` on the service do not exist. Per-character match highlighting in the palette and the workspace settings layer are TODO. The user-facing keybinding format is documented in 07-storage (file) and 11-gpui (catalog).
 

@@ -9,6 +9,7 @@ description       = "Buffer, rope data structures, syntax (docs/10-editor.md)"
 tempr_domain.workspace = true
 
 ropey.workspace              = true
+unicode-segmentation.workspace = true
 thiserror.workspace          = true
 tree-sitter.workspace        = true
 tree-sitter-sequel.workspace = true

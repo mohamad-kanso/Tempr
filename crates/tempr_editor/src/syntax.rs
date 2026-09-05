@@ -57,12 +57,54 @@ fn kind_of(node: &Node) -> Option<StatementKind> {
     })
 }
 
-/// A highlight capture: byte range + capture name from `highlights.scm`
-/// (e.g. `keyword`, `string`, `comment`, `function.call`).
+/// Highlight classes — the vocabulary of `queries/highlights.scm`, owned by
+/// this crate so the UI's colour mapping is an exhaustive `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HighlightKind {
+    Keyword,
+    KeywordOperator,
+    String,
+    Number,
+    Boolean,
+    Comment,
+    FunctionCall,
+    Type,
+    Variable,
+    Field,
+    Parameter,
+    Operator,
+    Punctuation,
+    /// A capture the query defines but Tempr does not style specially.
+    Other,
+}
+
+impl HighlightKind {
+    /// Map a capture name from `highlights.scm` to a kind.
+    pub fn from_capture(name: &str) -> Self {
+        match name {
+            "keyword" | "conditional" | "attribute" | "storageclass" => Self::Keyword,
+            "keyword.operator" => Self::KeywordOperator,
+            "string" => Self::String,
+            "number" | "float" => Self::Number,
+            "boolean" => Self::Boolean,
+            "comment" => Self::Comment,
+            "function.call" => Self::FunctionCall,
+            "type" | "type.builtin" | "type.qualifier" => Self::Type,
+            "variable" => Self::Variable,
+            "field" => Self::Field,
+            "parameter" => Self::Parameter,
+            "operator" => Self::Operator,
+            "punctuation.delimiter" | "punctuation.bracket" => Self::Punctuation,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A highlight: byte range + kind. Sorted by range, one per node range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Highlight {
     pub range: Range<usize>,
-    pub capture: String,
+    pub kind: HighlightKind,
 }
 
 pub struct SyntaxTree {
@@ -82,6 +124,26 @@ impl std::fmt::Debug for SyntaxTree {
 
 /// Tempr's highlight query source (see `queries/highlights.scm`).
 pub const HIGHLIGHTS_QUERY: &str = include_str!("../queries/highlights.scm");
+
+/// The compiled highlight query plus its capture-index → kind table, built
+/// once per process.
+pub fn highlight_query() -> (&'static Query, &'static [HighlightKind]) {
+    static QUERY: std::sync::OnceLock<(Query, Vec<HighlightKind>)> = std::sync::OnceLock::new();
+    let (q, kinds) = QUERY.get_or_init(|| {
+        // The query is part of this crate; a compile failure is a bug caught
+        // by `highlights_yield_keyword_string_and_number_captures`.
+        #[allow(clippy::expect_used)]
+        let q = Query::new(&language(), HIGHLIGHTS_QUERY)
+            .expect("queries/highlights.scm compiles against tree-sitter-sequel");
+        let kinds = q
+            .capture_names()
+            .iter()
+            .map(|n| HighlightKind::from_capture(n))
+            .collect();
+        (q, kinds)
+    });
+    (q, kinds)
+}
 
 /// The SQL language handle (shared, cheap to clone).
 pub fn language() -> Language {
@@ -185,59 +247,48 @@ impl SyntaxTree {
             end,
             kind,
         };
-        let at_document_end = offset == end && end == root.end_byte();
-        (range.contains(offset) || at_document_end).then_some(range)
+        // At the very end of the last statement (even with trailing
+        // whitespace after it) the caret still "belongs" to it.
+        let is_last = node
+            .next_sibling()
+            .is_none_or(|n| n.kind() == ";" && n.next_sibling().is_none());
+        let at_last_statement_end = offset == end && is_last;
+        (range.contains(offset) || at_last_statement_end).then_some(range)
     }
 
-    /// Run `query` over `byte_range` and return one capture per node range in
-    /// document order. When several patterns capture the same range, the
-    /// later pattern in the query file wins (so specific patterns such as
-    /// numeric literals override generic ones). `text` feeds `#match?`.
-    pub fn highlights(
-        &self,
-        query: &Query,
-        text: &Rope,
-        byte_range: Range<usize>,
-    ) -> Vec<Highlight> {
-        let names = query.capture_names();
+    /// Run Tempr's highlight query over `byte_range` and return one
+    /// highlight per node range in document order. When several patterns
+    /// capture the same range, the later pattern in the query file wins (so
+    /// numeric literals override the generic literal→string). `text` feeds
+    /// `#match?`. An empty range yields nothing (tree-sitter would otherwise
+    /// treat `0..0` as unbounded).
+    pub fn highlights(&self, text: &Rope, byte_range: Range<usize>) -> Vec<Highlight> {
+        if byte_range.is_empty() {
+            return Vec::new();
+        }
+        let (query, kinds) = highlight_query();
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(byte_range);
         let provider = RopeText(text);
-        let mut raw: Vec<(Range<usize>, usize, &str)> = Vec::new();
+        let mut raw: Vec<(Range<usize>, usize, HighlightKind)> = Vec::new();
         let mut captures = cursor.captures(query, self.tree.root_node(), provider);
         while let Some((m, ix)) = captures.next() {
             let cap = m.captures[*ix];
             raw.push((
                 cap.node.byte_range(),
                 m.pattern_index,
-                names[cap.index as usize],
+                kinds[cap.index as usize],
             ));
         }
         raw.sort_by_key(|(r, pattern, _)| (r.start, r.end, *pattern));
         let mut out: Vec<Highlight> = Vec::with_capacity(raw.len());
-        for (range, _, name) in raw {
+        for (range, _, kind) in raw {
             match out.last_mut() {
-                Some(last) if last.range == range => last.capture = name.to_string(),
-                _ => out.push(Highlight {
-                    range,
-                    capture: name.to_string(),
-                }),
+                Some(last) if last.range == range => last.kind = kind,
+                _ => out.push(Highlight { range, kind }),
             }
         }
         out
-    }
-
-    /// Tempr's `highlights.scm` (`queries/highlights.scm`, derived from the
-    /// grammar's), compiled once per process.
-    pub fn highlight_query() -> &'static Query {
-        static QUERY: std::sync::OnceLock<Query> = std::sync::OnceLock::new();
-        QUERY.get_or_init(|| {
-            // The query is part of this crate; a compile failure is a bug
-            // caught by `highlights_yield_keyword_string_and_number_captures`.
-            #[allow(clippy::expect_used)]
-            Query::new(&language(), HIGHLIGHTS_QUERY)
-                .expect("queries/highlights.scm compiles against tree-sitter-sequel")
-        })
     }
 }
 
@@ -325,6 +376,14 @@ mod tests {
         let inner = SAMPLE.find("$$ select").unwrap() + 4;
         assert_eq!(t.statement_at(inner), Some(ranges[2]), "inside a $$ body");
         assert_eq!(t.statement_at(SAMPLE.len()), Some(ranges[3]), "at EOF");
+        // Trailing newline after an unterminated last statement.
+        let tn = SyntaxTree::parse(&rope("select 1\n"));
+        assert_eq!(
+            tn.statement_at(8).map(|r| r.end),
+            Some(8),
+            "end of last statement"
+        );
+        assert_eq!(tn.statement_at(9), None, "on the trailing newline");
         assert_eq!(
             SyntaxTree::parse(&rope("-- only a comment\n")).statement_at(3),
             None
@@ -434,21 +493,48 @@ mod tests {
         let src = "select 42, 1.5, 'x' -- c\nfrom t;";
         let text = rope(src);
         let t = SyntaxTree::parse(&text);
-        let hs = t.highlights(SyntaxTree::highlight_query(), &text, 0..text.len_bytes());
-        let by_text: Vec<(&str, &str)> = hs
-            .iter()
-            .map(|h| (&src[h.range.clone()], h.capture.as_str()))
-            .collect();
-        assert!(by_text.contains(&("select", "keyword")), "{by_text:?}");
-        assert!(by_text.contains(&("42", "number")), "{by_text:?}");
-        assert!(by_text.contains(&("1.5", "float")), "{by_text:?}");
-        assert!(by_text.contains(&("'x'", "string")), "{by_text:?}");
-        assert!(by_text.contains(&("-- c", "comment")), "{by_text:?}");
-        // One capture per range: no duplicates, no @spell.
+        let hs = t.highlights(&text, 0..text.len_bytes());
+        let by_text: Vec<(&str, HighlightKind)> =
+            hs.iter().map(|h| (&src[h.range.clone()], h.kind)).collect();
+        assert!(
+            by_text.contains(&("select", HighlightKind::Keyword)),
+            "{by_text:?}"
+        );
+        assert!(
+            by_text.contains(&("42", HighlightKind::Number)),
+            "{by_text:?}"
+        );
+        assert!(
+            by_text.contains(&("1.5", HighlightKind::Number)),
+            "{by_text:?}"
+        );
+        assert!(
+            by_text.contains(&("'x'", HighlightKind::String)),
+            "{by_text:?}"
+        );
+        assert!(
+            by_text.contains(&("-- c", HighlightKind::Comment)),
+            "{by_text:?}"
+        );
+        // One highlight per range.
         let mut ranges: Vec<&Range<usize>> = hs.iter().map(|h| &h.range).collect();
         ranges.dedup();
         assert_eq!(ranges.len(), hs.len());
-        assert!(hs.iter().all(|h| h.capture != "spell"));
+        assert!(
+            t.highlights(&text, 0..0).is_empty(),
+            "empty range is empty, not unbounded"
+        );
+        // Every capture the query defines maps to a kind (Other is allowed
+        // but listed here so additions are deliberate).
+        let (q, kinds) = highlight_query();
+        let unmapped: Vec<&str> = q
+            .capture_names()
+            .iter()
+            .zip(kinds)
+            .filter(|(_, k)| **k == HighlightKind::Other)
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(unmapped.is_empty(), "unmapped captures: {unmapped:?}");
     }
 
     #[test]

@@ -5813,6 +5813,7 @@ dependencies = [
  "tempr_events",
  "tempr_services",
  "tempr_ui",
+ "tempr_workspace",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5871,6 +5872,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tree-sitter",
  "tree-sitter-sequel",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -5908,6 +5910,7 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "tempr_domain",
+ "tempr_editor",
  "tempr_events",
  "tempr_services",
  "tokio",

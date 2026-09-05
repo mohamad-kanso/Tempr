@@ -11,7 +11,9 @@ use tempr_db::DatabaseDriver;
 use tempr_db_postgres::PostgresDriver;
 use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode};
 use tempr_events::{EventBus, EventFilter};
-use tempr_services::{ConnectionService, QueryService, SchemaService, ServiceRegistry};
+use tempr_services::{
+    CommandService, ConnectionService, QueryService, SchemaService, ServiceRegistry,
+};
 use tempr_ui::{DevOptions, Services, gpui_compat};
 
 /// Everything the UI needs a handle to. Built before GPUI starts. The
@@ -22,6 +24,7 @@ struct AppServices {
     registry: Arc<ServiceRegistry>,
     connection: Arc<ConnectionService>,
     query: Arc<QueryService>,
+    command: Arc<CommandService>,
     _schema: Arc<SchemaService>,
 }
 
@@ -32,6 +35,7 @@ fn build_services() -> AppServices {
     let connection = ConnectionService::new(bus.clone());
     let query = QueryService::new(bus.clone(), connection.clone());
     let schema = SchemaService::new(bus.clone(), connection.clone());
+    let command = CommandService::new(bus.clone());
 
     let pg_driver = Arc::new(PostgresDriver::new()) as Arc<dyn DatabaseDriver>;
     connection.register_driver(pg_driver);
@@ -39,12 +43,14 @@ fn build_services() -> AppServices {
     registry.register(connection.clone());
     registry.register(query.clone());
     registry.register(schema.clone());
+    registry.register(command.clone());
 
     AppServices {
         bus,
         registry,
         connection,
         query,
+        command,
         _schema: schema,
     }
 }
@@ -97,6 +103,48 @@ fn main() -> Result<()> {
 
     let services = build_services();
     let connection = connection_from_env()?;
+
+    // Keybinding layers: user settings (~/.config/tempr/settings.toml) now;
+    // the workspace layer joins when workspace open lands.
+    // A broken settings file must not prevent the window from opening.
+    let (user_settings, settings_notice) = match tempr_workspace::load_user_settings() {
+        Ok(s) => (s, None),
+        Err(e) => {
+            let path = tempr_workspace::user_settings_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "settings.toml".into());
+            tracing::warn!(error = %e, path, "ignoring user settings; using defaults");
+            (
+                tempr_workspace::UserSettings::default(),
+                Some(format!("{path} ignored: {e}")),
+            )
+        }
+    };
+    services
+        .command
+        .set_keybinding_layers(vec![user_settings.keybindings.clone()]);
+
+    // Keyboard-only audit: print every command with its effective keys.
+    if std::env::var("TEMPR_LIST_COMMANDS").is_ok_and(|v| v == "1") {
+        for spec in tempr_ui::commands::core_commands() {
+            services.command.register(spec.contribution());
+        }
+        println!(
+            "id                                 title                          category     context                pal  keys"
+        );
+        for c in services.command.commands() {
+            println!(
+                "{:<34} {:<30} {:<12} {:<22} {:<4} {}",
+                c.id.to_string(),
+                c.title,
+                c.category,
+                c.context.as_deref().unwrap_or("(global)"),
+                if c.hidden { "-" } else { "yes" },
+                c.keystrokes.join(", ")
+            );
+        }
+        return Ok(());
+    }
     // Developer knobs (see tempr_ui::DevOptions). TEMPR_STARTUP_SQL runs a
     // statement once connected; TEMPR_BENCH_SCROLL=1 then benchmarks grid
     // scrolling, logs the report and exits.
@@ -105,6 +153,7 @@ fn main() -> Result<()> {
             .ok()
             .filter(|s| !s.trim().is_empty()),
         bench_scroll_then_exit: std::env::var("TEMPR_BENCH_SCROLL").is_ok_and(|v| v == "1"),
+        startup_notice: settings_notice,
     };
     if dev.bench_scroll_then_exit && (dev.startup_sql.is_none() || connection.is_none()) {
         anyhow::bail!("TEMPR_BENCH_SCROLL=1 requires TEMPR_STARTUP_SQL and DATABASE_URL");
@@ -115,7 +164,7 @@ fn main() -> Result<()> {
     });
 
     gpui_compat::run_app(move |cx| {
-        tempr_ui::bind_keys(cx);
+        tempr_ui::commands::install(cx, &services.command);
         cx.on_action(|_: &tempr_ui::Quit, cx| cx.quit());
 
         // Stop services (cancel runs, drain pools) when the app quits.
@@ -147,6 +196,7 @@ fn main() -> Result<()> {
             bus: services.bus.clone(),
             connection: services.connection.clone(),
             query: services.query.clone(),
+            command: services.command.clone(),
         };
         if let Err(e) =
             gpui_compat::open_main_window(cx, "Tempr", throttle_inactive, move |window, cx| {

@@ -234,19 +234,30 @@ impl HistoryService {
 
 `CommandService` is the registry of every user action in the system. Every action — executing a query, opening the palette, toggling a panel, refreshing schema — is a `Command` with an `id`, `title`, optional `keybinding`, and a `handler` closure. This is what makes the command palette first-class: the palette is simply a searchable view over the `CommandService`'s registry. Commands are contributed by core code (at startup) and by plugins (via `CommandContribution` during activation), making the palette extensible without modifying its implementation.
 
-**Owned state:** command registry (`CommandId → Command`), keybinding map (`KeyBinding → CommandId`), active palette state (future: fuzzy-match cache).
+**Owned state:** command registry (`CommandId → CommandContribution`), keybinding override layers (lowest → highest; each `command id → keystrokes`). The service holds metadata and configuration only — commands are GPUI actions dispatched by the UI layer (D23).
 
-**Key async methods:**
+**Key methods** *(verified against `crates/tempr_services/src/command.rs`, 2026-09-05)*:
 
 ```rust
+pub struct CommandContribution { pub id: CommandId, pub title: String, pub category: String,
+                                 pub context: Option<String>, pub default_keystrokes: Vec<String> }
+pub struct CommandMeta { /* contribution fields */ pub keystrokes: Vec<String> /* resolved */ }
+pub struct CommandMatch { pub meta: CommandMeta, pub score: i32, pub indices: Vec<usize> }
+pub type KeybindingOverrides = BTreeMap<String, Vec<String>>;
+
 impl CommandService {
-    pub fn register(&self, command: CommandContribution);
-    pub async fn execute(&self, id: CommandId) -> Result<(), CommandError>;
-    pub fn commands(&self) -> Vec<CommandMeta>;
-    pub fn by_keybinding(&self, binding: &KeyBinding) -> Option<CommandId>;
-    pub fn title(&self, id: CommandId) -> &str;
+    pub fn register(&self, contribution: CommandContribution);
+    pub fn unregister(&self, id: &CommandId);
+    pub fn set_keybinding_layers(&self, layers: Vec<KeybindingOverrides>); // [user, workspace]
+    pub fn keystrokes_for(&self, id: &CommandId) -> Vec<String>;
+    pub fn get(&self, id: &CommandId) -> Option<CommandMeta>;
+    pub fn commands(&self) -> Vec<CommandMeta>;            // sorted by category, title
+    pub fn search(&self, query: &str) -> Vec<CommandMatch>; // fuzzy, best first
+    pub fn record_executed(&self, id: CommandId);          // publishes CommandExecuted
 }
 ```
+
+Execution: `tempr_ui::commands::dispatch(id, service, window, cx)` builds the typed GPUI action from the catalog, dispatches it into the window, and calls `record_executed`.
 
 **Events published:** `CommandExecuted { id: CommandId }`.
 
@@ -256,13 +267,16 @@ A `CommandContribution` is the registration record that core code and plugins su
 
 ```rust
 pub struct CommandContribution {
-    pub id: CommandId,
-    pub title: String,
-    pub keybinding: Option<KeyBinding>,
-    pub category: CommandCategory,   // e.g. "Query", "View", "Edit"
-    pub handler: Box<dyn Fn(CommandContext) -> BoxFuture<'static, Result<(), CommandError>> + Send + Sync>,
+    pub id: CommandId,                     // GPUI action name, e.g. "main_window::RunQuery"
+    pub title: String,                     // palette title
+    pub category: String,                  // "Query", "View", "Editor", …
+    pub context: Option<String>,           // GPUI key context predicate, None = global
+    pub default_keystrokes: Vec<String>,   // GPUI syntax; overridable per layer
+    pub hidden: bool,                      // bindable but not offered in palette search
 }
 ```
+
+There is no handler closure: a command *is* a GPUI action type, dispatched by the UI (D23). Core commands come from the typed catalog `tempr_ui::commands::core_commands()`; plugin commands will register the same record (their action shape is an open TODO).
 
 Commands contributed by plugins are namespaced (`plugin_id::command_id`) to prevent collisions and are unregistered on plugin deactivation.
 

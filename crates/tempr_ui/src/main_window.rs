@@ -1,6 +1,6 @@
 //! Root view of the application window.
 //!
-//! Layout: SQL `Input` (top) · `ResultGrid` (middle) · status bar (bottom).
+//! Layout: SQL `EditorView` (top) · `ResultGrid` (middle) · status bar (bottom) · `Palette` overlay.
 //! Holds service handles + render state only (D6). Query execution happens
 //! in `QueryService` on the tokio runtime; rows and bus events reach this
 //! view through channels drained on the foreground executor.
@@ -11,16 +11,17 @@ use std::time::Instant;
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render, Subscription,
-    Window, actions, div, prelude::*, px, rgb,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Subscription, Window,
+    actions, div, prelude::*, px, rgb,
 };
 use tempr_domain::{
     Batch, ColumnSpec, Connection, ConnectionId, ConnectionState, QueryOutcome, QueryRunId,
 };
 use tempr_events::EventBus;
-use tempr_services::{ConnectionService, QueryService, RowSink, ServiceError};
+use tempr_services::{CommandService, ConnectionService, QueryService, RowSink, ServiceError};
 
-use crate::components::{Input, InputEvent, ResultGrid};
+use crate::commands;
+use crate::components::{EditorEvent, EditorView, Palette, PaletteEvent, ResultGrid};
 use crate::events::{self, UiEvent};
 use crate::gpui_compat;
 use crate::scroll_bench::ScrollBench;
@@ -28,27 +29,22 @@ use crate::theme;
 
 actions!(
     main_window,
-    [RunQuery, CancelQuery, DebugScrollBenchmark, Quit]
+    [
+        RunQuery,
+        CancelQuery,
+        DebugScrollBenchmark,
+        TogglePalette,
+        Quit
+    ]
 );
 
 pub const KEY_CONTEXT: &str = "MainWindow";
+/// Binding context for main-window commands: active only while no overlay
+/// (anything adding `palette::MODAL_CONTEXT` to its key context) is open.
+pub const KEY_CONTEXT_NOT_PALETTE: &str = "MainWindow && !Modal";
 
 /// How many frames the scroll benchmark spreads the row sweep over.
 const BENCH_TARGET_FRAMES: usize = 600;
-
-/// Register global + main-window keybindings. Call once at startup.
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("ctrl-enter", RunQuery, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-enter", RunQuery, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", CancelQuery, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-shift-b", DebugScrollBenchmark, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-shift-b", DebugScrollBenchmark, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-q", Quit, None),
-        KeyBinding::new("cmd-q", Quit, None),
-    ]);
-    crate::components::input::bind_keys(cx);
-}
 
 /// Messages from the tokio-side [`RowSink`] to the grid.
 enum GridMsg {
@@ -77,6 +73,9 @@ pub struct DevOptions {
     /// report, and quit. Any failure on the way also quits (non-zero log
     /// line), so a headless run never hangs.
     pub bench_scroll_then_exit: bool,
+    /// Something the binary wants shown in the status bar at startup (e.g.
+    /// "settings.toml ignored: …").
+    pub startup_notice: Option<String>,
 }
 
 /// Service handles the window needs. Built by the binary before GPUI starts.
@@ -84,6 +83,7 @@ pub struct Services {
     pub bus: Arc<EventBus>,
     pub connection: Arc<ConnectionService>,
     pub query: Arc<QueryService>,
+    pub command: Arc<CommandService>,
 }
 
 /// Outcome of the tokio-side query task, as seen by the view.
@@ -94,8 +94,9 @@ pub struct MainWindow {
     /// Connection to use for queries; `None` when no `DATABASE_URL` was given.
     connection: Option<Connection>,
     connection_state: ConnectionState,
-    input: Entity<Input>,
+    editor: Entity<EditorView>,
     grid: Entity<ResultGrid>,
+    palette: Entity<Palette>,
     status: String,
     status_is_error: bool,
     /// The run in flight, allocated by the view before the task starts so
@@ -105,7 +106,8 @@ pub struct MainWindow {
     dev: DevOptions,
     bench: Option<ScrollBench>,
     focus_handle: FocusHandle,
-    _input_subscription: Subscription,
+    _editor_subscription: Subscription,
+    _palette_subscription: Subscription,
     _bus_subscription: tempr_events::Subscription,
 }
 
@@ -117,15 +119,31 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| Input::new("SELECT … — Enter runs the statement", cx));
+        let editor = cx.new(|cx| EditorView::new("", cx));
         let grid = cx.new(|_| ResultGrid::new());
+        let command_service = services.command.clone();
+        let palette = cx.new(|cx| Palette::new(command_service, window, cx));
 
-        let _input_subscription =
-            cx.subscribe_in(&input, window, |this, _input, event, window, cx| {
-                if let InputEvent::Submit(sql) = event {
-                    this.run_sql(sql.clone(), window, cx);
+        // The palette restores the previous focus itself before emitting.
+        let _palette_subscription =
+            cx.subscribe_in(&palette, window, |this, _palette, event, window, cx| {
+                if let PaletteEvent::Execute(id) = event
+                    && !commands::dispatch(id, &this.services.command, window, cx)
+                {
+                    this.set_status(format!("Command {id} is not available here"), true, cx);
                 }
+                cx.notify();
             });
+
+        let _editor_subscription = cx.subscribe_in(
+            &editor,
+            window,
+            |this, _editor, event, window, cx| match event {
+                EditorEvent::Run(sql) => this.run_sql(sql.clone(), window, cx),
+                EditorEvent::Notice(text) => this.set_status(text.clone(), true, cx),
+                EditorEvent::Changed => {}
+            },
+        );
 
         // Bus → UI: drain the bridge channel on the foreground executor.
         let (_bus_subscription, mut rx) = events::bridge(&services.bus);
@@ -141,7 +159,7 @@ impl MainWindow {
         })
         .detach();
 
-        window.focus(&input.focus_handle(cx), cx);
+        window.focus(&editor.focus_handle(cx), cx);
 
         let status = match &connection {
             Some(c) => format!(
@@ -154,22 +172,28 @@ impl MainWindow {
             }
         };
 
+        let startup_notice = dev.startup_notice.clone();
         let mut this = Self {
             services,
             connection,
             connection_state: ConnectionState::Disconnected,
-            input,
+            editor,
             grid,
+            palette,
             status,
             status_is_error: false,
             current_run: None,
             dev,
             bench: None,
             focus_handle: cx.focus_handle(),
-            _input_subscription,
+            _editor_subscription,
+            _palette_subscription,
             _bus_subscription,
         };
         this.connect(window, cx);
+        if let Some(notice) = startup_notice {
+            this.set_status(notice, true, cx);
+        }
         this
     }
 
@@ -219,9 +243,11 @@ impl MainWindow {
 
     // ── actions ──────────────────────────────────────────────────────────
 
-    fn run_query_action(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
-        let sql = self.input.read(cx).text().to_string();
-        self.run_sql(sql, window, cx);
+    /// Run the statement under the editor's cursor (or its selection); the
+    /// editor emits `EditorEvent::Run`, handled above.
+    fn run_query_action(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| editor.run_statement_under_cursor(cx));
     }
 
     fn cancel_query_action(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
@@ -246,6 +272,22 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.start_bench(window, cx);
+    }
+
+    fn toggle_palette_action(
+        &mut self,
+        _: &TogglePalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open = self.palette.read(cx).is_open();
+        self.palette.update(cx, |p, cx| {
+            if open {
+                p.close(window, cx)
+            } else {
+                p.open(window, cx)
+            }
+        });
     }
 
     // ── query lifecycle ──────────────────────────────────────────────────
@@ -391,8 +433,8 @@ impl MainWindow {
                 if state == ConnectionState::Connected
                     && let Some(sql) = self.dev.startup_sql.take()
                 {
-                    self.input
-                        .update(cx, |input, cx| input.set_text(sql.clone(), cx));
+                    self.editor
+                        .update(cx, |editor, cx| editor.set_text(&sql, cx));
                     self.run_sql(sql, window, cx);
                 }
             }
@@ -497,6 +539,8 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::run_query_action))
             .on_action(cx.listener(Self::cancel_query_action))
             .on_action(cx.listener(Self::bench_action))
+            .on_action(cx.listener(Self::toggle_palette_action))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -513,9 +557,23 @@ impl Render for MainWindow {
                     .border_b_1()
                     .border_color(rgb(theme::BORDER))
                     .child(div().text_color(rgb(theme::ACCENT)).child("SQL"))
-                    .child(div().flex_1().child(self.input.clone())),
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_size(px(12.))
+                            .child("ctrl-enter runs the statement under the cursor · ctrl-shift-enter runs all · ctrl-shift-p commands"),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(260.))
+                    .border_b_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(self.editor.clone()),
             )
             .child(div().flex_1().min_h_0().child(self.grid.clone()))
+            .child(self.palette.clone())
             .child(
                 div()
                     .flex()

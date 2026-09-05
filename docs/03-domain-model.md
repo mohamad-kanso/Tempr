@@ -156,6 +156,14 @@ pub struct SqlFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SqlFileId(pub Uuid);
 
+// ── Command ──────────────────────────────────────────────────
+
+/// Identifier of a user action — the GPUI action name (`main_window::RunQuery`,
+/// `plugin_id::command`). Stable across sessions; the key in keybinding
+/// configuration (D23). Not a UUID: it must be human-writable in TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CommandId(pub String);
+
 // ── Query ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
