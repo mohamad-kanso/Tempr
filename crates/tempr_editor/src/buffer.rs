@@ -20,6 +20,7 @@ use tempr_domain::SqlFileId;
 use thiserror::Error;
 use tree_sitter::{InputEdit, Point as TsPoint};
 
+use crate::selection::Selection;
 use crate::syntax::{Highlight, StatementRange, SyntaxTree};
 
 /// Identifier of one applied edit transaction; monotonically increasing per
@@ -75,6 +76,16 @@ struct Transaction {
     id: EditId,
     /// In application order (start descending; see `edit` for tie-breaks).
     changes: Vec<Change>,
+    /// Cursor state around the transaction, when the caller supplied it
+    /// (`edit_with_selections`); restored by `undo_with_selections` /
+    /// `redo_with_selections`.
+    selections: Option<SelectionSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionSnapshot {
+    before: Vec<Selection>,
+    after: Vec<Selection>,
 }
 
 #[derive(Debug, Default)]
@@ -210,6 +221,31 @@ impl Buffer {
     /// (empty batch, or every replacement equals what it replaces); a real
     /// change records one undo transaction and clears the redo stack.
     pub fn edit(&mut self, edits: &[(Range<usize>, &str)]) -> Result<Option<EditId>, EditError> {
+        self.edit_inner(edits, None)
+    }
+
+    /// Like `edit`, additionally remembering the selections before and
+    /// after the transaction so undo/redo can restore the cursors.
+    pub fn edit_with_selections(
+        &mut self,
+        edits: &[(Range<usize>, &str)],
+        before: &[Selection],
+        after: &[Selection],
+    ) -> Result<Option<EditId>, EditError> {
+        self.edit_inner(
+            edits,
+            Some(SelectionSnapshot {
+                before: before.to_vec(),
+                after: after.to_vec(),
+            }),
+        )
+    }
+
+    fn edit_inner(
+        &mut self,
+        edits: &[(Range<usize>, &str)],
+        selections: Option<SelectionSnapshot>,
+    ) -> Result<Option<EditId>, EditError> {
         // Validate everything before touching the rope.
         for (range, _) in edits {
             self.char_range(range)?;
@@ -262,9 +298,37 @@ impl Buffer {
 
         let id = EditId(self.next_edit);
         self.next_edit += 1;
-        self.history.undo.push(Transaction { id, changes });
+        self.history.undo.push(Transaction {
+            id,
+            changes,
+            selections,
+        });
         self.history.redo.clear();
         Ok(Some(id))
+    }
+
+    /// `undo`, also returning the selections that were active *before* the
+    /// reverted transaction (if it recorded them).
+    pub fn undo_with_selections(&mut self) -> Option<(EditId, Option<Vec<Selection>>)> {
+        let id = self.undo()?;
+        let sel = self
+            .history
+            .redo
+            .last()
+            .and_then(|tx| tx.selections.as_ref().map(|s| s.before.clone()));
+        Some((id, sel))
+    }
+
+    /// `redo`, also returning the selections that were active *after* the
+    /// re-applied transaction (if it recorded them).
+    pub fn redo_with_selections(&mut self) -> Option<(EditId, Option<Vec<Selection>>)> {
+        let id = self.redo()?;
+        let sel = self
+            .history
+            .undo
+            .last()
+            .and_then(|tx| tx.selections.as_ref().map(|s| s.after.clone()));
+        Some((id, sel))
     }
 
     /// Revert the most recent transaction. Returns its id.

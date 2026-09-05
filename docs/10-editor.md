@@ -158,6 +158,8 @@ impl SyntaxTree {
 }
 ```
 
+**Implementation notes (2026-09-05):** the editing model behind `EditorView` lives in `tempr_editor` and is UI-free — `Selection { anchor, head }` (byte offsets; `selection::normalize` sorts and merges overlaps), motions on `Buffer` (`next/prev_grapheme_boundary`, `next/prev_word_boundary`, `line_start/line_end`, `move_vertically(offset, delta, goal_column)`), and cursor-based edit ops (`insert_at`, `backspace`, `delete_forward`, `selected_text`, `delete_lines`, `duplicate_lines`, `move_lines`) that each apply one atomic `Buffer::edit` batch and return the resulting selections (`EditOutcome`). `edit_with_selections` records the cursors around a transaction so `undo_with_selections`/`redo_with_selections` restore them. Clipboard access stays in the view.
+
 **Implementation notes (2026-09-03, D22):** `tempr_editor::SyntaxTree` — `parse(&Rope)`, `edit(&InputEdit)`, `reparse(&Rope)` (reads rope chunks, no copy), `root_node()`, `has_error()`, `statement_ranges()` / `statement_at(offset)` (the statement detector: `statement`/`transaction`/`block` children of `program` with a following `;` folded in, `ERROR` recovery fragments returned with `StatementKind::Error` so executors can refuse them, comments and stray `;` skipped, `$$` bodies and strings opaque; a `BEGIN … END` block is one range — inner-statement execution is a TODO), `highlights(query, text, range)` with the bundled `highlights.scm` via `SyntaxTree::highlight_query()`. Grammar: `tree-sitter-sequel`.
 
 ### EditorView

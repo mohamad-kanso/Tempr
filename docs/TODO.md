@@ -31,6 +31,8 @@
 - [ ] Palette: highlight matched characters (`CommandMatch::indices`) in titles; show "no keybinding" hint; remember last query per session
 - [ ] Apply the workspace keybinding layer (`WorkspaceManifest::keybindings`) when workspace open lands (`CommandService::set_keybinding_layers([user, workspace])`); rebind live on settings change (`cx.clear_key_bindings()` + `commands::install`)
 - [ ] Plugin commands need a GPUI action shape (a generic `PluginCommand { id }` action or per-plugin `actions!`) before `CommandContribution` from 08-plugin-api can register through `CommandService`
+- [ ] `EditorView` (multi-line, `tempr_ui`): render visible lines from `Buffer` with `highlights`, gutter line numbers, cursors/selections; keyboard editing through the command catalog (motions, edit ops, undo/redo, clipboard); replaces the single-line `Input` for SQL; then "execute statement under cursor" (`Buffer::statement_at` → `QueryService`), refusing `StatementKind::Error`
+- [ ] Editing ops follow-ups: indent/outdent, join lines, transpose, select word/line, add cursor above/below, word motions across line breaks for `prev_word_boundary` when the previous line is empty
 - [ ] `EditHistory` bounds: cap depth and coalesce typing bursts (today every keystroke stores its removed/inserted text forever; a select-all + paste on a 10 MB file retains full copies)
 - [ ] Phase 2: Tree-sitter PostgreSQL grammar integration + incremental parse
 - [ ] Phase 2: Statement boundary detector ($$ delimiters, comments, string literals)
