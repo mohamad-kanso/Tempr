@@ -41,6 +41,7 @@
 | D19 | 2026-09-03 | Connection pooling = `deadpool` (core, `managed`) over `Box<dyn DriverConnection>` in `ConnectionService`; user pool (max 8) + dedicated 1-slot metadata pool; `deadpool-postgres` dropped | Claude (Phase 1) |
 | D20 | 2026-09-03 | PostgreSQL TLS via rustls (`tokio-postgres-rustls`, `ring` provider, platform roots from `rustls-native-certs`); `TlsMode` on `Connection` with libpq `sslmode` semantics, default `prefer`; `verify-ca` treated as `verify-full` | Claude (Phase 1) |
 | D21 | 2026-09-03 | Editor buffer = `ropey` 1.x rope in new `tempr_editor` crate; public API is byte-offset based (ropey char indices never leak); `edit` is a validated, atomic batch returning `Result`; `Buffer` is a pure model (no event bus) | Claude (Phase 2) |
+| D22 | 2026-09-03 | SQL grammar = `tree-sitter-sequel` (DerekStride, MIT) on `tree-sitter` 0.25; `Buffer` records `InputEdit`s eagerly but re-parses **lazily** on read, so `edit` stays sub-ms on any document size | Claude (Phase 2) |
 
 ---
 
@@ -262,4 +263,20 @@
 **Why**: tree-sitter, `StatementRange`, `str` slicing and the result grid all speak bytes; leaking ropey's char indices would force every caller to convert and invite off-by-one bugs at multibyte characters. A `Result` on `edit` turns caller bugs into errors instead of panics inside a GPUI frame. Keeping the buffer free of the bus keeps it trivially testable and lets one buffer be driven from tests, services, or views alike. `ropey` over `sum_tree`: battle-tested standalone crate with a `str`-chunk API that feeds tree-sitter directly, versus coupling to Zed's internal structures.
 
 **Consequences**: Measured on this machine (release, 10 MB buffer, 200 mid-document insert+delete pairs): **avg 1.73 µs, worst 12.1 µs** — the 1 ms criterion holds with three orders of magnitude to spare. `EditHistory` is unbounded for now (cap/coalescing tracked in TODO). Syntax tree and statement detection attach to `Buffer` in the next tasks; tree-sitter edits will be fed from the same recorded `Change`s.
+
+---
+
+## D22 — tree-sitter grammar and lazy incremental reparse (2026-09-03)
+
+**By**: Claude (Phase 2, box 2 of the checklist).
+**Decision**:
+1. The SQL grammar is **`tree-sitter-sequel`** 0.3 (DerekStride's `tree-sitter-sql`, MIT; PostgreSQL-flavoured with dollar quoting, `create function` bodies, `explain`, DDL/DML), consumed through the stable `tree-sitter-language` ABI shim; the runtime is **`tree-sitter` 0.25** (the grammar's own dev-dependency line; grammar ABI 14). The alternative `tree-sitter-sql` crate (m-novikov, 0.0.2) is stale.
+2. `tempr_editor::SyntaxTree` wraps parser + tree; `Buffer` owns one. Every rope change also calls `tree.edit(InputEdit)` (O(1) bookkeeping, byte + row/column positions computed from the rope) and marks the tree dirty; the **parse runs lazily** on the next read (`syntax()`, `statement_at`, `statement_ranges`, `highlights`) or an explicit `reparse()`. Parsing reads the rope's chunks directly (`parse_with_options`), never a full-text copy.
+3. Statement boundaries come from the tree: each `statement`/`transaction`/`block` child of `program` (positively matched by kind), with a directly following `;` folded in; `ERROR` recovery nodes are returned as `StatementKind::Error` so an executor can refuse them; comments and stray `;` are skipped; dollar-quoted bodies and string literals are opaque to the boundary. A block or transaction is one range (inner-statement execution is a TODO). This is the statement detector — no separate hand-written scanner.
+4. Syntax highlighting uses Tempr's own `queries/highlights.scm`, derived from the grammar's bundled query with the Lua `%d` classes replaced by `[0-9]` (the Rust binding evaluates `#match?` with the `regex` crate, so the original never matched numbers) and `@spell` dropped; for one node range the last matching pattern wins.
+5. `Buffer::new` does not parse; the first tree read performs the full parse, later reads re-parse incrementally.
+
+**Why**: Measured in release on a 10 MB buffer: full parse 2.0–2.7 s; incremental reparse after a one-line edit **1.6 ms** for realistic statement sizes but **~150 ms** for a dump of 180k one-line statements (tree-sitter re-walks the flat sibling list). Running the parse inside `edit` would have turned the rope's 6 µs edit into hundreds of milliseconds on such files and violated the Phase 2 "< 1 ms insert/delete" criterion; deferring it keeps typing cheap and lets the owner decide when (and later, on which thread) to parse. tree-sitter itself is the settled choice (10-editor, ADR-0003); the grammar was picked for PostgreSQL coverage, maintenance, and license.
+
+**Consequences**: Tree readers take `&mut Buffer` (they may parse). A background/incremental-by-viewport parse strategy for pathological dumps is a TODO; so is `SyntaxTree` sharing with the semantic engine (tree-sitter `Tree` is a cheap ref-counted clone). Grammar and runtime versions are bumped together. `cc` compiles the generated `parser.c` at build time — accepted as part of the tree-sitter choice (the parser is generated, not hand-written C), consistent with D2's intent.
 

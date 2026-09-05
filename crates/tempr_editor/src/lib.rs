@@ -8,5 +8,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod buffer;
+pub mod syntax;
 
 pub use buffer::{Buffer, EditError, EditId, Point};
+pub use syntax::{Highlight, StatementKind, StatementRange, SyntaxTree};

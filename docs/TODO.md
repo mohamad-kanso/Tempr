@@ -26,6 +26,8 @@
 
 ## Later
 
+- [ ] Parse strategy for pathological files: a 10 MB dump of ~180k one-line statements re-parses in ~150 ms (tree-sitter re-walks the flat `program` sibling list); options — parse on a background thread from a `Tree` clone, or viewport-scoped `set_included_ranges`; realistic files (2.5k statements) are at 1.6 ms already
+- [ ] Inner-statement execution inside `BEGIN … END` blocks / transactions: `StatementRange` reports the whole block as one range (kind `Block`/`Transaction`); descend into children when the cursor is inside
 - [ ] `EditHistory` bounds: cap depth and coalesce typing bursts (today every keystroke stores its removed/inserted text forever; a select-all + paste on a 10 MB file retains full copies)
 - [ ] Phase 2: Tree-sitter PostgreSQL grammar integration + incremental parse
 - [ ] Phase 2: Statement boundary detector ($$ delimiters, comments, string literals)

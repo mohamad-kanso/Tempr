@@ -8,8 +8,10 @@ description       = "Buffer, rope data structures, syntax (docs/10-editor.md)"
 [dependencies]
 tempr_domain.workspace = true
 
-ropey.workspace     = true
-thiserror.workspace = true
+ropey.workspace              = true
+thiserror.workspace          = true
+tree-sitter.workspace        = true
+tree-sitter-sequel.workspace = true
 
 [lints]
 workspace = true

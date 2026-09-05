@@ -116,4 +116,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 (Editor) — in progress (rope buffer 2026-09-03).
+Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 (Editor) — in progress (rope buffer + tree-sitter syntax tree 2026-09-03).
