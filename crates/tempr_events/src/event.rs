@@ -1,7 +1,7 @@
 use std::any::Any;
 use tempr_domain::{
-    ConnectionId, ConnectionState, PluginId, QueryOutcome, QueryRunId, SchemaSnapshotId, SqlFileId,
-    WorkspaceId,
+    CommandId, ConnectionId, ConnectionState, PluginId, QueryOutcome, QueryRunId, SchemaSnapshotId,
+    SqlFileId, WorkspaceId,
 };
 
 /// Opaque plugin payload — carries arbitrary data across the event bus.
@@ -65,6 +65,11 @@ pub enum AppEvent {
         file: SqlFileId,
     },
 
+    // Commands
+    CommandExecuted {
+        id: CommandId,
+    },
+
     // Plugin-authored events — namespaced by plugin_id
     PluginEvent {
         plugin_id: PluginId,
@@ -86,6 +91,7 @@ pub enum AppEventKind {
     SchemaRefreshed,
     BufferChanged,
     BufferSaved,
+    CommandExecuted,
     PluginEvent,
 }
 
@@ -103,6 +109,7 @@ impl AppEvent {
             AppEvent::SchemaRefreshed { .. } => AppEventKind::SchemaRefreshed,
             AppEvent::BufferChanged { .. } => AppEventKind::BufferChanged,
             AppEvent::BufferSaved { .. } => AppEventKind::BufferSaved,
+            AppEvent::CommandExecuted { .. } => AppEventKind::CommandExecuted,
             AppEvent::PluginEvent { .. } => AppEventKind::PluginEvent,
         }
     }

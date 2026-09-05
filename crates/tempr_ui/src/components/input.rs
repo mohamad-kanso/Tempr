@@ -9,8 +9,8 @@ use std::ops::Range;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
     fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
@@ -39,32 +39,6 @@ actions!(
 
 /// Key context used for `Input` bindings (`key_context("Input")`).
 pub const KEY_CONTEXT: &str = "Input";
-
-/// Register the default keybindings for every `Input`. Call once at startup.
-pub fn bind_keys(cx: &mut App) {
-    let c = Some(KEY_CONTEXT);
-    cx.bind_keys([
-        KeyBinding::new("backspace", Backspace, c),
-        KeyBinding::new("delete", Delete, c),
-        KeyBinding::new("left", Left, c),
-        KeyBinding::new("right", Right, c),
-        KeyBinding::new("shift-left", SelectLeft, c),
-        KeyBinding::new("shift-right", SelectRight, c),
-        KeyBinding::new("home", Home, c),
-        KeyBinding::new("end", End, c),
-        KeyBinding::new("enter", Submit, c),
-        // Linux/Windows
-        KeyBinding::new("ctrl-a", SelectAll, c),
-        KeyBinding::new("ctrl-v", Paste, c),
-        KeyBinding::new("ctrl-c", Copy, c),
-        KeyBinding::new("ctrl-x", Cut, c),
-        // macOS
-        KeyBinding::new("cmd-a", SelectAll, c),
-        KeyBinding::new("cmd-v", Paste, c),
-        KeyBinding::new("cmd-c", Copy, c),
-        KeyBinding::new("cmd-x", Cut, c),
-    ]);
-}
 
 /// Events emitted to the parent view.
 #[derive(Debug, Clone, PartialEq, Eq)]

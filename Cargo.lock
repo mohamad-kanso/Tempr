@@ -5813,6 +5813,7 @@ dependencies = [
  "tempr_events",
  "tempr_services",
  "tempr_ui",
+ "tempr_workspace",
  "tokio",
  "tracing",
  "tracing-subscriber",

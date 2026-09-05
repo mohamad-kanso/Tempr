@@ -11,16 +11,17 @@ use std::time::Instant;
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render, Subscription,
-    Window, actions, div, prelude::*, px, rgb,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Subscription, Window,
+    actions, div, prelude::*, px, rgb,
 };
 use tempr_domain::{
     Batch, ColumnSpec, Connection, ConnectionId, ConnectionState, QueryOutcome, QueryRunId,
 };
 use tempr_events::EventBus;
-use tempr_services::{ConnectionService, QueryService, RowSink, ServiceError};
+use tempr_services::{CommandService, ConnectionService, QueryService, RowSink, ServiceError};
 
-use crate::components::{Input, InputEvent, ResultGrid};
+use crate::commands;
+use crate::components::{Input, InputEvent, Palette, PaletteEvent, ResultGrid};
 use crate::events::{self, UiEvent};
 use crate::gpui_compat;
 use crate::scroll_bench::ScrollBench;
@@ -28,27 +29,19 @@ use crate::theme;
 
 actions!(
     main_window,
-    [RunQuery, CancelQuery, DebugScrollBenchmark, Quit]
+    [
+        RunQuery,
+        CancelQuery,
+        DebugScrollBenchmark,
+        TogglePalette,
+        Quit
+    ]
 );
 
 pub const KEY_CONTEXT: &str = "MainWindow";
 
 /// How many frames the scroll benchmark spreads the row sweep over.
 const BENCH_TARGET_FRAMES: usize = 600;
-
-/// Register global + main-window keybindings. Call once at startup.
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("ctrl-enter", RunQuery, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-enter", RunQuery, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", CancelQuery, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-shift-b", DebugScrollBenchmark, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-shift-b", DebugScrollBenchmark, Some(KEY_CONTEXT)),
-        KeyBinding::new("ctrl-q", Quit, None),
-        KeyBinding::new("cmd-q", Quit, None),
-    ]);
-    crate::components::input::bind_keys(cx);
-}
 
 /// Messages from the tokio-side [`RowSink`] to the grid.
 enum GridMsg {
@@ -84,6 +77,7 @@ pub struct Services {
     pub bus: Arc<EventBus>,
     pub connection: Arc<ConnectionService>,
     pub query: Arc<QueryService>,
+    pub command: Arc<CommandService>,
 }
 
 /// Outcome of the tokio-side query task, as seen by the view.
@@ -96,6 +90,7 @@ pub struct MainWindow {
     connection_state: ConnectionState,
     input: Entity<Input>,
     grid: Entity<ResultGrid>,
+    palette: Entity<Palette>,
     status: String,
     status_is_error: bool,
     /// The run in flight, allocated by the view before the task starts so
@@ -106,6 +101,7 @@ pub struct MainWindow {
     bench: Option<ScrollBench>,
     focus_handle: FocusHandle,
     _input_subscription: Subscription,
+    _palette_subscription: Subscription,
     _bus_subscription: tempr_events::Subscription,
 }
 
@@ -119,6 +115,25 @@ impl MainWindow {
     ) -> Self {
         let input = cx.new(|cx| Input::new("SELECT … — Enter runs the statement", cx));
         let grid = cx.new(|_| ResultGrid::new());
+        let command_service = services.command.clone();
+        let palette = cx.new(|cx| Palette::new(command_service, cx));
+
+        let _palette_subscription =
+            cx.subscribe_in(&palette, window, |this, _palette, event, window, cx| {
+                match event {
+                    PaletteEvent::Execute(id) => {
+                        let id = id.clone();
+                        window.focus(&this.input.focus_handle(cx), cx);
+                        if !commands::dispatch(&id, &this.services.command, window, cx) {
+                            this.set_status(format!("Unknown command {id}"), true, cx);
+                        }
+                    }
+                    PaletteEvent::Dismissed => {
+                        window.focus(&this.input.focus_handle(cx), cx);
+                    }
+                }
+                cx.notify();
+            });
 
         let _input_subscription =
             cx.subscribe_in(&input, window, |this, _input, event, window, cx| {
@@ -160,6 +175,7 @@ impl MainWindow {
             connection_state: ConnectionState::Disconnected,
             input,
             grid,
+            palette,
             status,
             status_is_error: false,
             current_run: None,
@@ -167,6 +183,7 @@ impl MainWindow {
             bench: None,
             focus_handle: cx.focus_handle(),
             _input_subscription,
+            _palette_subscription,
             _bus_subscription,
         };
         this.connect(window, cx);
@@ -246,6 +263,21 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.start_bench(window, cx);
+    }
+
+    fn toggle_palette_action(
+        &mut self,
+        _: &TogglePalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open = self.palette.read(cx).is_open();
+        if open {
+            self.palette.update(cx, |p, cx| p.close(cx));
+            window.focus(&self.input.focus_handle(cx), cx);
+        } else {
+            self.palette.update(cx, |p, cx| p.open(window, cx));
+        }
     }
 
     // ── query lifecycle ──────────────────────────────────────────────────
@@ -497,6 +529,8 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::run_query_action))
             .on_action(cx.listener(Self::cancel_query_action))
             .on_action(cx.listener(Self::bench_action))
+            .on_action(cx.listener(Self::toggle_palette_action))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -516,6 +550,7 @@ impl Render for MainWindow {
                     .child(div().flex_1().child(self.input.clone())),
             )
             .child(div().flex_1().min_h_0().child(self.grid.clone()))
+            .child(self.palette.clone())
             .child(
                 div()
                     .flex()

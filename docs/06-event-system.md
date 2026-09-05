@@ -84,6 +84,9 @@ pub enum AppEvent {
     BufferChanged { file: SqlFileId },
     BufferSaved { file: SqlFileId },
 
+    // Commands
+    CommandExecuted { id: CommandId },
+
     // Plugin system
     PluginEvent { plugin_id: PluginId, payload: Box<dyn Any + Send> },
 

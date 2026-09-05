@@ -10,6 +10,10 @@ pub struct WorkspaceManifest {
     pub workspace: WorkspaceInfo,
     #[serde(default)]
     pub connections: Vec<ConnectionConfig>,
+    /// Workspace-level keybinding overrides (`command id → keystrokes`);
+    /// the highest settings layer (docs/04-workspace.md → Settings layering).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub keybindings: crate::settings::KeybindingMap,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +48,7 @@ impl WorkspaceManifest {
                 format_version: CURRENT_FORMAT_VERSION,
             },
             connections: vec![],
+            keybindings: Default::default(),
         }
     }
 }
@@ -100,5 +105,23 @@ format_version = 1
 "#;
         let result: Result<WorkspaceManifest, _> = toml::from_str(bad);
         assert!(result.is_err(), "missing required field must error");
+    }
+
+    #[test]
+    fn manifest_keybindings_roundtrip_and_default() {
+        let mut manifest = WorkspaceManifest::new("kb");
+        manifest
+            .keybindings
+            .insert("main_window::RunQuery".into(), vec!["f5".into()]);
+        let toml_str = toml::to_string(&manifest).expect("serialize");
+        assert!(toml_str.contains("[keybindings]"));
+        let back: WorkspaceManifest = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(back.keybindings["main_window::RunQuery"], vec!["f5"]);
+        let old: WorkspaceManifest =
+            toml::from_str("[workspace]\nname = \"x\"\nformat_version = 1\n").unwrap();
+        assert!(
+            old.keybindings.is_empty(),
+            "older manifests default to no overrides"
+        );
     }
 }

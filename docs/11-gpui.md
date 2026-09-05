@@ -74,12 +74,43 @@ A community alternative exists — **`gpui-component`** (longbridge/gpui-compone
 | **Input** | Single-line text field with selection, clipboard, undo. Auto-resizes to content when used in palettes. Emits `on_change` and `on_submit` callbacks. **Status (2026-09-03):** `tempr_ui::components::Input` — selection, clipboard, IME/marked text, grapheme-aware cursor; emits `InputEvent::{Changed, Submit}`; keybindings via `input::bind_keys` (context `Input`). Undo and auto-resize are TODO. |
 | **List** | Virtualized scrollable list, wrapping `uniform_list` (fixed row height) or `list` + `ListState` when rows vary. Only renders visible rows. Supports multi-select and keyboard navigation (↑/↓/Home/End/PageUp/PageDown). Used for palette results, sidebar items. |
 | **Table** | Virtualized, columnar grid built on `uniform_list` for rows plus Tempr's own column virtualization. Shared with the result grid (§6 data flow). Columns are resizable. Cells support copy-on-select. Keyboard navigable in a 2D grid pattern. **Status (2026-09-03):** Phase 1 `tempr_ui::components::ResultGrid` — `uniform_list` row virtualization, fixed 180 px columns, horizontal scroll, `∅` for NULL, rows appended per `Batch`. Column virtualization/resize, copy, 2D keyboard nav, and the columnar `RowStore` are TODO. |
-| **Palette** | Modal overlay combining `Input` + `List`. Fuzzy-search over a command or file list. Activated via a global keybinding. Returns selection to the caller. |
+| **Palette** | Modal overlay combining `Input` + `List`. Fuzzy-search over a command or file list. Activated via a global keybinding. Returns selection to the caller. **Status (2026-09-05):** `tempr_ui::components::Palette` — `Input` + `uniform_list` over `CommandService::search`; ctrl-shift-p toggles, ↑/↓ (ctrl-p/ctrl-n) select, enter emits `PaletteEvent::Execute(id)`, escape dismisses; `MainWindow` dispatches. Per-character match highlighting is TODO. |
 | **Dock/Panel** | Resizable sidebar/bottom panel container. Panels can be collapsed, floated, or docked to any edge. State is persisted to workspace config (§8). |
 | **Tabs** | Horizontal tab bar. Each tab has a label, optional dirty indicator, and close button. Tabs are reorderable via drag. Keyboard navigable (Ctrl+Tab, Ctrl+Shift+Tab). |
 | **StatusBar** | Bottom bar rendered as a fixed-height `Div`. Displays connection status, active database, line/column, and mode indicator. Right-aligned actions are `Button` components. |
 | **Tooltip** | Hover-triggered overlay. Attached to any component via a wrapper. Delay is configurable. Dismissed on mouse-leave or Escape. |
 | **ContextMenu** | Right-click or Shift+F10 overlay menu. Positioned at cursor. Items can be nested (submenus). Each item maps to a Command. Dismissed on outside-click or Escape. |
+
+### Command Catalog
+
+Every user action is a GPUI action listed once in `tempr_ui::commands::core_commands()` (D23). A unit test fails the build if a command has no default keystroke — this table *is* the keyboard-only audit. Regenerate with `TEMPR_LIST_COMMANDS=1 cargo run` (effective keys after user/workspace overrides):
+
+```
+id                                 title                        category     context     keys
+main_window::Quit                  Quit                         Application  (global)    ctrl-q, cmd-q
+input::Backspace                   Edit: Backspace              Edit         Input       backspace
+input::Copy                        Edit: Copy                   Edit         Input       ctrl-c, cmd-c
+input::Cut                         Edit: Cut                    Edit         Input       ctrl-x, cmd-x
+input::Delete                      Edit: Delete                 Edit         Input       delete
+input::End                         Edit: Line End               Edit         Input       end
+input::Home                        Edit: Line Start             Edit         Input       home
+input::Left                        Edit: Move Left              Edit         Input       left
+input::Right                       Edit: Move Right             Edit         Input       right
+input::Paste                       Edit: Paste                  Edit         Input       ctrl-v, cmd-v
+input::SelectAll                   Edit: Select All             Edit         Input       ctrl-a, cmd-a
+input::SelectLeft                  Edit: Select Left            Edit         Input       shift-left
+input::SelectRight                 Edit: Select Right           Edit         Input       shift-right
+input::Submit                      Edit: Submit                 Edit         Input       enter
+palette::Dismiss                   Palette: Close               Palette      Palette     escape
+palette::SelectNext                Palette: Next Item           Palette      Palette     down, ctrl-n
+palette::SelectPrev                Palette: Previous Item       Palette      Palette     up, ctrl-p
+main_window::CancelQuery           Cancel Query                 Query        MainWindow  escape
+main_window::RunQuery              Run Query                    Query        MainWindow  ctrl-enter, cmd-enter
+main_window::DebugScrollBenchmark  Debug: Scroll Benchmark      View         MainWindow  ctrl-shift-b, cmd-shift-b
+main_window::TogglePalette         Toggle Command Palette       View         (global)    ctrl-shift-p, cmd-shift-p
+```
+
+Overrides: `~/.config/tempr/settings.toml` (user) and `workspace.toml` (workspace), `[keybindings]` table, `"command id" = ["keystroke", …]`, GPUI syntax (`ctrl-shift-p`; chords space-separated), `[]` unbinds.
 
 ### Theme Tokens
 
