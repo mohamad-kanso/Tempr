@@ -131,7 +131,7 @@ impl Buffer {
 
 ### SyntaxTree
 
-`SyntaxTree` wraps tree-sitter's incremental parser output. It is produced by `Buffer` on every edit and consumed by both the editor's highlight layer and the semantic engine.
+`SyntaxTree` wraps tree-sitter's incremental parser output. `Buffer` records every edit on it and re-parses lazily when the tree is next read; both the editor's highlight layer and the semantic engine consume it.
 
 ```rust
 pub struct SyntaxTree {
@@ -158,7 +158,7 @@ impl SyntaxTree {
 }
 ```
 
-**Implementation notes (2026-09-03, D22):** `tempr_editor::SyntaxTree` — `parse(&Rope)`, `edit(&InputEdit)`, `reparse(&Rope)` (reads rope chunks, no copy), `root_node()`, `has_error()`, `statement_ranges()` / `statement_at(offset)` (the statement detector: `program` children with `;` folded in, comments skipped, `$$` bodies and strings opaque), `highlights(query, text, range)` with the bundled `highlights.scm` via `SyntaxTree::highlight_query()`. Grammar: `tree-sitter-sequel`.
+**Implementation notes (2026-09-03, D22):** `tempr_editor::SyntaxTree` — `parse(&Rope)`, `edit(&InputEdit)`, `reparse(&Rope)` (reads rope chunks, no copy), `root_node()`, `has_error()`, `statement_ranges()` / `statement_at(offset)` (the statement detector: `statement`/`transaction`/`block` children of `program` with a following `;` folded in, `ERROR` recovery fragments returned with `StatementKind::Error` so executors can refuse them, comments and stray `;` skipped, `$$` bodies and strings opaque; a `BEGIN … END` block is one range — inner-statement execution is a TODO), `highlights(query, text, range)` with the bundled `highlights.scm` via `SyntaxTree::highlight_query()`. Grammar: `tree-sitter-sequel`.
 
 ### EditorView
 
@@ -244,7 +244,7 @@ flowchart TD
 
 Key properties of this pipeline:
 
-- **The Buffer never publishes events directly.** `Buffer::edit` updates the rope and syntax tree synchronously, then returns. The caller (typically the GPUI view's event handler) publishes `BufferChanged` through the `EventBus`. This keeps the `Buffer` free of event-bus dependencies and simplifies testing.
+- **The Buffer never publishes events directly.** `Buffer::edit` updates the rope, records the edit on the syntax tree (the incremental re-parse runs on the next tree read), then returns. The caller (typically the GPUI view's event handler) publishes `BufferChanged` through the `EventBus`. This keeps the `Buffer` free of event-bus dependencies and simplifies testing.
 - **The IntelligenceService receives the event asynchronously.** It may run on the main thread (for trivial re-analysis) or be deferred to a background task (for large files). The latency budget for completion remains under 5 ms regardless, because the `CatalogCache` is in-memory and the tree-sitter reparse is incremental.
 - **The view re-renders only if the highlight map changed.** For cursor-only movements (arrow keys), the view updates cursor positions without recomputing highlights — a fast path that avoids unnecessary work on the most frequent interaction.
 
@@ -256,7 +256,7 @@ Key properties of this pipeline:
 
 1. **Keystroke arrives.** `EditorView::on_keystroke` receives the GPUI input event and determines whether it is a text edit, a cursor motion, or a command dispatch.
 
-2. **Buffer::edit called.** For text edits, the view calls `Buffer::edit(&[(range, replacement)])`. The buffer applies the edit to the rope (O(log n) insertion), updates the undo history, and calls `SyntaxTree::reparse` with the changed byte range. Tree-sitter incrementally reparses only the affected subtree.
+2. **Buffer::edit called.** For text edits, the view calls `Buffer::edit(&[(range, replacement)])`. The buffer applies the edit to the rope (O(log n) insertion), updates the undo history, and records the change on the tree (`SyntaxTree::edit`); the incremental `reparse` runs when the tree is next read. Tree-sitter incrementally reparses only the affected subtree.
 
 3. **Highlights recomputed.** The buffer runs the tree-sitter highlights query against the new tree and produces a `HighlightCache` — a list of `(byte_range, highlight_type)` tuples covering the visible viewport. Only visible lines are queried.
 

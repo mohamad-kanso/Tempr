@@ -86,42 +86,51 @@ struct EditHistory {
 pub struct Buffer {
     rope: Rope,
     history: EditHistory,
-    syntax: SyntaxTree,
-    /// Edits have been fed to the tree (`tree.edit`) but it has not been
-    /// re-parsed yet. Cleared by `reparse`.
+    /// `None` until the tree is first needed: opening a buffer never parses
+    /// (a 10 MB file takes seconds to parse from scratch).
+    syntax: Option<SyntaxTree>,
+    /// The tree is missing or edits have been fed to it (`tree.edit`) but it
+    /// has not been re-parsed yet. Cleared by `reparse`.
     syntax_dirty: bool,
     file_id: SqlFileId,
     next_edit: u64,
 }
 
 impl Buffer {
+    /// Open a buffer over `text`. O(text) to build the rope; the syntax tree
+    /// is built on first use, not here.
     pub fn new(file_id: SqlFileId, text: &str) -> Self {
-        let rope = Rope::from_str(text);
-        let syntax = SyntaxTree::parse(&rope);
         Self {
-            rope,
+            rope: Rope::from_str(text),
             history: EditHistory::default(),
-            syntax,
-            syntax_dirty: false,
+            syntax: None,
+            syntax_dirty: true,
             file_id,
             next_edit: 1,
         }
     }
 
-    /// Re-parse incrementally if any edit happened since the last parse.
-    /// Edits only record their shape on the tree (O(1)); the parse itself
-    /// runs here, on demand, so `edit` stays sub-millisecond regardless of
-    /// document size. Returns `true` if a parse ran.
+    pub fn file_id(&self) -> SqlFileId {
+        self.file_id
+    }
+
+    /// Bring the tree up to date: a full parse the first time, incremental
+    /// afterwards. Edits only record their shape on the tree (O(1)); the
+    /// parse runs here, on demand, so `edit` stays sub-millisecond
+    /// regardless of document size. Returns `true` if a parse ran.
     pub fn reparse(&mut self) -> bool {
         if !self.syntax_dirty {
             return false;
         }
-        self.syntax.reparse(&self.rope);
+        match self.syntax.as_mut() {
+            Some(tree) => tree.reparse(&self.rope),
+            None => self.syntax = Some(SyntaxTree::parse(&self.rope)),
+        }
         self.syntax_dirty = false;
         true
     }
 
-    /// True when edits are pending a `reparse`.
+    /// True when the tree is missing or edits are pending a `reparse`.
     pub fn is_syntax_dirty(&self) -> bool {
         self.syntax_dirty
     }
@@ -129,7 +138,9 @@ impl Buffer {
     /// The parse tree, brought up to date first.
     pub fn syntax(&mut self) -> &SyntaxTree {
         self.reparse();
-        &self.syntax
+        // `reparse` always leaves a tree in place.
+        self.syntax
+            .get_or_insert_with(|| SyntaxTree::parse(&Rope::new()))
     }
 
     /// Byte range of the top-level statement containing `offset`
@@ -146,12 +157,11 @@ impl Buffer {
     /// Syntax-highlight captures within `byte_range` (the grammar's
     /// bundled `highlights.scm`).
     pub fn highlights(&mut self, byte_range: Range<usize>) -> Vec<Highlight> {
-        self.reparse();
-        self.syntax
-            .highlights(SyntaxTree::highlight_query(), &self.rope, byte_range)
+        let rope = self.rope.clone();
+        self.syntax()
+            .highlights(SyntaxTree::highlight_query(), &rope, byte_range)
     }
 
-    /// Cheap snapshot of the file id.
     /// Total byte length of the content.
     pub fn len(&self) -> usize {
         self.rope.len_bytes()
@@ -231,21 +241,22 @@ impl Buffer {
         }
 
         // Apply from the highest start down so lower offsets stay valid.
+        // Replacements identical to the current text are skipped entirely
+        // (no rope, tree or history work).
         let mut changes: Vec<Change> = Vec::with_capacity(edits.len());
-        let mut touched = false;
         for &i in &order {
             let (range, text) = &edits[i];
-            let removed = self.replace_bytes(range.clone(), text);
-            if removed != *text {
-                touched = true;
-                changes.push(Change {
-                    start: range.start,
-                    removed,
-                    inserted: (*text).to_string(),
-                });
+            if self.rope.byte_slice(range.clone()) == *text {
+                continue;
             }
+            let removed = self.replace_bytes(range.clone(), text);
+            changes.push(Change {
+                start: range.start,
+                removed,
+                inserted: (*text).to_string(),
+            });
         }
-        if !touched {
+        if changes.is_empty() {
             return Ok(None);
         }
 
@@ -378,14 +389,17 @@ impl Buffer {
             self.rope.insert(start, text);
         }
         let new_end_byte = range.start + text.len();
-        self.syntax.edit(&InputEdit {
-            start_byte: range.start,
-            old_end_byte: range.end,
-            new_end_byte,
-            start_position,
-            old_end_position,
-            new_end_position: self.ts_point(new_end_byte),
-        });
+        let new_end_position = self.ts_point(new_end_byte);
+        if let Some(tree) = self.syntax.as_mut() {
+            tree.edit(&InputEdit {
+                start_byte: range.start,
+                old_end_byte: range.end,
+                new_end_byte,
+                start_position,
+                old_end_position,
+                new_end_position,
+            });
+        }
         self.syntax_dirty = true;
         removed
     }
@@ -733,11 +747,19 @@ mod tests {
     #[test]
     fn syntax_tree_tracks_edits_undo_and_redo() {
         let mut b = buf("select 1;\nselect 2;");
+        assert!(b.is_syntax_dirty(), "opening does not parse");
         assert_eq!(b.statement_ranges().len(), 2);
+        assert!(!b.is_syntax_dirty());
         assert!(!b.syntax().has_error());
 
         b.edit(&[(18..18, " + 40")]).unwrap().unwrap();
         assert!(b.is_syntax_dirty(), "edit defers the parse");
+        // A no-op replacement changes nothing, including the tree state.
+        b.syntax();
+        assert_eq!(b.edit(&[(0..6, "select")]).unwrap(), None);
+        assert!(!b.is_syntax_dirty(), "no-op edit does not dirty the tree");
+        b.edit(&[(18..18, "")]).unwrap(); // still a no-op
+        assert!(!b.is_syntax_dirty());
         let full = SyntaxTree::parse(&b.text());
         assert_eq!(b.syntax().root_node().to_sexp(), full.root_node().to_sexp());
         assert!(!b.is_syntax_dirty(), "reading the tree parsed it");

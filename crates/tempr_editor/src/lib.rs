@@ -11,4 +11,4 @@ pub mod buffer;
 pub mod syntax;
 
 pub use buffer::{Buffer, EditError, EditId, Point};
-pub use syntax::{Highlight, StatementRange, SyntaxTree};
+pub use syntax::{Highlight, StatementKind, StatementRange, SyntaxTree};

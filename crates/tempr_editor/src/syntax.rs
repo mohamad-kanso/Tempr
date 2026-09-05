@@ -12,18 +12,49 @@ use tree_sitter::{
     Tree,
 };
 
-/// The byte range of one SQL statement (exclusive end), including its
+/// What a top-level range is. Callers that execute SQL should refuse
+/// `Error` ranges (tree-sitter recovery fragments) rather than send them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    /// A single `statement` (the common case).
+    Statement,
+    /// `BEGIN … COMMIT/ROLLBACK` — one range spanning the whole transaction.
+    Transaction,
+    /// `BEGIN … END` block — one range spanning the whole block.
+    Block,
+    /// Text the parser could not fit into a statement.
+    Error,
+}
+
+/// The byte range of one top-level statement (exclusive end), including its
 /// terminating `;` when present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementRange {
     pub start: usize,
     pub end: usize,
+    pub kind: StatementKind,
 }
 
 impl StatementRange {
+    /// `start <= offset < end`; see `SyntaxTree::statement_at` for the
+    /// end-of-document special case.
     pub fn contains(&self, offset: usize) -> bool {
-        self.start <= offset && offset <= self.end
+        self.start <= offset && offset < self.end
     }
+
+    pub fn is_error(&self) -> bool {
+        self.kind == StatementKind::Error
+    }
+}
+
+fn kind_of(node: &Node) -> Option<StatementKind> {
+    Some(match node.kind() {
+        "statement" => StatementKind::Statement,
+        "transaction" => StatementKind::Transaction,
+        "block" => StatementKind::Block,
+        _ if node.is_error() => StatementKind::Error,
+        _ => return None,
+    })
 }
 
 /// A highlight capture: byte range + capture name from `highlights.scm`
@@ -48,6 +79,9 @@ impl std::fmt::Debug for SyntaxTree {
             .finish()
     }
 }
+
+/// Tempr's highlight query source (see `queries/highlights.scm`).
+pub const HIGHLIGHTS_QUERY: &str = include_str!("../queries/highlights.scm");
 
 /// The SQL language handle (shared, cheap to clone).
 pub fn language() -> Language {
@@ -97,40 +131,68 @@ impl SyntaxTree {
         self.tree.root_node().has_error()
     }
 
-    /// Top-level statement ranges in document order. Each `statement`
-    /// (or `transaction`) child of the root; a following `;` is folded in.
+    /// Top-level ranges in document order: every `statement`, `transaction`,
+    /// `block` or `ERROR` child of the root, with a directly following `;`
+    /// folded in. Comments and stray `;` are not statements.
     pub fn statement_ranges(&self) -> Vec<StatementRange> {
         let root = self.tree.root_node();
         let mut cursor = root.walk();
         let mut ranges: Vec<StatementRange> = Vec::new();
         for child in root.children(&mut cursor) {
-            match child.kind() {
-                ";" => {
-                    if let Some(last) = ranges.last_mut()
-                        && last.end <= child.start_byte()
-                    {
-                        last.end = child.end_byte();
-                    }
+            if child.kind() == ";" {
+                if let Some(last) = ranges.last_mut()
+                    && last.end == child.start_byte()
+                {
+                    last.end = child.end_byte();
                 }
-                "comment" | "marginalia" => {}
-                _ => ranges.push(StatementRange {
+                continue;
+            }
+            if let Some(kind) = kind_of(&child) {
+                ranges.push(StatementRange {
                     start: child.start_byte(),
                     end: child.end_byte(),
-                }),
+                    kind,
+                });
             }
         }
         ranges
     }
 
-    /// The statement containing `offset` (inclusive of its end), if any.
+    /// The top-level range containing `offset` (`start <= offset < end`,
+    /// terminating `;` included). At the very end of the document the last
+    /// range is returned if the offset touches it. `None` on comments,
+    /// whitespace between statements, or stray `;`. O(log n): no allocation.
     pub fn statement_at(&self, offset: usize) -> Option<StatementRange> {
-        self.statement_ranges()
-            .into_iter()
-            .find(|r| r.contains(offset))
+        let root = self.tree.root_node();
+        let mut node = root.first_child_for_byte(offset).or_else(|| {
+            // Past the last child: the last top-level node, if any.
+            root.child(root.child_count().checked_sub(1)?)
+        })?;
+        // A `;` belongs to the range it terminates.
+        if node.kind() == ";" {
+            node = node.prev_sibling()?;
+        }
+        let kind = kind_of(&node)?;
+        let mut end = node.end_byte();
+        if let Some(next) = node.next_sibling()
+            && next.kind() == ";"
+            && next.start_byte() == end
+        {
+            end = next.end_byte();
+        }
+        let range = StatementRange {
+            start: node.start_byte(),
+            end,
+            kind,
+        };
+        let at_document_end = offset == end && end == root.end_byte();
+        (range.contains(offset) || at_document_end).then_some(range)
     }
 
-    /// Run `query` over `byte_range` and return captures in document order.
-    /// `text` is needed for predicates such as `#match?`.
+    /// Run `query` over `byte_range` and return one capture per node range in
+    /// document order. When several patterns capture the same range, the
+    /// later pattern in the query file wins (so specific patterns such as
+    /// numeric literals override generic ones). `text` feeds `#match?`.
     pub fn highlights(
         &self,
         query: &Query,
@@ -141,28 +203,40 @@ impl SyntaxTree {
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(byte_range);
         let provider = RopeText(text);
-        let mut out = Vec::new();
+        let mut raw: Vec<(Range<usize>, usize, &str)> = Vec::new();
         let mut captures = cursor.captures(query, self.tree.root_node(), provider);
         while let Some((m, ix)) = captures.next() {
             let cap = m.captures[*ix];
-            out.push(Highlight {
-                range: cap.node.byte_range(),
-                capture: names[cap.index as usize].to_string(),
-            });
+            raw.push((
+                cap.node.byte_range(),
+                m.pattern_index,
+                names[cap.index as usize],
+            ));
         }
-        out.sort_by_key(|h| (h.range.start, h.range.end));
+        raw.sort_by_key(|(r, pattern, _)| (r.start, r.end, *pattern));
+        let mut out: Vec<Highlight> = Vec::with_capacity(raw.len());
+        for (range, _, name) in raw {
+            match out.last_mut() {
+                Some(last) if last.range == range => last.capture = name.to_string(),
+                _ => out.push(Highlight {
+                    range,
+                    capture: name.to_string(),
+                }),
+            }
+        }
         out
     }
 
-    /// The grammar's bundled `highlights.scm`, compiled once per process.
+    /// Tempr's `highlights.scm` (`queries/highlights.scm`, derived from the
+    /// grammar's), compiled once per process.
     pub fn highlight_query() -> &'static Query {
         static QUERY: std::sync::OnceLock<Query> = std::sync::OnceLock::new();
         QUERY.get_or_init(|| {
-            // The query ships inside the grammar crate; a compile failure is a
-            // dependency bug caught by `highlights_yield_keyword_and_string_captures`.
+            // The query is part of this crate; a compile failure is a bug
+            // caught by `highlights_yield_keyword_string_and_number_captures`.
             #[allow(clippy::expect_used)]
-            Query::new(&language(), tree_sitter_sequel::HIGHLIGHTS_QUERY)
-                .expect("bundled highlights.scm compiles against its own grammar")
+            Query::new(&language(), HIGHLIGHTS_QUERY)
+                .expect("queries/highlights.scm compiles against tree-sitter-sequel")
         })
     }
 }
@@ -239,8 +313,14 @@ mod tests {
     fn statement_at_offsets() {
         let t = SyntaxTree::parse(&rope(SAMPLE));
         let ranges = t.statement_ranges();
+        assert!(ranges.iter().all(|r| r.kind == StatementKind::Statement));
         assert_eq!(t.statement_at(0), Some(ranges[0]));
-        assert_eq!(t.statement_at(9), Some(ranges[0]), "on the semicolon");
+        assert_eq!(t.statement_at(8), Some(ranges[0]), "on the semicolon");
+        assert_eq!(
+            t.statement_at(9),
+            None,
+            "past the semicolon, on the newline"
+        );
         assert_eq!(t.statement_at(12), None, "inside the comment line");
         let inner = SAMPLE.find("$$ select").unwrap() + 4;
         assert_eq!(t.statement_at(inner), Some(ranges[2]), "inside a $$ body");
@@ -249,6 +329,70 @@ mod tests {
             SyntaxTree::parse(&rope("-- only a comment\n")).statement_at(3),
             None
         );
+        // Adjacent statements: the boundary offset belongs to the second one.
+        let two = SyntaxTree::parse(&rope("select 1;select 2;"));
+        assert_eq!(two.statement_at(9).unwrap().start, 9);
+        assert_eq!(two.statement_at(8).unwrap().start, 0);
+        // statement_at agrees with statement_ranges everywhere.
+        for off in 0..=SAMPLE.len() {
+            let expected = ranges
+                .iter()
+                .copied()
+                .find(|r| r.contains(off) || (off == SAMPLE.len() && off == r.end));
+            assert_eq!(t.statement_at(off), expected, "offset {off}");
+        }
+    }
+
+    #[test]
+    fn error_fragments_and_stray_semicolons_are_not_statements() {
+        // The grammar reports a leading `;;` as an ERROR node: it must never be
+        // promoted to a runnable statement.
+        let src = ";; select 1;";
+        let t = SyntaxTree::parse(&rope(src));
+        let good: Vec<&str> = t
+            .statement_ranges()
+            .iter()
+            .filter(|r| !r.is_error())
+            .map(|r| &src[r.start..r.end])
+            .collect();
+        assert_eq!(good, vec!["select 1;"]);
+        assert!(
+            t.statement_at(0).is_none_or(|r| r.is_error()),
+            "stray ; is not a runnable statement: {:?}",
+            t.statement_at(0)
+        );
+
+        let sql = "select 1;\nselect 2 from;\nselect 3;";
+        let t = SyntaxTree::parse(&rope(sql));
+        assert!(t.has_error());
+        let ranges = t.statement_ranges();
+        let good: Vec<&str> = ranges
+            .iter()
+            .filter(|r| !r.is_error())
+            .map(|r| &sql[r.start..r.end])
+            .collect();
+        assert!(
+            good.contains(&"select 1;") && good.contains(&"select 3;"),
+            "{good:?}"
+        );
+        assert!(
+            ranges.iter().any(|r| r.is_error()),
+            "recovery fragments are flagged, not silently promoted: {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn blocks_and_transactions_are_single_ranges_with_their_kind() {
+        let sql = "begin; select 1; select 2; end;";
+        let t = SyntaxTree::parse(&rope(sql));
+        let ranges = t.statement_ranges();
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert!(matches!(
+            ranges[0].kind,
+            StatementKind::Block | StatementKind::Transaction
+        ));
+        assert_eq!(&sql[ranges[0].start..ranges[0].end], sql);
+        assert_eq!(t.statement_at(10).map(|r| r.kind), Some(ranges[0].kind));
     }
 
     #[test]
@@ -286,18 +430,25 @@ mod tests {
     }
 
     #[test]
-    fn highlights_yield_keyword_and_string_captures() {
-        let text = rope("select a from t where b = 'x';");
+    fn highlights_yield_keyword_string_and_number_captures() {
+        let src = "select 42, 1.5, 'x' -- c\nfrom t;";
+        let text = rope(src);
         let t = SyntaxTree::parse(&text);
         let hs = t.highlights(SyntaxTree::highlight_query(), &text, 0..text.len_bytes());
-        let names: std::collections::BTreeSet<&str> =
-            hs.iter().map(|h| h.capture.as_str()).collect();
-        assert!(names.contains("keyword"), "{names:?}");
-        assert!(names.contains("string"), "{names:?}");
-        assert!(
-            hs.iter()
-                .any(|h| h.range == (0..6) && h.capture == "keyword")
-        );
+        let by_text: Vec<(&str, &str)> = hs
+            .iter()
+            .map(|h| (&src[h.range.clone()], h.capture.as_str()))
+            .collect();
+        assert!(by_text.contains(&("select", "keyword")), "{by_text:?}");
+        assert!(by_text.contains(&("42", "number")), "{by_text:?}");
+        assert!(by_text.contains(&("1.5", "float")), "{by_text:?}");
+        assert!(by_text.contains(&("'x'", "string")), "{by_text:?}");
+        assert!(by_text.contains(&("-- c", "comment")), "{by_text:?}");
+        // One capture per range: no duplicates, no @spell.
+        let mut ranges: Vec<&Range<usize>> = hs.iter().map(|h| &h.range).collect();
+        ranges.dedup();
+        assert_eq!(ranges.len(), hs.len());
+        assert!(hs.iter().all(|h| h.capture != "spell"));
     }
 
     #[test]
