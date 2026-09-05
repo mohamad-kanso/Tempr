@@ -23,20 +23,12 @@ impl Buffer {
 
     /// Byte offset of the start of the line containing `offset`.
     pub fn line_start(&self, offset: usize) -> usize {
-        let p = self.point_for_offset(offset);
-        self.offset_for_point(Point {
-            line: p.line,
-            column: 0,
-        })
+        self.line_start_of(self.point_for_offset(offset).line)
     }
 
     /// Byte offset just before the line break of the line containing `offset`.
     pub fn line_end(&self, offset: usize) -> usize {
-        let p = self.point_for_offset(offset);
-        self.offset_for_point(Point {
-            line: p.line,
-            column: usize::MAX,
-        })
+        self.line_end_of(self.point_for_offset(offset).line)
     }
 
     /// Next grapheme boundary after `offset`; crosses line breaks; clamps.

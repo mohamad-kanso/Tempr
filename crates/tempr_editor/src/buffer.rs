@@ -169,8 +169,7 @@ impl Buffer {
     /// bundled `highlights.scm`).
     pub fn highlights(&mut self, byte_range: Range<usize>) -> Vec<Highlight> {
         let rope = self.rope.clone();
-        self.syntax()
-            .highlights(SyntaxTree::highlight_query(), &rope, byte_range)
+        self.syntax().highlights(&rope, byte_range)
     }
 
     /// Total byte length of the content.
@@ -378,6 +377,16 @@ impl Buffer {
         }
     }
 
+    /// UTF-16 code-unit range for a byte range.
+    pub fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    /// Byte range for a UTF-16 code-unit range.
+    pub fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+    }
+
     /// UTF-16 code-unit offset for a byte offset (IME / platform text APIs).
     pub fn offset_to_utf16(&self, offset: usize) -> usize {
         let ch = self.rope.byte_to_char(offset.min(self.len()));
@@ -504,7 +513,7 @@ impl std::fmt::Debug for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::SyntaxTree;
+    use crate::syntax::{HighlightKind, SyntaxTree};
 
     fn buf(text: &str) -> Buffer {
         Buffer::new(SqlFileId::new(), text)
@@ -890,7 +899,7 @@ mod tests {
             "select 'wörld';"
         );
         let hs = b.highlights(0..b.len());
-        assert!(hs.iter().any(|h| h.capture == "comment"));
+        assert!(hs.iter().any(|h| h.kind == HighlightKind::Comment));
     }
 
     /// Incremental reparse cost after a one-line edit, for two 10 MB

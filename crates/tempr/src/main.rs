@@ -107,11 +107,17 @@ fn main() -> Result<()> {
     // Keybinding layers: user settings (~/.config/tempr/settings.toml) now;
     // the workspace layer joins when workspace open lands.
     // A broken settings file must not prevent the window from opening.
-    let user_settings = match tempr_workspace::load_user_settings() {
-        Ok(s) => s,
+    let (user_settings, settings_notice) = match tempr_workspace::load_user_settings() {
+        Ok(s) => (s, None),
         Err(e) => {
-            tracing::warn!(error = %e, "ignoring user settings; using defaults");
-            tempr_workspace::UserSettings::default()
+            let path = tempr_workspace::user_settings_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "settings.toml".into());
+            tracing::warn!(error = %e, path, "ignoring user settings; using defaults");
+            (
+                tempr_workspace::UserSettings::default(),
+                Some(format!("{path} ignored: {e}")),
+            )
         }
     };
     services
@@ -124,15 +130,16 @@ fn main() -> Result<()> {
             services.command.register(spec.contribution());
         }
         println!(
-            "id                                 title                        category     context     keys"
+            "id                                 title                          category     context                pal  keys"
         );
         for c in services.command.commands() {
             println!(
-                "{:<34} {:<28} {:<12} {:<11} {}",
+                "{:<34} {:<30} {:<12} {:<22} {:<4} {}",
                 c.id.to_string(),
                 c.title,
                 c.category,
                 c.context.as_deref().unwrap_or("(global)"),
+                if c.hidden { "-" } else { "yes" },
                 c.keystrokes.join(", ")
             );
         }
@@ -146,6 +153,7 @@ fn main() -> Result<()> {
             .ok()
             .filter(|s| !s.trim().is_empty()),
         bench_scroll_then_exit: std::env::var("TEMPR_BENCH_SCROLL").is_ok_and(|v| v == "1"),
+        startup_notice: settings_notice,
     };
     if dev.bench_scroll_then_exit && (dev.startup_sql.is_none() || connection.is_none()) {
         anyhow::bail!("TEMPR_BENCH_SCROLL=1 requires TEMPR_STARTUP_SQL and DATABASE_URL");

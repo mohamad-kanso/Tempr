@@ -18,6 +18,9 @@ use crate::theme;
 actions!(palette, [SelectNext, SelectPrev, Dismiss]);
 
 pub const KEY_CONTEXT: &str = "Palette";
+/// Shared identifier every overlay adds to its key context so window-level
+/// bindings can be suspended with `!Modal` without naming each overlay.
+pub const MODAL_CONTEXT: &str = "Modal";
 const ROW_HEIGHT: f32 = 28.0;
 const MAX_VISIBLE_ROWS: usize = 12;
 
@@ -35,6 +38,9 @@ pub struct Palette {
     matches: Vec<CommandMatch>,
     selected: usize,
     open: bool,
+    /// Focus to restore when the palette closes (whatever was focused when
+    /// it opened), so the confirmed command dispatches against it.
+    previous_focus: Option<FocusHandle>,
     focus_handle: FocusHandle,
     _input_subscription: Subscription,
 }
@@ -42,18 +48,23 @@ pub struct Palette {
 impl EventEmitter<PaletteEvent> for Palette {}
 
 impl Palette {
-    pub fn new(service: Arc<CommandService>, cx: &mut Context<Self>) -> Self {
+    pub fn new(service: Arc<CommandService>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| Input::new("Type a command…", cx));
-        let _input_subscription = cx.subscribe(&input, |this, _input, event, cx| match event {
-            InputEvent::Changed => this.refresh(cx),
-            InputEvent::Submit(_) => this.confirm(cx),
-        });
+        let _input_subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, event, window, cx| match event {
+                InputEvent::Changed => this.refresh(cx),
+                InputEvent::Submit(_) => this.confirm(window, cx),
+            },
+        );
         Self {
             service,
             input,
             matches: Vec::new(),
             selected: 0,
             open: false,
+            previous_focus: None,
             focus_handle: cx.focus_handle(),
             _input_subscription,
         }
@@ -63,20 +74,27 @@ impl Palette {
         self.open
     }
 
-    /// Open with an empty query and focus the input.
+    /// Open with an empty query and focus the input; remembers the current
+    /// focus for `close`.
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = true;
+        self.previous_focus = window.focused(cx);
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.refresh(cx);
         window.focus(&self.input.focus_handle(cx), cx);
         cx.notify();
     }
 
-    pub fn close(&mut self, cx: &mut Context<Self>) {
-        if self.open {
-            self.open = false;
-            cx.notify();
+    /// Close and restore the focus captured by `open`.
+    pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.open {
+            return;
         }
+        self.open = false;
+        if let Some(prev) = self.previous_focus.take() {
+            window.focus(&prev, cx);
+        }
+        cx.notify();
     }
 
     /// Current matches (for tests and status UIs).
@@ -95,12 +113,13 @@ impl Palette {
         cx.notify();
     }
 
-    fn confirm(&mut self, cx: &mut Context<Self>) {
+    /// Close (restoring focus first, so the owner's dispatch lands on the
+    /// element that was focused before the palette opened), then emit.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(hit) = self.matches.get(self.selected) {
             let id = hit.meta.id.clone();
-            self.open = false;
+            self.close(window, cx);
             cx.emit(PaletteEvent::Execute(id));
-            cx.notify();
         }
     }
 
@@ -118,10 +137,9 @@ impl Palette {
         }
     }
 
-    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        self.open = false;
+    fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        self.close(window, cx);
         cx.emit(PaletteEvent::Dismissed);
-        cx.notify();
     }
 
     fn render_row(&self, ix: usize) -> gpui::AnyElement {
@@ -173,7 +191,12 @@ impl Render for Palette {
         }
         let rows = self.matches.len().min(MAX_VISIBLE_ROWS);
         div()
-            .key_context(KEY_CONTEXT)
+            .key_context({
+                let mut kc = gpui::KeyContext::new_with_defaults();
+                kc.add(KEY_CONTEXT);
+                kc.add(MODAL_CONTEXT);
+                kc
+            })
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_prev))

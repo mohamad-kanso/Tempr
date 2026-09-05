@@ -1,6 +1,6 @@
 //! Root view of the application window.
 //!
-//! Layout: SQL `Input` (top) · `ResultGrid` (middle) · status bar (bottom).
+//! Layout: SQL `EditorView` (top) · `ResultGrid` (middle) · status bar (bottom) · `Palette` overlay.
 //! Holds service handles + render state only (D6). Query execution happens
 //! in `QueryService` on the tokio runtime; rows and bus events reach this
 //! view through channels drained on the foreground executor.
@@ -39,9 +39,9 @@ actions!(
 );
 
 pub const KEY_CONTEXT: &str = "MainWindow";
-/// Binding context for main-window commands: active only while the palette
-/// overlay (a child of this node) is closed.
-pub const KEY_CONTEXT_NOT_PALETTE: &str = "MainWindow && !Palette";
+/// Binding context for main-window commands: active only while no overlay
+/// (anything adding `palette::MODAL_CONTEXT` to its key context) is open.
+pub const KEY_CONTEXT_NOT_PALETTE: &str = "MainWindow && !Modal";
 
 /// How many frames the scroll benchmark spreads the row sweep over.
 const BENCH_TARGET_FRAMES: usize = 600;
@@ -73,6 +73,9 @@ pub struct DevOptions {
     /// report, and quit. Any failure on the way also quits (non-zero log
     /// line), so a headless run never hangs.
     pub bench_scroll_then_exit: bool,
+    /// Something the binary wants shown in the status bar at startup (e.g.
+    /// "settings.toml ignored: …").
+    pub startup_notice: Option<String>,
 }
 
 /// Service handles the window needs. Built by the binary before GPUI starts.
@@ -103,7 +106,7 @@ pub struct MainWindow {
     dev: DevOptions,
     bench: Option<ScrollBench>,
     focus_handle: FocusHandle,
-    _input_subscription: Subscription,
+    _editor_subscription: Subscription,
     _palette_subscription: Subscription,
     _bus_subscription: tempr_events::Subscription,
 }
@@ -119,33 +122,20 @@ impl MainWindow {
         let editor = cx.new(|cx| EditorView::new("", cx));
         let grid = cx.new(|_| ResultGrid::new());
         let command_service = services.command.clone();
-        let palette = cx.new(|cx| Palette::new(command_service, cx));
+        let palette = cx.new(|cx| Palette::new(command_service, window, cx));
 
+        // The palette restores the previous focus itself before emitting.
         let _palette_subscription =
             cx.subscribe_in(&palette, window, |this, _palette, event, window, cx| {
-                match event {
-                    PaletteEvent::Execute(id) => {
-                        // Restore focus first: the dispatch is deferred against
-                        // the focus at call time, and most commands live in the
-                        // editor / main-window contexts.
-                        let id = id.clone();
-                        window.focus(&this.editor.focus_handle(cx), cx);
-                        if !commands::dispatch(&id, &this.services.command, window, cx) {
-                            this.set_status(
-                                format!("Command {id} is not available here"),
-                                true,
-                                cx,
-                            );
-                        }
-                    }
-                    PaletteEvent::Dismissed => {
-                        window.focus(&this.editor.focus_handle(cx), cx);
-                    }
+                if let PaletteEvent::Execute(id) = event
+                    && !commands::dispatch(id, &this.services.command, window, cx)
+                {
+                    this.set_status(format!("Command {id} is not available here"), true, cx);
                 }
                 cx.notify();
             });
 
-        let _input_subscription = cx.subscribe_in(
+        let _editor_subscription = cx.subscribe_in(
             &editor,
             window,
             |this, _editor, event, window, cx| match event {
@@ -182,6 +172,7 @@ impl MainWindow {
             }
         };
 
+        let startup_notice = dev.startup_notice.clone();
         let mut this = Self {
             services,
             connection,
@@ -195,11 +186,14 @@ impl MainWindow {
             dev,
             bench: None,
             focus_handle: cx.focus_handle(),
-            _input_subscription,
+            _editor_subscription,
             _palette_subscription,
             _bus_subscription,
         };
         this.connect(window, cx);
+        if let Some(notice) = startup_notice {
+            this.set_status(notice, true, cx);
+        }
         this
     }
 
@@ -287,12 +281,13 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         let open = self.palette.read(cx).is_open();
-        if open {
-            self.palette.update(cx, |p, cx| p.close(cx));
-            window.focus(&self.editor.focus_handle(cx), cx);
-        } else {
-            self.palette.update(cx, |p, cx| p.open(window, cx));
-        }
+        self.palette.update(cx, |p, cx| {
+            if open {
+                p.close(window, cx)
+            } else {
+                p.open(window, cx)
+            }
+        });
     }
 
     // ── query lifecycle ──────────────────────────────────────────────────

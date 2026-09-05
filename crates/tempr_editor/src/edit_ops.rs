@@ -33,7 +33,7 @@ impl Buffer {
         let sels = normalize(selections);
         let edits: Vec<(std::ops::Range<usize>, &str)> =
             sels.iter().map(|s| (s.range(), text)).collect();
-        let after = self.cursors_after_replacements(&sels, text.len());
+        let after = normalize(&self.cursors_after_replacements(&sels, text.len()));
         let edit = self.edit_with_selections(&edits, &sels, &after)?;
         Ok(EditOutcome {
             edit,
@@ -44,32 +44,34 @@ impl Buffer {
     /// Delete the selections; an empty selection deletes the previous
     /// grapheme (no-op at the start of the buffer).
     pub fn backspace(&mut self, selections: &[Selection]) -> Result<EditOutcome, EditError> {
-        let sels: Vec<Selection> = normalize(selections)
-            .into_iter()
+        let before = normalize(selections);
+        let ranges: Vec<Selection> = before
+            .iter()
             .map(|s| {
                 if s.is_empty() {
                     Selection::new(self.prev_grapheme_boundary(s.head), s.head)
                 } else {
-                    s
+                    *s
                 }
             })
             .collect();
-        self.delete_ranges(&sels)
+        self.delete_ranges(&ranges, &before)
     }
 
     /// Delete the selections; an empty selection deletes the next grapheme.
     pub fn delete_forward(&mut self, selections: &[Selection]) -> Result<EditOutcome, EditError> {
-        let sels: Vec<Selection> = normalize(selections)
-            .into_iter()
+        let before = normalize(selections);
+        let ranges: Vec<Selection> = before
+            .iter()
             .map(|s| {
                 if s.is_empty() {
                     Selection::new(s.head, self.next_grapheme_boundary(s.head))
                 } else {
-                    s
+                    *s
                 }
             })
             .collect();
-        self.delete_ranges(&sels)
+        self.delete_ranges(&ranges, &before)
     }
 
     /// Text covered by the selections, joined with `\n` (clipboard copy).
@@ -143,76 +145,79 @@ impl Buffer {
         })
     }
 
-    /// Move the lines touched by the selections one line up or down
-    /// (no-op at the buffer edges); selections travel with the text.
+    /// Move the lines touched by the selections one line up or down. Each
+    /// contiguous block of touched lines swaps with its own neighbour
+    /// (unselected lines between blocks stay put); blocks already at the
+    /// edge do not move. Selections travel with their text.
     pub fn move_lines(
         &mut self,
         selections: &[Selection],
         direction: LineDirection,
     ) -> Result<EditOutcome, EditError> {
         let before = normalize(selections);
-        let Some(first) = before.first() else {
+        let blocks = self.line_blocks(&before);
+        let content_end = self.len();
+        let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        // (block byte range incl. its break, delta for selections inside it)
+        let mut deltas: Vec<(std::ops::Range<usize>, isize)> = Vec::new();
+
+        for (block, has_break) in &blocks {
+            let block_end = if *has_break {
+                self.line_end(block.end.saturating_sub(1))
+            } else {
+                block.end
+            };
+            let block_text = self.slice(block.start..block_end)?;
+            match direction {
+                LineDirection::Up => {
+                    if block.start == 0 {
+                        continue;
+                    }
+                    let prev_line = self.point_for_offset(block.start).line - 1;
+                    let prev_start = self.line_start_of(prev_line);
+                    let prev = self.slice(prev_start..block.start)?; // includes its break
+                    let prev_content = prev.trim_end_matches(['\r', '\n']).to_string();
+                    let brk = &prev[prev_content.len()..];
+                    edits.push((
+                        prev_start..block_end,
+                        format!("{block_text}{brk}{prev_content}"),
+                    ));
+                    deltas.push((
+                        block.start..block.end.max(block_end + 1),
+                        -(prev.len() as isize),
+                    ));
+                }
+                LineDirection::Down => {
+                    let next_start = block.end;
+                    // Nothing below (last line, or only a phantom empty line
+                    // after the trailing break).
+                    if !*has_break || next_start >= content_end {
+                        continue;
+                    }
+                    let next_end = self.line_end(next_start);
+                    let brk = self.slice(block_end..next_start)?;
+                    let next = self.slice(next_start..next_end)?;
+                    edits.push((block.start..next_end, format!("{next}{brk}{block_text}")));
+                    deltas.push((block.start..block.end, (next.len() + brk.len()) as isize));
+                }
+            }
+        }
+        if edits.is_empty() {
             return Ok(EditOutcome {
                 edit: None,
                 selections: before,
             });
-        };
-        let last = before.last().unwrap_or(first);
-        let first_line = self.point_for_offset(first.start()).line;
-        let last_line = self.point_for_offset(last.end()).line;
-        let block_start = self.offset_for_point(Point {
-            line: first_line,
-            column: 0,
-        });
-        let block_end = self.line_end(last.end()); // exclusive of the break
-        let block = self.slice(block_start..block_end)?;
-
-        let (edits, delta): (Vec<(std::ops::Range<usize>, String)>, isize) = match direction {
-            LineDirection::Up => {
-                if first_line == 0 {
-                    return Ok(EditOutcome {
-                        edit: None,
-                        selections: before,
-                    });
-                }
-                let prev_start = self.offset_for_point(Point {
-                    line: first_line - 1,
-                    column: 0,
-                });
-                let prev = self.slice(prev_start..block_start)?; // includes its break
-                let prev_content = prev.trim_end_matches(['\r', '\n']).to_string();
-                let brk = &prev[prev_content.len()..];
-                // Replace [prev_start, block_end) with block + brk + prev_content.
-                let replacement = format!("{block}{brk}{prev_content}");
-                (
-                    vec![(prev_start..block_end, replacement)],
-                    -(prev.len() as isize),
-                )
-            }
-            LineDirection::Down => {
-                if last_line + 1 >= self.len_lines() {
-                    return Ok(EditOutcome {
-                        edit: None,
-                        selections: before,
-                    });
-                }
-                let next_start = self.offset_for_point(Point {
-                    line: last_line + 1,
-                    column: 0,
-                });
-                let next_end = self.line_end(next_start);
-                let brk = self.slice(block_end..next_start)?; // the break after our block
-                let next = self.slice(next_start..next_end)?;
-                let replacement = format!("{next}{brk}{block}");
-                (
-                    vec![(block_start..next_end, replacement)],
-                    (next.len() + brk.len()) as isize,
-                )
-            }
-        };
+        }
         let after: Vec<Selection> = before
             .iter()
             .map(|s| {
+                let delta = deltas
+                    .iter()
+                    .find(|(r, _)| {
+                        r.contains(&s.start()) || (s.start() == r.end && r.end == content_end)
+                    })
+                    .map(|(_, d)| *d)
+                    .unwrap_or(0);
                 Selection::new(
                     (s.anchor as isize + delta) as usize,
                     (s.head as isize + delta) as usize,
@@ -230,12 +235,18 @@ impl Buffer {
 
     // ── helpers ─────────────────────────────────────────────────────────
 
-    fn delete_ranges(&mut self, sels: &[Selection]) -> Result<EditOutcome, EditError> {
-        let sels = normalize(sels);
+    /// Delete `ranges` (already grapheme-expanded); `before` is the user's
+    /// original selection set, recorded for undo.
+    fn delete_ranges(
+        &mut self,
+        ranges: &[Selection],
+        before: &[Selection],
+    ) -> Result<EditOutcome, EditError> {
+        let ranges = normalize(ranges);
         let edits: Vec<(std::ops::Range<usize>, &str)> =
-            sels.iter().map(|s| (s.range(), "")).collect();
-        let after = self.cursors_after_replacements(&sels, 0);
-        let edit = self.edit_with_selections(&edits, &sels, &after)?;
+            ranges.iter().map(|s| (s.range(), "")).collect();
+        let after = normalize(&self.cursors_after_replacements(&ranges, 0));
+        let edit = self.edit_with_selections(&edits, before, &after)?;
         Ok(EditOutcome {
             edit,
             selections: after,
@@ -259,13 +270,25 @@ impl Buffer {
         out
     }
 
+    /// Last line a selection touches. A non-empty selection that ends at
+    /// column 0 (the classic whole-line shape `"one\n"`) does not touch
+    /// the line it ends on.
+    fn last_touched_line(&self, s: &Selection) -> usize {
+        let end = self.point_for_offset(s.end());
+        if !s.is_empty() && end.column == 0 && end.line > 0 {
+            end.line - 1
+        } else {
+            end.line
+        }
+    }
+
     /// Whole-line byte blocks covered by the selections, merged, each with
     /// whether it ends in a line break (the last line may not).
     fn line_blocks(&self, selections: &[Selection]) -> Vec<(std::ops::Range<usize>, bool)> {
         let mut blocks: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
         for s in normalize(selections) {
             let first = self.point_for_offset(s.start()).line;
-            let last = self.point_for_offset(s.end()).line;
+            let last = self.last_touched_line(&s);
             let start = self.offset_for_point(Point {
                 line: first,
                 column: 0,
@@ -406,6 +429,68 @@ mod tests {
         c.move_lines(&[Selection::cursor(0)], LineDirection::Down)
             .unwrap();
         assert_eq!(text(&c), "b\r\na");
+    }
+
+    #[test]
+    fn whole_line_selection_ending_at_column_zero_does_not_touch_next_line() {
+        let sel = [Selection::new(0, 4)]; // exactly "one\n"
+        let mut b = buf("one\ntwo\nthree");
+        b.delete_lines(&sel).unwrap();
+        assert_eq!(text(&b), "two\nthree");
+        let mut b = buf("one\ntwo\nthree");
+        b.duplicate_lines(&sel).unwrap();
+        assert_eq!(text(&b), "one\none\ntwo\nthree");
+        let mut b = buf("one\ntwo\nthree");
+        b.move_lines(&sel, LineDirection::Down).unwrap();
+        assert_eq!(text(&b), "two\none\nthree");
+    }
+
+    #[test]
+    fn move_lines_handles_trailing_newline_and_separate_blocks() {
+        let mut b = buf("a\nb\n");
+        let out = b
+            .move_lines(&[Selection::cursor(2)], LineDirection::Down)
+            .unwrap();
+        assert_eq!(out.edit, None, "last content line stays put");
+        assert_eq!(text(&b), "a\nb\n");
+
+        let mut b = buf("l0\nl1\nl2\nl3\nl4\nl5");
+        let out = b
+            .move_lines(
+                &[Selection::cursor(0), Selection::cursor(12)],
+                LineDirection::Down,
+            )
+            .unwrap();
+        assert_eq!(text(&b), "l1\nl0\nl2\nl3\nl5\nl4");
+        assert_eq!(
+            out.selections,
+            vec![Selection::cursor(3), Selection::cursor(15)]
+        );
+        let out = b
+            .move_lines(
+                &[Selection::cursor(3), Selection::cursor(15)],
+                LineDirection::Up,
+            )
+            .unwrap();
+        assert_eq!(text(&b), "l0\nl1\nl2\nl3\nl4\nl5");
+        assert_eq!(
+            out.selections,
+            vec![Selection::cursor(0), Selection::cursor(12)]
+        );
+    }
+
+    #[test]
+    fn backspace_records_original_cursor_and_normalizes() {
+        let mut b = buf("héllo");
+        b.backspace(&[Selection::cursor(3)]).unwrap();
+        let (_, sel) = b.undo_with_selections().unwrap();
+        assert_eq!(sel, Some(vec![Selection::cursor(3)]));
+        let mut b = buf("abc");
+        let out = b
+            .backspace(&[Selection::cursor(1), Selection::cursor(2)])
+            .unwrap();
+        assert_eq!(text(&b), "c");
+        assert_eq!(out.selections, vec![Selection::cursor(0)]);
     }
 
     #[test]

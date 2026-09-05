@@ -74,8 +74,8 @@ A community alternative exists — **`gpui-component`** (longbridge/gpui-compone
 | **Input** | Single-line text field with selection, clipboard, undo. Auto-resizes to content when used in palettes. Emits `on_change` and `on_submit` callbacks. **Status (2026-09-03):** `tempr_ui::components::Input` — selection, clipboard, IME/marked text, grapheme-aware cursor; emits `InputEvent::{Changed, Submit}`; keybindings come from the command catalog (`tempr_ui::commands`, context `Input`). Undo and auto-resize are TODO. |
 | **List** | Virtualized scrollable list, wrapping `uniform_list` (fixed row height) or `list` + `ListState` when rows vary. Only renders visible rows. Supports multi-select and keyboard navigation (↑/↓/Home/End/PageUp/PageDown). Used for palette results, sidebar items. |
 | **Table** | Virtualized, columnar grid built on `uniform_list` for rows plus Tempr's own column virtualization. Shared with the result grid (§6 data flow). Columns are resizable. Cells support copy-on-select. Keyboard navigable in a 2D grid pattern. **Status (2026-09-03):** Phase 1 `tempr_ui::components::ResultGrid` — `uniform_list` row virtualization, fixed 180 px columns, horizontal scroll, `∅` for NULL, rows appended per `Batch`. Column virtualization/resize, copy, 2D keyboard nav, and the columnar `RowStore` are TODO. |
-| **Editor** | Multi-line SQL editor over `tempr_editor::Buffer`. **Status (2026-09-05):** `tempr_ui::components::EditorView` — `uniform_list` of lines (gutter numbers, current-line tint), tree-sitter highlights via `theme::highlight_color`, multi-cursor selections/cursors painted per line, IME through `EntityInputHandler`, mouse click places the cursor; 33 keyboard commands (context `Editor`) drive motions/edit ops/undo/redo/clipboard/line ops; emits `EditorEvent::{Changed, Run(sql), Notice}` — ctrl-enter runs the statement under the cursor (selection if any; `StatementKind::Error` is refused), ctrl-shift-enter runs everything. Horizontal scroll/wrapping, search, and multi-cursor creation are TODO. |
-| **Palette** | Modal overlay combining `Input` + `List`. Fuzzy-search over a command or file list. Activated via a global keybinding. Returns selection to the caller. **Status (2026-09-05):** `tempr_ui::components::Palette` — `Input` + `uniform_list` over `CommandService::search`; ctrl-shift-p toggles, ↑/↓ (ctrl-p/ctrl-n) select, enter emits `PaletteEvent::Execute(id)`, escape dismisses; `MainWindow` dispatches. Per-character match highlighting is TODO. |
+| **Editor** | Multi-line SQL editor over `tempr_editor::Buffer`. **Status (2026-09-05):** `tempr_ui::components::EditorView` — see [10 — Editor](./10-editor.md) "EditorView" for what is implemented and what is still TODO. |
+| **Palette** | Modal overlay combining `Input` + `List`. Fuzzy-search over a command or file list. Activated via a global keybinding. Returns selection to the caller. **Status (2026-09-05):** `tempr_ui::components::Palette` — `Input` + `uniform_list` over `CommandService::search`; ctrl-shift-p toggles, ↑/↓ (ctrl-p/ctrl-n) select, enter emits `PaletteEvent::Execute(id)`, escape dismisses; `MainWindow` dispatches. The palette adds `Modal` to its key context; main-window bindings use the `MainWindow && !Modal` predicate so any future overlay suspends them the same way. Focus returns to whatever was focused before it opened. Per-character match highlighting is TODO. |
 | **Dock/Panel** | Resizable sidebar/bottom panel container. Panels can be collapsed, floated, or docked to any edge. State is persisted to workspace config (§8). |
 | **Tabs** | Horizontal tab bar. Each tab has a label, optional dirty indicator, and close button. Tabs are reorderable via drag. Keyboard navigable (Ctrl+Tab, Ctrl+Shift+Tab). |
 | **StatusBar** | Bottom bar rendered as a fixed-height `Div`. Displays connection status, active database, line/column, and mode indicator. Right-aligned actions are `Button` components. |
@@ -84,64 +84,64 @@ A community alternative exists — **`gpui-component`** (longbridge/gpui-compone
 
 ### Command Catalog
 
-Every user action is a GPUI action listed once in `tempr_ui::commands::core_commands()` (D23). A unit test fails the build if a command has no default keystroke — this table *is* the keyboard-only audit. Regenerate with `TEMPR_LIST_COMMANDS=1 cargo run` (effective keys after user/workspace overrides):
+Every user action is a GPUI action listed once in `tempr_ui::commands::core_commands()` (D23). A unit test fails the build if a command has no default keystroke — this table *is* the keyboard-only audit. Regenerate with `TEMPR_LIST_COMMANDS=1 cargo run` (effective keys after user/workspace overrides; `pal` = searchable in the palette — `-` marks commands that only make sense inside the palette or its single-line `Input`):
 
 ```
-id                                 title                        category     context     keys
-main_window::Quit                  Quit                         Application  (global)    ctrl-q, cmd-q
-input::Backspace                   Edit: Backspace              Edit         Input       backspace
-input::Copy                        Edit: Copy                   Edit         Input       ctrl-c, cmd-c
-input::Cut                         Edit: Cut                    Edit         Input       ctrl-x, cmd-x
-input::Delete                      Edit: Delete                 Edit         Input       delete
-input::End                         Edit: Line End               Edit         Input       end
-input::Home                        Edit: Line Start             Edit         Input       home
-input::Left                        Edit: Move Left              Edit         Input       left
-input::Right                       Edit: Move Right             Edit         Input       right
-input::Paste                       Edit: Paste                  Edit         Input       ctrl-v, cmd-v
-input::SelectAll                   Edit: Select All             Edit         Input       ctrl-a, cmd-a
-input::SelectLeft                  Edit: Select Left            Edit         Input       shift-left
-input::SelectRight                 Edit: Select Right           Edit         Input       shift-right
-input::Submit                      Edit: Submit                 Edit         Input       enter
-editor::Backspace                  Editor: Backspace            Editor       Editor      backspace
-editor::Copy                       Editor: Copy                 Editor       Editor      ctrl-c, cmd-c
-editor::Cut                        Editor: Cut                  Editor       Editor      ctrl-x, cmd-x
-editor::Delete                     Editor: Delete               Editor       Editor      delete
-editor::DeleteLine                 Editor: Delete Line          Editor       Editor      ctrl-shift-k, cmd-shift-k
-editor::DocumentEnd                Editor: Document End         Editor       Editor      ctrl-end, cmd-down
-editor::DocumentStart              Editor: Document Start       Editor       Editor      ctrl-home, cmd-up
-editor::DuplicateLine              Editor: Duplicate Line       Editor       Editor      ctrl-shift-d, cmd-shift-d
-editor::Tab                        Editor: Indent               Editor       Editor      tab
-editor::LineEnd                    Editor: Line End             Editor       Editor      end
-editor::LineStart                  Editor: Line Start           Editor       Editor      home
-editor::MoveDown                   Editor: Move Down            Editor       Editor      down
-editor::MoveLeft                   Editor: Move Left            Editor       Editor      left
-editor::MoveLineDown               Editor: Move Line Down       Editor       Editor      alt-down
-editor::MoveLineUp                 Editor: Move Line Up         Editor       Editor      alt-up
-editor::MoveRight                  Editor: Move Right           Editor       Editor      right
-editor::MoveUp                     Editor: Move Up              Editor       Editor      up
-editor::Newline                    Editor: New Line             Editor       Editor      enter
-editor::Paste                      Editor: Paste                Editor       Editor      ctrl-v, cmd-v
-editor::Redo                       Editor: Redo                 Editor       Editor      ctrl-shift-z, ctrl-y, cmd-shift-z
-editor::SelectAll                  Editor: Select All           Editor       Editor      ctrl-a, cmd-a
-editor::SelectDown                 Editor: Select Down          Editor       Editor      shift-down
-editor::SelectLeft                 Editor: Select Left          Editor       Editor      shift-left
-editor::SelectRight                Editor: Select Right         Editor       Editor      shift-right
-editor::SelectUp                   Editor: Select Up            Editor       Editor      shift-up
-editor::SelectWordLeft             Editor: Select Word Left     Editor       Editor      ctrl-shift-left, alt-shift-left
-editor::SelectWordRight            Editor: Select Word Right    Editor       Editor      ctrl-shift-right, alt-shift-right
-editor::SelectLineEnd              Editor: Select to Line End   Editor       Editor      shift-end
-editor::SelectLineStart            Editor: Select to Line Start Editor       Editor      shift-home
-editor::Undo                       Editor: Undo                 Editor       Editor      ctrl-z, cmd-z
-editor::WordLeft                   Editor: Word Left            Editor       Editor      ctrl-left, alt-left
-editor::WordRight                  Editor: Word Right           Editor       Editor      ctrl-right, alt-right
-palette::Dismiss                   Palette: Close               Palette      Palette     escape
-palette::SelectNext                Palette: Next Item           Palette      Palette     down, ctrl-n
-palette::SelectPrev                Palette: Previous Item       Palette      Palette     up, ctrl-p
-main_window::CancelQuery           Cancel Query                 Query        MainWindow && !Palette escape
-editor::RunAll                     Run All Statements           Query        Editor      ctrl-shift-enter, cmd-shift-enter
-main_window::RunQuery              Run Query                    Query        MainWindow && !Palette ctrl-enter, cmd-enter
-main_window::DebugScrollBenchmark  Debug: Scroll Benchmark      View         MainWindow && !Palette ctrl-shift-b, cmd-shift-b
-main_window::TogglePalette         Toggle Command Palette       View         (global)    ctrl-shift-p, cmd-shift-p
+id                                 title                          category     context                pal  keys
+main_window::Quit                  Quit                           Application  (global)               yes  ctrl-q, cmd-q
+input::Backspace                   Edit: Backspace                Edit         Input                  -    backspace
+input::Copy                        Edit: Copy                     Edit         Input                  -    ctrl-c, cmd-c
+input::Cut                         Edit: Cut                      Edit         Input                  -    ctrl-x, cmd-x
+input::Delete                      Edit: Delete                   Edit         Input                  -    delete
+input::End                         Edit: Line End                 Edit         Input                  -    end
+input::Home                        Edit: Line Start               Edit         Input                  -    home
+input::Left                        Edit: Move Left                Edit         Input                  -    left
+input::Right                       Edit: Move Right               Edit         Input                  -    right
+input::Paste                       Edit: Paste                    Edit         Input                  -    ctrl-v, cmd-v
+input::SelectAll                   Edit: Select All               Edit         Input                  -    ctrl-a, cmd-a
+input::SelectLeft                  Edit: Select Left              Edit         Input                  -    shift-left
+input::SelectRight                 Edit: Select Right             Edit         Input                  -    shift-right
+input::Submit                      Edit: Submit                   Edit         Input                  -    enter
+editor::Backspace                  Editor: Backspace              Editor       Editor                 yes  backspace
+editor::Copy                       Editor: Copy                   Editor       Editor                 yes  ctrl-c, cmd-c
+editor::Cut                        Editor: Cut                    Editor       Editor                 yes  ctrl-x, cmd-x
+editor::Delete                     Editor: Delete                 Editor       Editor                 yes  delete
+editor::DeleteLine                 Editor: Delete Line            Editor       Editor                 yes  ctrl-shift-k, cmd-shift-k
+editor::DocumentEnd                Editor: Document End           Editor       Editor                 yes  ctrl-end, cmd-down
+editor::DocumentStart              Editor: Document Start         Editor       Editor                 yes  ctrl-home, cmd-up
+editor::DuplicateLine              Editor: Duplicate Line         Editor       Editor                 yes  ctrl-shift-d, cmd-shift-d
+editor::Tab                        Editor: Indent                 Editor       Editor                 yes  tab
+editor::LineEnd                    Editor: Line End               Editor       Editor                 yes  end
+editor::LineStart                  Editor: Line Start             Editor       Editor                 yes  home
+editor::MoveDown                   Editor: Move Down              Editor       Editor                 yes  down
+editor::MoveLeft                   Editor: Move Left              Editor       Editor                 yes  left
+editor::MoveLineDown               Editor: Move Line Down         Editor       Editor                 yes  alt-down
+editor::MoveLineUp                 Editor: Move Line Up           Editor       Editor                 yes  alt-up
+editor::MoveRight                  Editor: Move Right             Editor       Editor                 yes  right
+editor::MoveUp                     Editor: Move Up                Editor       Editor                 yes  up
+editor::Newline                    Editor: New Line               Editor       Editor                 yes  enter
+editor::Paste                      Editor: Paste                  Editor       Editor                 yes  ctrl-v, cmd-v
+editor::Redo                       Editor: Redo                   Editor       Editor                 yes  ctrl-shift-z, ctrl-y, cmd-shift-z
+editor::SelectAll                  Editor: Select All             Editor       Editor                 yes  ctrl-a, cmd-a
+editor::SelectDown                 Editor: Select Down            Editor       Editor                 yes  shift-down
+editor::SelectLeft                 Editor: Select Left            Editor       Editor                 yes  shift-left
+editor::SelectRight                Editor: Select Right           Editor       Editor                 yes  shift-right
+editor::SelectUp                   Editor: Select Up              Editor       Editor                 yes  shift-up
+editor::SelectWordLeft             Editor: Select Word Left       Editor       Editor                 yes  ctrl-shift-left, alt-shift-left
+editor::SelectWordRight            Editor: Select Word Right      Editor       Editor                 yes  ctrl-shift-right, alt-shift-right
+editor::SelectLineEnd              Editor: Select to Line End     Editor       Editor                 yes  shift-end
+editor::SelectLineStart            Editor: Select to Line Start   Editor       Editor                 yes  shift-home
+editor::Undo                       Editor: Undo                   Editor       Editor                 yes  ctrl-z, cmd-z
+editor::WordLeft                   Editor: Word Left              Editor       Editor                 yes  ctrl-left, alt-left
+editor::WordRight                  Editor: Word Right             Editor       Editor                 yes  ctrl-right, alt-right
+palette::Dismiss                   Palette: Close                 Palette      Palette                -    escape
+palette::SelectNext                Palette: Next Item             Palette      Palette                -    down, ctrl-n
+palette::SelectPrev                Palette: Previous Item         Palette      Palette                -    up, ctrl-p
+main_window::CancelQuery           Cancel Query                   Query        MainWindow && !Modal   yes  escape
+editor::RunAll                     Run All Statements             Query        Editor                 yes  ctrl-shift-enter, cmd-shift-enter
+main_window::RunQuery              Run Query                      Query        MainWindow && !Modal   yes  ctrl-enter, cmd-enter
+main_window::DebugScrollBenchmark  Debug: Scroll Benchmark        View         MainWindow && !Modal   yes  ctrl-shift-b, cmd-shift-b
+main_window::TogglePalette         Toggle Command Palette         View         (global)               -    ctrl-shift-p, cmd-shift-p
 ```
 
 Overrides: `~/.config/tempr/settings.toml` (user) and `workspace.toml` (workspace), `[keybindings]` table, `"command id" = ["keystroke", …]`, GPUI syntax (`ctrl-shift-p`; chords space-separated), `[]` unbinds.

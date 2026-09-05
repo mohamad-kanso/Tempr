@@ -13,11 +13,11 @@ use gpui::{
     LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point as GpuiPoint, Render,
     ScrollStrategy, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
     UniformListScrollHandle, Window, actions, div, fill, point, prelude::*, px, relative, rgb,
-    rgba, size, uniform_list,
+    size, uniform_list,
 };
 use tempr_domain::SqlFileId;
 use tempr_editor::edit_ops::LineDirection;
-use tempr_editor::{Buffer, Highlight, Selection, StatementKind};
+use tempr_editor::{Buffer, Highlight, HighlightKind, Selection, StatementKind};
 
 use crate::theme;
 
@@ -91,7 +91,12 @@ pub struct EditorView {
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     /// Layouts of the lines painted last frame, for mouse/IME geometry.
+    /// Layouts of the lines painted in the *current* frame (rebuilt by the
+    /// `uniform_list` processor, filled by `LineElement::paint`).
     line_layouts: HashMap<usize, LineLayout>,
+    /// Line range the list rendered last frame; drives scroll direction
+    /// and the IME-handler fallback line.
+    visible_lines: Range<usize>,
     /// Highlights for the lines rendered this frame.
     visible_highlights: Vec<Highlight>,
 }
@@ -108,6 +113,7 @@ impl EditorView {
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             line_layouts: HashMap::new(),
+            visible_lines: 0..0,
             visible_highlights: Vec::new(),
         }
     }
@@ -169,13 +175,32 @@ impl EditorView {
             tempr_editor::selection::normalize(&sels)
         };
         let line = self.buffer.point_for_offset(self.primary().head).line;
-        self.scroll_handle.scroll_to_item(line, ScrollStrategy::Top);
+        // `visible_lines` is last frame's range: good enough to pick a side.
+        if line < self.visible_lines.start {
+            self.scroll_handle.scroll_to_item(line, ScrollStrategy::Top);
+        } else if line >= self.visible_lines.end {
+            self.scroll_handle
+                .scroll_to_item(line, ScrollStrategy::Bottom);
+        }
         cx.notify();
     }
 
+    /// Undo/redo landed: announce the change and restore the recorded
+    /// selections (or a cursor at 0 for edits recorded without any).
+    fn restore(&mut self, sels: Option<Vec<Selection>>, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::Changed);
+        self.goal_column = None;
+        self.set_selections(sels.unwrap_or_else(|| vec![Selection::cursor(0)]), cx);
+    }
+
+    /// Apply a motion to every selection head. `collapse_to_edge`: a plain
+    /// left/right on a non-empty selection lands on its edge instead of
+    /// moving from the head (grapheme motions only; word/line/document
+    /// motions always move from the head, as in Zed).
     fn move_each(
         &mut self,
         extend: bool,
+        collapse_to_edge: bool,
         cx: &mut Context<Self>,
         f: impl Fn(&Buffer, usize) -> usize,
     ) {
@@ -184,8 +209,7 @@ impl EditorView {
             .selections
             .iter()
             .map(|s| {
-                let target = if !extend && !s.is_empty() {
-                    // Collapsing a selection with a plain motion lands at its edge.
+                let target = if collapse_to_edge && !extend && !s.is_empty() {
                     let edge = f(&self.buffer, s.head);
                     if edge < s.head { s.start() } else { s.end() }
                 } else {
@@ -242,16 +266,16 @@ impl EditorView {
     // ── actions ──────────────────────────────────────────────────────────
 
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(false, cx, |b, o| b.prev_grapheme_boundary(o));
+        self.move_each(false, true, cx, |b, o| b.prev_grapheme_boundary(o));
     }
     fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(false, cx, |b, o| b.next_grapheme_boundary(o));
+        self.move_each(false, true, cx, |b, o| b.next_grapheme_boundary(o));
     }
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(true, cx, |b, o| b.prev_grapheme_boundary(o));
+        self.move_each(true, true, cx, |b, o| b.prev_grapheme_boundary(o));
     }
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(true, cx, |b, o| b.next_grapheme_boundary(o));
+        self.move_each(true, true, cx, |b, o| b.next_grapheme_boundary(o));
     }
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
         self.move_vertical(-1, false, cx);
@@ -266,28 +290,28 @@ impl EditorView {
         self.move_vertical(1, true, cx);
     }
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(false, cx, |b, o| b.prev_word_boundary(o));
+        self.move_each(false, false, cx, |b, o| b.prev_word_boundary(o));
     }
     fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(false, cx, |b, o| b.next_word_boundary(o));
+        self.move_each(false, false, cx, |b, o| b.next_word_boundary(o));
     }
     fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(true, cx, |b, o| b.prev_word_boundary(o));
+        self.move_each(true, false, cx, |b, o| b.prev_word_boundary(o));
     }
     fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(true, cx, |b, o| b.next_word_boundary(o));
+        self.move_each(true, false, cx, |b, o| b.next_word_boundary(o));
     }
     fn line_start(&mut self, _: &LineStart, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(false, cx, |b, o| b.line_start(o));
+        self.move_each(false, false, cx, |b, o| b.line_start(o));
     }
     fn line_end(&mut self, _: &LineEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(false, cx, |b, o| b.line_end(o));
+        self.move_each(false, false, cx, |b, o| b.line_end(o));
     }
     fn select_line_start(&mut self, _: &SelectLineStart, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(true, cx, |b, o| b.line_start(o));
+        self.move_each(true, false, cx, |b, o| b.line_start(o));
     }
     fn select_line_end(&mut self, _: &SelectLineEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_each(true, cx, |b, o| b.line_end(o));
+        self.move_each(true, false, cx, |b, o| b.line_end(o));
     }
     fn document_start(&mut self, _: &DocumentStart, _: &mut Window, cx: &mut Context<Self>) {
         self.set_selections(vec![Selection::cursor(0)], cx);
@@ -314,16 +338,12 @@ impl EditorView {
     }
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((_, sels)) = self.buffer.undo_with_selections() {
-            cx.emit(EditorEvent::Changed);
-            let sels = sels.unwrap_or_else(|| vec![Selection::cursor(0)]);
-            self.set_selections(sels, cx);
+            self.restore(sels, cx);
         }
     }
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((_, sels)) = self.buffer.redo_with_selections() {
-            cx.emit(EditorEvent::Changed);
-            let sels = sels.unwrap_or_else(|| vec![Selection::cursor(0)]);
-            self.set_selections(sels, cx);
+            self.restore(sels, cx);
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -386,14 +406,11 @@ impl EditorView {
         Some(layout.start + rel)
     }
 
-    /// Text runs for one line from the cached visible highlights.
-    fn runs_for_line(
-        &self,
-        line_start: usize,
-        text: &str,
-        font: gpui::Font,
-        current: bool,
-    ) -> Vec<TextRun> {
+    /// Text runs for one line from the cached visible highlights. Captures
+    /// are applied in query order onto a per-byte map, so a nested capture
+    /// (e.g. a string inside a function call) overrides the enclosing one
+    /// instead of being dropped.
+    fn runs_for_line(&self, line_start: usize, text: &str, font: gpui::Font) -> Vec<TextRun> {
         let base = TextRun {
             len: 0,
             font,
@@ -402,38 +419,35 @@ impl EditorView {
             underline: None,
             strikethrough: None,
         };
-        let _ = current;
-        let line_end = line_start + text.len();
-        let mut runs: Vec<TextRun> = Vec::new();
-        let mut cursor = line_start;
-        for h in self
-            .visible_highlights
-            .iter()
-            .filter(|h| h.range.start < line_end && h.range.end > line_start)
-        {
-            let start = h.range.start.max(line_start).max(cursor);
-            let end = h.range.end.min(line_end);
-            if start >= end {
-                continue;
-            }
-            if start > cursor {
-                runs.push(TextRun {
-                    len: start - cursor,
-                    ..base.clone()
-                });
-            }
-            runs.push(TextRun {
-                len: end - start,
-                color: rgb(theme::highlight_color(&h.capture)).into(),
-                ..base.clone()
-            });
-            cursor = end;
+        if text.is_empty() {
+            return Vec::new();
         }
-        if cursor < line_end {
-            runs.push(TextRun {
-                len: line_end - cursor,
-                ..base
-            });
+        let line_end = line_start + text.len();
+        let mut kinds: Vec<Option<HighlightKind>> = vec![None; text.len()];
+        // `visible_highlights` is sorted by start: stop at the first capture
+        // beginning after this line.
+        let upper = self
+            .visible_highlights
+            .partition_point(|h| h.range.start < line_end);
+        for h in self.visible_highlights[..upper]
+            .iter()
+            .filter(|h| h.range.end > line_start)
+        {
+            let a = h.range.start.max(line_start) - line_start;
+            let b = h.range.end.min(line_end) - line_start;
+            kinds[a..b].fill(Some(h.kind));
+        }
+        let mut runs: Vec<TextRun> = Vec::new();
+        for kind in kinds {
+            let color: gpui::Hsla = rgb(kind.map_or(theme::TEXT, theme::highlight_color)).into();
+            match runs.last_mut() {
+                Some(last) if last.color == color => last.len += 1,
+                _ => runs.push(TextRun {
+                    len: 1,
+                    color,
+                    ..base.clone()
+                }),
+            }
         }
         runs
     }
@@ -556,15 +570,13 @@ impl EntityInputHandler for EditorView {
         cx: &mut Context<Self>,
     ) {
         // Minimal IME: insert the composition and mark it; the marked text is
-        // replaced by the next call.
-        let start_before = range_utf16
-            .as_ref()
-            .map(|r| self.buffer.offset_from_utf16(r.start))
-            .or_else(|| self.marked_range.as_ref().map(|r| r.start))
-            .unwrap_or(self.primary().start());
+        // replaced by the next call. The mark is derived from where the
+        // primary cursor actually landed, so it stays right with multiple
+        // cursors or a rejected edit.
         self.replace_text_in_range(range_utf16, new_text, window, cx);
+        let head = self.primary().head;
         self.marked_range =
-            (!new_text.is_empty()).then(|| start_before..start_before + new_text.len());
+            (!new_text.is_empty() && head >= new_text.len()).then(|| head - new_text.len()..head);
     }
 
     fn bounds_for_range(
@@ -646,10 +658,18 @@ impl Render for EditorView {
                     "editor-lines",
                     line_count,
                     cx.processor(|this, range: Range<usize>, _window, cx| {
+                        // Per-frame state: layouts are re-filled by paint.
+                        this.line_layouts.clear();
+                        this.visible_lines = range.clone();
+                        if range.is_empty() {
+                            this.visible_highlights.clear();
+                            return Vec::new();
+                        }
                         // Highlights for exactly the lines about to be rendered.
                         let start = this.buffer.line_start_of(range.start);
-                        let end = this.buffer.line_end_of(range.end.saturating_sub(1));
+                        let end = this.buffer.line_end_of(range.end - 1);
                         this.visible_highlights = this.buffer.highlights(start..end);
+                        this.visible_highlights.sort_by_key(|h| h.range.start);
                         range
                             .map(|line| this.render_line(line, cx))
                             .collect::<Vec<_>>()
@@ -662,7 +682,7 @@ impl Render for EditorView {
 }
 
 /// Paints one line: text with highlight runs, selection backgrounds, and
-/// cursors; registers the IME handler on the primary cursor's line.
+/// cursors; registers the IME handler (see `LinePrepaint::hosts_ime`).
 struct LineElement {
     view: Entity<EditorView>,
     line: usize,
@@ -673,7 +693,10 @@ struct LinePrepaint {
     selections: Vec<PaintQuad>,
     cursors: Vec<PaintQuad>,
     start: usize,
-    is_primary_line: bool,
+    /// Registers the IME/input handler: the primary cursor's line, or the
+    /// first visible line when that cursor is scrolled out of view (typing
+    /// must never be dropped).
+    hosts_ime: bool,
 }
 
 impl IntoElement for LineElement {
@@ -722,7 +745,7 @@ impl gpui::Element for LineElement {
         let start = view.buffer.line_start_of(self.line);
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let runs = view.runs_for_line(start, &text, style.font(), false);
+        let runs = view.runs_for_line(start, &text, style.font());
         let shaped = window
             .text_system()
             .shape_line(text.clone(), font_size, &runs, None);
@@ -732,7 +755,9 @@ impl gpui::Element for LineElement {
         let mut cursors = Vec::new();
         let primary = view.primary();
         for s in &view.selections {
-            if !s.is_empty() && s.start() < line_end.max(start + 1) && s.end() > start {
+            // Overlaps this line's text or its newline (a selection covering
+            // only the newline still paints, as a strip to the right edge).
+            if !s.is_empty() && s.start() <= line_end && s.end() > start && s.start() < s.end() {
                 let a = s.start().clamp(start, line_end) - start;
                 let b = s.end().clamp(start, line_end) - start;
                 let x0 = shaped.x_for_index(a);
@@ -747,7 +772,7 @@ impl gpui::Element for LineElement {
                         point(bounds.left() + x0, bounds.top()),
                         point(bounds.left() + x1.max(x0 + px(4.)), bounds.bottom()),
                     ),
-                    rgba((theme::SELECTION << 8) | 0x40),
+                    theme::selection_fill(),
                 ));
             }
             if s.head >= start && s.head <= line_end {
@@ -761,12 +786,16 @@ impl gpui::Element for LineElement {
                 ));
             }
         }
+        let primary_line = view.buffer.point_for_offset(primary.head).line;
+        let hosts_ime = primary_line == self.line
+            || (!view.visible_lines.contains(&primary_line)
+                && self.line == view.visible_lines.start);
         LinePrepaint {
             shaped,
             selections,
             cursors,
             start,
-            is_primary_line: primary.head >= start && primary.head <= line_end,
+            hosts_ime,
         }
     }
 
@@ -781,7 +810,7 @@ impl gpui::Element for LineElement {
         cx: &mut App,
     ) {
         let focus_handle = self.view.read(cx).focus_handle.clone();
-        if prepaint.is_primary_line {
+        if prepaint.hosts_ime {
             window.handle_input(
                 &focus_handle,
                 ElementInputHandler::new(bounds, self.view.clone()),

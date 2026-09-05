@@ -16,4 +16,4 @@ pub mod syntax;
 pub use buffer::{Buffer, EditError, EditId, Point};
 pub use edit_ops::EditOutcome;
 pub use selection::Selection;
-pub use syntax::{Highlight, StatementKind, StatementRange, SyntaxTree};
+pub use syntax::{Highlight, HighlightKind, StatementKind, StatementRange, SyntaxTree};

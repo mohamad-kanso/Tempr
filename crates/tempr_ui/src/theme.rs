@@ -26,18 +26,25 @@ pub const HL_PUNCTUATION: u32 = 0x9399b2;
 pub const EDITOR_GUTTER: u32 = 0x45475a;
 pub const EDITOR_CURRENT_LINE: u32 = 0x24243a;
 
-/// Color for a highlight capture; `TEXT` for anything unmapped.
-pub fn highlight_color(capture: &str) -> u32 {
-    match capture {
-        "keyword" | "conditional" | "attribute" | "storageclass" => HL_KEYWORD,
-        "keyword.operator" => HL_KEYWORD_OPERATOR,
-        "string" => HL_STRING,
-        "number" | "float" | "boolean" => HL_NUMBER,
-        "comment" => HL_COMMENT,
-        "function.call" | "parameter" => HL_FUNCTION,
-        "type" | "type.builtin" | "type.qualifier" => HL_TYPE,
-        "operator" => HL_OPERATOR,
-        "punctuation.delimiter" | "punctuation.bracket" => HL_PUNCTUATION,
-        _ => TEXT,
+/// Color for a highlight kind (exhaustive: adding a kind in `tempr_editor`
+/// fails to compile here until it has a colour).
+pub fn highlight_color(kind: tempr_editor::HighlightKind) -> u32 {
+    use tempr_editor::HighlightKind as K;
+    match kind {
+        K::Keyword => HL_KEYWORD,
+        K::KeywordOperator => HL_KEYWORD_OPERATOR,
+        K::String => HL_STRING,
+        K::Number | K::Boolean => HL_NUMBER,
+        K::Comment => HL_COMMENT,
+        K::FunctionCall | K::Parameter => HL_FUNCTION,
+        K::Type => HL_TYPE,
+        K::Operator => HL_OPERATOR,
+        K::Punctuation => HL_PUNCTUATION,
+        K::Variable | K::Field | K::Other => TEXT,
     }
+}
+
+/// Translucent selection fill shared by every text component.
+pub fn selection_fill() -> gpui::Rgba {
+    gpui::rgba((SELECTION << 8) | 0x40)
 }

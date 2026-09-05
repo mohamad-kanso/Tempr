@@ -40,9 +40,7 @@ impl CommandSpec {
     /// (user-provided overrides must never panic).
     pub fn binding(&self, keystrokes: &str) -> Option<KeyBinding> {
         let valid = !keystrokes.trim().is_empty()
-            && keystrokes
-                .split_whitespace()
-                .all(|k| Keystroke::parse(k).is_ok());
+            && keystrokes.split_whitespace().all(is_fireable_keystroke);
         valid.then(|| (self.make_binding)(keystrokes, self.context))
     }
 
@@ -65,6 +63,38 @@ impl CommandSpec {
         self.hidden = true;
         self
     }
+}
+
+/// gpui parses almost any string ("ctrl+enter" becomes a key literally named
+/// `ctrl+enter`); require the key part to be one character or a known key
+/// name so mistyped overrides are rejected instead of silently dead.
+fn is_fireable_keystroke(source: &str) -> bool {
+    const NAMED: &[&str] = &[
+        "enter",
+        "escape",
+        "tab",
+        "backspace",
+        "delete",
+        "space",
+        "up",
+        "down",
+        "left",
+        "right",
+        "home",
+        "end",
+        "pageup",
+        "pagedown",
+        "insert",
+    ];
+    let Ok(ks) = Keystroke::parse(source) else {
+        return false;
+    };
+    let key = ks.key.as_str();
+    key.chars().count() == 1
+        || NAMED.contains(&key)
+        || (key.len() <= 3
+            && key.starts_with('f')
+            && key[1..].parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)))
 }
 
 fn spec<A: Action + Default>(
@@ -211,20 +241,21 @@ pub fn core_commands() -> Vec<CommandSpec> {
         ),
         spec::<ed::MoveLineUp>("Editor: Move Line Up", "Editor", ED, &["alt-up"]),
         spec::<ed::MoveLineDown>("Editor: Move Line Down", "Editor", ED, &["alt-down"]),
-        // Edit (single-line Input)
-        spec::<input::Backspace>("Edit: Backspace", "Edit", IN, &["backspace"]),
-        spec::<input::Delete>("Edit: Delete", "Edit", IN, &["delete"]),
-        spec::<input::Left>("Edit: Move Left", "Edit", IN, &["left"]),
-        spec::<input::Right>("Edit: Move Right", "Edit", IN, &["right"]),
-        spec::<input::SelectLeft>("Edit: Select Left", "Edit", IN, &["shift-left"]),
-        spec::<input::SelectRight>("Edit: Select Right", "Edit", IN, &["shift-right"]),
-        spec::<input::SelectAll>("Edit: Select All", "Edit", IN, &["ctrl-a", "cmd-a"]),
-        spec::<input::Home>("Edit: Line Start", "Edit", IN, &["home"]),
-        spec::<input::End>("Edit: Line End", "Edit", IN, &["end"]),
-        spec::<input::Paste>("Edit: Paste", "Edit", IN, &["ctrl-v", "cmd-v"]),
-        spec::<input::Cut>("Edit: Cut", "Edit", IN, &["ctrl-x", "cmd-x"]),
-        spec::<input::Copy>("Edit: Copy", "Edit", IN, &["ctrl-c", "cmd-c"]),
-        spec::<input::Submit>("Edit: Submit", "Edit", IN, &["enter"]),
+        // Edit (single-line Input — now only the palette's query box, so
+        // hidden from search: they cannot fire from the editor)
+        spec::<input::Backspace>("Edit: Backspace", "Edit", IN, &["backspace"]).hidden(),
+        spec::<input::Delete>("Edit: Delete", "Edit", IN, &["delete"]).hidden(),
+        spec::<input::Left>("Edit: Move Left", "Edit", IN, &["left"]).hidden(),
+        spec::<input::Right>("Edit: Move Right", "Edit", IN, &["right"]).hidden(),
+        spec::<input::SelectLeft>("Edit: Select Left", "Edit", IN, &["shift-left"]).hidden(),
+        spec::<input::SelectRight>("Edit: Select Right", "Edit", IN, &["shift-right"]).hidden(),
+        spec::<input::SelectAll>("Edit: Select All", "Edit", IN, &["ctrl-a", "cmd-a"]).hidden(),
+        spec::<input::Home>("Edit: Line Start", "Edit", IN, &["home"]).hidden(),
+        spec::<input::End>("Edit: Line End", "Edit", IN, &["end"]).hidden(),
+        spec::<input::Paste>("Edit: Paste", "Edit", IN, &["ctrl-v", "cmd-v"]).hidden(),
+        spec::<input::Cut>("Edit: Cut", "Edit", IN, &["ctrl-x", "cmd-x"]).hidden(),
+        spec::<input::Copy>("Edit: Copy", "Edit", IN, &["ctrl-c", "cmd-c"]).hidden(),
+        spec::<input::Submit>("Edit: Submit", "Edit", IN, &["enter"]).hidden(),
     ]
 }
 
@@ -238,11 +269,22 @@ pub fn install(cx: &mut App, service: &CommandService) {
     }
     let mut bindings = Vec::new();
     for s in &specs {
-        for keys in service.keystrokes_for(&s.id) {
-            match s.binding(&keys) {
-                Some(b) => bindings.push(b),
+        let resolved = service.keystrokes_for(&s.id);
+        let mut usable = 0;
+        for keys in &resolved {
+            match s.binding(keys) {
+                Some(b) => {
+                    bindings.push(b);
+                    usable += 1;
+                }
                 None => tracing::warn!(command = %s.id, keys, "invalid keystroke ignored"),
             }
+        }
+        // An override that left the command with no working key falls back
+        // to the defaults: no mouse-only features, even under bad config.
+        if usable == 0 && !resolved.is_empty() && !s.default_keystrokes.is_empty() {
+            tracing::warn!(command = %s.id, "no usable override keystroke; using defaults");
+            bindings.extend(s.default_keystrokes.iter().filter_map(|k| s.binding(k)));
         }
     }
     cx.bind_keys(bindings);
@@ -268,7 +310,9 @@ pub fn dispatch(
         return false;
     };
     let action = spec.action();
-    if !window.is_action_available(&*action, cx) {
+    // `Window::is_action_available` only sees node listeners on the focus
+    // path; global `cx.on_action` handlers (Quit) live on the App.
+    if !window.is_action_available(&*action, cx) && !cx.is_action_available(&*action) {
         return false;
     }
     window.dispatch_action(action, cx);
@@ -305,8 +349,17 @@ mod tests {
             "palette::Dismiss",
             "palette::SelectNext",
             "palette::SelectPrev",
+            "input::Submit",
         ] {
             assert!(hidden.iter().any(|h| h == id), "{id} must be hidden");
+        }
+        // Everything searchable must be reachable from the editor / main window.
+        for s in core_commands().iter().filter(|s| !s.hidden) {
+            assert!(
+                s.context != IN && s.context != PAL,
+                "{} is searchable but only handled inside the palette",
+                s.id
+            );
         }
     }
 
@@ -335,5 +388,13 @@ mod tests {
         assert!(run.binding("ctrl-k ctrl-r").is_some(), "chords");
         assert!(run.binding("").is_none());
         assert!(run.binding("   ").is_none());
+        assert!(
+            run.binding("ctrl+enter").is_none(),
+            "'+' is not a modifier separator"
+        );
+        assert!(run.binding("ctrl-").is_none(), "empty key");
+        assert!(run.binding("f5").is_some());
+        assert!(run.binding("ctrl-shift-p").is_some());
+        assert!(run.binding("é").is_some(), "any single character key");
     }
 }
