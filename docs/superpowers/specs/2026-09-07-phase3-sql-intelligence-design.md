@@ -24,6 +24,7 @@ This design covers the whole of Phase 3: the catalog cache, the semantic engine,
 **Out of scope**
 
 - Expression type inference and type-mismatch diagnostics (described in 12-sql-intelligence, demanded by no Phase 3 criterion; deferred to TODO).
+- Schemas off the connection's `search_path` (§4.4) — reachable through `schema::RefreshAllSchemas`, not cached by default.
 - Cross-file workspace symbol indexing (`WorkspaceIndex` in 12-sql-intelligence) — there is no file-open flow yet; the engine is written so the index can be added as a second candidate source without reshaping the API.
 - Plugin-authored completion providers beyond the call seam (no plugins ship in this phase).
 - Schema browser UI.
@@ -41,6 +42,9 @@ This design covers the whole of Phase 3: the catalog cache, the semantic engine,
 | 5 | Completion opens automatically after one identifier character, after a qualifier dot, or on ctrl-space | User's call; matches the roadmap demo |
 | 6 | The analyzer resolves scopes, aliases, CTEs and subqueries — no type inference | Exactly what the exit criteria require |
 | 7 | Completion and hover are synchronous on the UI thread; diagnostics are analyzed on a debounce in the background | The only arrangement that satisfies both "< 5 ms" and "never block the UI thread" |
+| 8 | `AmbiguousColumn` is a **warning**; syntax, unknown relation and unknown column are errors | User's call; an ambiguous reference is valid SQL that the server may still accept — it deserves attention, not a red line |
+| 9 | Keywords come from `pg_get_keywords()` on the connected server, cached with the catalog | Matches the server's own version exactly, costs one query at refresh time, and keeps the request path free of I/O |
+| 10 | The catalog covers the schemas on `search_path` plus `public`, not every schema | User's call; matches what unqualified SQL can actually reference, and keeps 10 000 objects a realistic ceiling on databases with many tenant schemas |
 
 Decisions 2, 3, 4 and 7 are MAJOR and get DECISIONS.md entries when their PR lands (D25–D28), not before — an entry describes a decision that shipped.
 
@@ -169,7 +173,39 @@ The diff is then:
 
 A frozen catalog row (after `VACUUM FREEZE`) reports `xmin = 2`, which differs from the cached value and triggers a re-introspect. That is a false positive, never a missed change — the safe direction.
 
-Both paths publish `SchemaRefreshed { connection, snapshot }` exactly as today, so existing subscribers are unaffected. `IntelligenceService` subscribes and swaps the `CatalogCache` behind the engine's lock.
+### 4.4 Catalog scope
+
+The catalog covers the schemas on the connection's `search_path` plus `public`, not every non-system schema (which is what `SchemaScope::All` means today). `SchemaScope` gains a variant:
+
+```rust
+pub enum SchemaScope { SearchPath, All, Schema(String), Table { schema: String, table: String } }
+```
+
+PostgreSQL resolves `SearchPath` as `SELECT unnest(current_schemas(false))` unioned with `public`; `current_schemas(false)` excludes the implicit `pg_catalog`, which the catalog does not want as user-visible content. `SchemaService` uses `SearchPath` for both full and incremental refresh, and the fingerprint query applies the same filter — otherwise every out-of-scope relation would read as "dropped" on the next diff.
+
+**Consequence to accept knowingly**: typing `other_schema.` completes nothing when `other_schema` is off the search path, because those relations were never introspected. `schema::RefreshAllSchemas` (a second command, `SchemaScope::All`) exists as the escape hatch, and a per-connection setting for the default scope goes to TODO. This is the right default — unqualified SQL can only reference what is on the search path — but it is a visible behavioural edge, not a hidden one.
+
+### 4.5 Keywords
+
+Completion needs SQL keywords, and they must not cost a query on the request path. The driver gains:
+
+```rust
+async fn keywords(&mut self) -> Result<Vec<String>, DriverError>;  // default: Ok(Vec::new())
+```
+
+PostgreSQL implements it as `SELECT word FROM pg_get_keywords()`, so the list matches the connected server's version rather than a list hand-copied from a manual. The result is fetched once per refresh and stored with the snapshot:
+
+```rust
+pub struct SchemaSnapshot {
+    /* … existing fields … */
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+```
+
+`#[serde(default)]` keeps older cache files loadable, and the `.tcat` format version bumps anyway. A driver that returns an empty list simply contributes no keyword candidates.
+
+Both refresh paths publish `SchemaRefreshed { connection, snapshot }` exactly as today, so existing subscribers are unaffected. `IntelligenceService` subscribes and swaps the `CatalogCache` behind the engine's lock.
 
 ---
 
@@ -208,8 +244,11 @@ Per statement (statement ranges come from `SyntaxTree::statement_ranges`, alread
 4. **Emit diagnostics.**
    ```rust
    pub enum DiagnosticKind { SyntaxError, UnknownRelation, UnknownColumn, AmbiguousColumn }
-   pub struct Diagnostic { pub range: Range<usize>, pub kind: DiagnosticKind, pub message: String }
+   pub enum Severity { Error, Warning }
+   pub struct Diagnostic { pub range: Range<usize>, pub kind: DiagnosticKind,
+                           pub severity: Severity, pub message: String }
    ```
+   `AmbiguousColumn` is a warning; the other three are errors. Severity drives the underline color and the status-bar counts, and `editor::NextDiagnostic` visits errors before warnings when both sit in the same statement.
    Syntax diagnostics are lifted from the tree's `Error` nodes (`StatementKind::Error` exists already).
 
 A statement whose parse contains an error still resolves what it can; a diagnostic never suppresses completion, because the buffer is mid-edit almost every time completion runs.
@@ -272,6 +311,7 @@ AppEvent::DiagnosticsReady { file: SqlFileId }
 | `editor::NextDiagnostic` / `editor::PrevDiagnostic` | f8 / shift-f8 |
 | `schema::Refresh` | ctrl-shift-r |
 | `schema::RefreshIncremental` | ctrl-alt-r |
+| `schema::RefreshAllSchemas` | ctrl-alt-shift-r |
 
 Completion triggers automatically after one identifier character in a completable position and immediately after a qualifier dot; ctrl-space forces it anywhere; escape dismisses.
 
@@ -300,9 +340,12 @@ Completion triggers automatically after one identifier character in a completabl
 - `.tcat`: round-trip, version mismatch discarded, truncated body discarded, unchanged snapshot does not rewrite.
 - Analyzer: a table of SQL string → expected diagnostics, covering aliases, CTEs, nested and correlated subqueries, set operations, `*` expansion, ambiguity between two joined tables, unknown relation, and the no-catalog silence rule.
 - Completion: a table of (SQL, cursor offset) → expected head of the ranked list, one row per context in §5.2.
+- Severity: `AmbiguousColumn` is reported as a warning and the other three as errors; `NextDiagnostic` orders errors before warnings within a statement.
+- Scope: a `SearchPath` refresh introspects only search-path and `public` relations, and its fingerprint diff does not report out-of-scope relations as dropped.
 
 **Integration (Docker PostgreSQL)**
-- Introspection carries real oids; functions appear.
+- Introspection carries real oids; functions appear; `keywords()` returns a non-empty list from `pg_get_keywords()`.
+- A relation created in a schema off the `search_path` does not enter a `SearchPath` refresh, and does enter a `RefreshAllSchemas` one.
 - Incremental refresh after `CREATE TABLE` / `ALTER TABLE ADD COLUMN` / `DROP TABLE` re-fetches exactly the touched relations and leaves the rest untouched (asserted by object identity, not by count alone).
 - Offline criterion: introspect, stop the container, rebuild the engine from `.tcat`, and complete successfully.
 
@@ -329,14 +372,19 @@ Each stage is one PR: green `fmt`, `clippy -D warnings`, tests, and its own docs
 
 ---
 
-## 10. Open questions
+## 10. Resolved questions and deferred work
 
-1. **Keyword list source.** Completion needs SQL keywords. Options: the grammar's own keyword set, a hand-maintained list, or `pg_get_keywords()` from the connected server (a query — but at refresh time, never on the request path). Leaning on the last, cached with the catalog, because it matches the connected server's version exactly.
-2. **Catalog scope.** Whether to introspect and cache every schema in the database or only those on `search_path` plus `public`. Full introspection is simpler and the 10 000-object target assumes it; a database with hundreds of tenant schemas would argue otherwise. Decide when stage 2 has a real timing.
-3. **Diagnostic severity.** All four kinds are currently errors. `AmbiguousColumn` may deserve warning status once the analyzer is real.
+All three questions raised in review are settled (decisions 8–10 in §2): `AmbiguousColumn` is a warning, keywords come from `pg_get_keywords()` cached with the catalog, and the catalog covers `search_path` plus `public`.
+
+Deferred to TODO rather than designed here:
+
+- A per-connection setting for the default catalog scope (today: `SearchPath`, with `schema::RefreshAllSchemas` as the manual override).
+- Expression type inference and type-mismatch diagnostics.
+- Cross-file workspace symbol indexing.
+- Interning or small-string types in the catalog arena, if the load probe justifies the dependency.
 
 ---
 
 ## 11. Documentation impact
 
-Landing these stages updates: `PROGRESS.md` (Phase 3 checklist, status, session log), `PRODUCT.md` (section 4 markers), `TODO.md` (deferred items above; the `BufferChanged` publisher row closes), `DECISIONS.md` (D25–D28 as their PRs land), `07-storage.md` (OD#1 resolved, `catalog_cache` signature), `09-database-engine.md` (driver trait additions), `12-sql-intelligence.md` (reconcile the sketched API with what ships), `05-services.md` (`IntelligenceService` signatures), `11-gpui.md` (command catalog table, popup component), and `14-project-layout.md` (`tempr_intel` exists).
+Landing these stages updates: `PROGRESS.md` (Phase 3 checklist, status, session log), `PRODUCT.md` (section 4 markers), `TODO.md` (deferred items above; the `BufferChanged` publisher row closes), `DECISIONS.md` (D25–D28 as their PRs land), `07-storage.md` (OD#1 resolved, `catalog_cache` signature), `09-database-engine.md` (driver trait additions: `native_id`, `Function` entries, `schema_fingerprints`, `keywords`, the `SearchPath` scope), `12-sql-intelligence.md` (reconcile the sketched API with what ships), `05-services.md` (`IntelligenceService` signatures), `11-gpui.md` (command catalog table, popup component), and `14-project-layout.md` (`tempr_intel` exists).
