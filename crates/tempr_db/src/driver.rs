@@ -71,6 +71,20 @@ pub trait DriverConnection: Send + Sync {
         &mut self,
         scope: SchemaScope,
     ) -> Result<Vec<SchemaSnapshotEntry>, DriverError>;
+
+    /// Cheap change-detection sweep over `scope`: one row per relation and per
+    /// column, carrying a version that moves when the object's definition
+    /// changes. Callers diff two sweeps and re-introspect only what moved.
+    ///
+    /// Drivers that cannot do this return `DriverError::Unsupported`, and the
+    /// caller falls back to a full introspection.
+    async fn schema_fingerprints(
+        &mut self,
+        scope: SchemaScope,
+    ) -> Result<Vec<SchemaFingerprint>, DriverError> {
+        let _ = scope;
+        Err(DriverError::Unsupported("schema_fingerprints".to_string()))
+    }
 }
 
 /// A handle capable of cancelling an in-flight query without exclusive
@@ -78,6 +92,23 @@ pub trait DriverConnection: Send + Sync {
 #[async_trait]
 pub trait CancelHandle: Send + Sync {
     async fn cancel(&self) -> Result<(), DriverError>;
+}
+
+/// What a fingerprint refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectKind {
+    Relation,
+    Column,
+}
+
+/// A cheap change marker for one schema object. `version` changes whenever the
+/// object's definition changes; comparing two sweeps yields the set of objects
+/// worth re-introspecting. PostgreSQL uses the catalog row's `xmin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaFingerprint {
+    pub native_id: u64,
+    pub kind: ObjectKind,
+    pub version: u64,
 }
 
 /// A single entry in a schema snapshot — flat list with implicit parent-child.

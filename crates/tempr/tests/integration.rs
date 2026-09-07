@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tempr_db::{SchemaScope, SchemaSnapshotEntry};
+use tempr_db::{ObjectKind, SchemaFingerprint, SchemaScope, SchemaSnapshotEntry};
 use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode, Value};
 use tempr_events::{AppEventKind, EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService};
@@ -746,4 +746,174 @@ async fn pg_snapshot_includes_functions() {
     })
     .await
     .expect("cleanup out_param_probe");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_fingerprints_move_only_for_changed_relations() {
+    let (_bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS fp_touched", &[]).await?;
+        conn.execute("DROP TABLE IF EXISTS fp_untouched", &[])
+            .await?;
+        conn.execute("CREATE TABLE fp_touched (id int)", &[])
+            .await?;
+        conn.execute("CREATE TABLE fp_untouched (id int)", &[])
+            .await
+    })
+    .await
+    .expect("setup tables");
+
+    let before = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.schema_fingerprints(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("first fingerprints");
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("ALTER TABLE fp_touched ADD COLUMN label text", &[])
+            .await
+    })
+    .await
+    .expect("alter table");
+
+    let after = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.schema_fingerprints(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("second fingerprints");
+
+    // Map the probe tables to their relation OIDs via a snapshot.
+    let entries = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("snapshot");
+    let oid_of = |want: &str| -> u64 {
+        entries
+            .iter()
+            .find_map(|e| match e {
+                SchemaSnapshotEntry::Table {
+                    native_id, name, ..
+                } if name == want => Some(*native_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{want} missing from snapshot"))
+    };
+    let version_of = |fps: &[SchemaFingerprint], oid: u64| -> u64 {
+        fps.iter()
+            .find(|f| f.native_id == oid && f.kind == ObjectKind::Relation)
+            .map(|f| f.version)
+            .expect("relation fingerprint missing")
+    };
+
+    let touched = oid_of("fp_touched");
+    let untouched = oid_of("fp_untouched");
+    assert!(!before.is_empty(), "fingerprint sweep returned nothing");
+    assert_ne!(
+        version_of(&before, touched),
+        version_of(&after, touched),
+        "altered relation must change its fingerprint"
+    );
+    assert_eq!(
+        version_of(&before, untouched),
+        version_of(&after, untouched),
+        "untouched relation must keep its fingerprint"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE fp_touched", &[]).await?;
+        conn.execute("DROP TABLE fp_untouched", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_fingerprints_respect_table_scope_binds() {
+    // `SearchPath`/`All` never bind parameters, so they can't catch a bug in
+    // the UNION ALL placeholder renumbering. `Table` scope binds two ($1,
+    // $2), forcing the second half of the fingerprint query to actually use
+    // the renumbered ($3, $4) placeholders — if `renumber_second_clause` or
+    // the doubled bind vector were wrong, this scope would either error out
+    // (mismatched param count) or silently return the wrong rows.
+    let (_bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS fp_scope_probe", &[])
+            .await?;
+        conn.execute("DROP TABLE IF EXISTS fp_scope_other", &[])
+            .await?;
+        conn.execute("CREATE TABLE fp_scope_probe (id int)", &[])
+            .await?;
+        conn.execute("CREATE TABLE fp_scope_other (id int)", &[])
+            .await
+    })
+    .await
+    .expect("setup tables");
+
+    let entries = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("snapshot");
+    let oid_of = |want: &str| -> u64 {
+        entries
+            .iter()
+            .find_map(|e| match e {
+                SchemaSnapshotEntry::Table {
+                    native_id, name, ..
+                } if name == want => Some(*native_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{want} missing from snapshot"))
+    };
+    let probe_id = oid_of("fp_scope_probe");
+    let other_id = oid_of("fp_scope_other");
+
+    let scoped = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.schema_fingerprints(SchemaScope::Table {
+                schema: "public".to_string(),
+                table: "fp_scope_probe".to_string(),
+            })
+            .await
+        })
+        .await
+        .expect("scoped fingerprints");
+
+    assert!(
+        scoped
+            .iter()
+            .any(|f| f.native_id == probe_id && f.kind == ObjectKind::Relation),
+        "table-scoped sweep must include the named table's relation fingerprint"
+    );
+    assert!(
+        scoped
+            .iter()
+            .any(|f| f.kind == ObjectKind::Column && f.native_id >> 16 == probe_id),
+        "table-scoped sweep must include the named table's column fingerprints"
+    );
+    assert!(
+        !scoped.iter().any(|f| {
+            (f.kind == ObjectKind::Relation && f.native_id == other_id)
+                || (f.kind == ObjectKind::Column && f.native_id >> 16 == other_id)
+        }),
+        "table-scoped sweep must not leak rows from a different relation"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE fp_scope_probe", &[]).await?;
+        conn.execute("DROP TABLE fp_scope_other", &[]).await
+    })
+    .await
+    .expect("cleanup");
 }

@@ -1,7 +1,7 @@
 use tempr_db::stream::QueryStream;
 use tempr_db::{
-    CancelHandle, DatabaseDriver, DriverConnection, DriverError, EngineId, SchemaScope,
-    SchemaSnapshotEntry,
+    CancelHandle, DatabaseDriver, DriverConnection, DriverError, EngineId, ObjectKind,
+    SchemaFingerprint, SchemaScope, SchemaSnapshotEntry,
 };
 use tempr_domain::{ColumnSpec, Connection, TlsMode, Value};
 use tokio_postgres::NoTls;
@@ -186,6 +186,26 @@ fn function_scope_clause(scope: &SchemaScope, ns: &str) -> (String, Vec<String>)
         SchemaScope::Schema(s) => (format!("{ns}.nspname = $1"), vec![s.clone()]),
         SchemaScope::Table { schema, .. } => (format!("{ns}.nspname = $1"), vec![schema.clone()]),
     }
+}
+
+/// The fingerprint query repeats its scope clause in both halves of a UNION,
+/// so the second half's placeholders must continue where the first left off:
+/// `$1, $2` become `$3, $4`. `count` is how many binds one clause uses.
+fn renumber_second_clause(sql: &str, count: usize) -> String {
+    if count == 0 {
+        return sql.to_string();
+    }
+    let (head, tail) = match sql.split_once(" UNION ALL ") {
+        Some(parts) => parts,
+        None => return sql.to_string(),
+    };
+    let mut renumbered = tail.to_string();
+    // Rewrite from the highest placeholder down, so $1 -> $3 never collides
+    // with an existing $2 that still has to move.
+    for i in (1..=count).rev() {
+        renumbered = renumbered.replace(&format!("${i}"), &format!("${}", i + count));
+    }
+    format!("{head} UNION ALL {renumbered}")
 }
 
 /// Borrow bind values as `tokio_postgres` parameters.
@@ -437,5 +457,80 @@ impl DriverConnection for PostgresConnection {
         }
 
         Ok(entries)
+    }
+
+    async fn schema_fingerprints(
+        &mut self,
+        scope: SchemaScope,
+    ) -> Result<Vec<SchemaFingerprint>, DriverError> {
+        let (where_clause, binds) = scope_clause(&scope, "n", "c");
+        let params = as_params(&binds);
+
+        // xmin is the transaction that last wrote the catalog row, so any DDL
+        // moves it. A frozen row reports 2, which differs from the cached value
+        // and forces a re-introspect — a false positive, never a missed change.
+        let sql = format!(
+            "SELECT c.oid::int8, 0::int2, c.xmin::text::int8 \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p', 'v', 'm') AND {where_clause} \
+             UNION ALL \
+             SELECT (a.attrelid::int8 << 16) | a.attnum::int8, 1::int2, a.xmin::text::int8 \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE a.attnum > 0 AND NOT a.attisdropped \
+               AND c.relkind IN ('r', 'p', 'v', 'm') AND {where_clause}"
+        );
+
+        // The clause appears twice, so the binds do too.
+        let mut doubled: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        doubled.extend_from_slice(&params);
+        doubled.extend_from_slice(&params);
+        let sql = renumber_second_clause(&sql, binds.len());
+
+        let rows = self
+            .client
+            .query(&sql, &doubled)
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let native: i64 = row.get(0);
+                let kind: i16 = row.get(1);
+                let version: i64 = row.get(2);
+                SchemaFingerprint {
+                    native_id: native as u64,
+                    kind: if kind == 0 {
+                        ObjectKind::Relation
+                    } else {
+                        ObjectKind::Column
+                    },
+                    version: version as u64,
+                }
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_union_clause_placeholders_are_renumbered() {
+        let sql = "SELECT 1 WHERE a = $1 AND b = $2 UNION ALL SELECT 2 WHERE a = $1 AND b = $2";
+        let out = renumber_second_clause(sql, 2);
+        assert_eq!(
+            out,
+            "SELECT 1 WHERE a = $1 AND b = $2 UNION ALL SELECT 2 WHERE a = $3 AND b = $4"
+        );
+    }
+
+    #[test]
+    fn renumbering_is_a_no_op_without_binds() {
+        let sql = "SELECT 1 UNION ALL SELECT 2";
+        assert_eq!(renumber_second_clause(sql, 0), sql);
     }
 }

@@ -22,4 +22,7 @@ pub enum DriverError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    #[error("unsupported by this driver: {0}")]
+    Unsupported(String),
 }
