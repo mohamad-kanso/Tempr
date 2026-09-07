@@ -512,6 +512,15 @@ impl DriverConnection for PostgresConnection {
             })
             .collect())
     }
+
+    async fn keywords(&mut self) -> Result<Vec<String>, DriverError> {
+        let rows = self
+            .client
+            .query("SELECT word FROM pg_get_keywords()", &[])
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?;
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    }
 }
 
 #[cfg(test)]

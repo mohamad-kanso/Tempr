@@ -917,3 +917,26 @@ async fn pg_fingerprints_respect_table_scope_binds() {
     .await
     .expect("cleanup");
 }
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_keywords_come_from_the_server() {
+    let (_bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    let words = cs
+        .with_metadata_connection_fn(id, |mut conn| async move { conn.keywords().await })
+        .await
+        .expect("keywords");
+
+    assert!(
+        words.len() > 100,
+        "expected a full keyword list, got {}",
+        words.len()
+    );
+    assert!(
+        words.iter().any(|w| w == "select"),
+        "keywords are lower-cased"
+    );
+    assert!(words.iter().any(|w| w == "join"));
+}

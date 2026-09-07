@@ -85,6 +85,13 @@ pub trait DriverConnection: Send + Sync {
         let _ = scope;
         Err(DriverError::Unsupported("schema_fingerprints".to_string()))
     }
+
+    /// The engine's own keyword list, fetched once per schema refresh and
+    /// cached with the catalog — never on the completion request path.
+    /// Drivers with no such list return an empty vector.
+    async fn keywords(&mut self) -> Result<Vec<String>, DriverError> {
+        Ok(Vec::new())
+    }
 }
 
 /// A handle capable of cancelling an in-flight query without exclusive
