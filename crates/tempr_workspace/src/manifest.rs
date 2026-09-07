@@ -1,5 +1,9 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::error::WorkspaceError;
 
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
 
@@ -50,6 +54,26 @@ impl WorkspaceManifest {
             connections: vec![],
             keybindings: Default::default(),
         }
+    }
+}
+
+/// Parse the TOML text of a workspace manifest.
+pub fn parse_manifest(text: &str) -> Result<WorkspaceManifest, WorkspaceError> {
+    toml::from_str(text).map_err(|e| WorkspaceError::Corrupted {
+        reason: format!("workspace.toml parse error: {e}"),
+    })
+}
+
+/// Read and parse `workspace.toml` at `path`; a missing file yields `None`.
+///
+/// Synchronous counterpart to [`crate::Storage::load_manifest`], for callers
+/// that need the manifest before an async runtime exists — the startup
+/// keybinding layer in the binary (docs/04-workspace.md → Settings layering).
+pub fn load_manifest_from(path: &Path) -> Result<Option<WorkspaceManifest>, WorkspaceError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_manifest(&text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(WorkspaceError::Io(e)),
     }
 }
 
@@ -122,6 +146,49 @@ format_version = 1
         assert!(
             old.keybindings.is_empty(),
             "older manifests default to no overrides"
+        );
+    }
+
+    #[test]
+    fn load_manifest_from_reads_keybindings_and_tolerates_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspace.toml");
+        assert!(
+            load_manifest_from(&path)
+                .expect("missing is not an error")
+                .is_none()
+        );
+
+        std::fs::write(
+            &path,
+            r#"
+[workspace]
+name = "kb-ws"
+format_version = 1
+
+[keybindings]
+"main_window::RunQuery" = ["f5"]
+"main_window::Quit" = []
+"#,
+        )
+        .expect("write manifest");
+        let manifest = load_manifest_from(&path)
+            .expect("parses")
+            .expect("file exists");
+        assert_eq!(manifest.workspace.name, "kb-ws");
+        assert_eq!(manifest.keybindings["main_window::RunQuery"], vec!["f5"]);
+        assert!(manifest.keybindings["main_window::Quit"].is_empty());
+    }
+
+    #[test]
+    fn load_manifest_from_reports_a_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspace.toml");
+        std::fs::write(&path, "not = [valid").expect("write manifest");
+        let err = load_manifest_from(&path).expect_err("corrupt manifest must error");
+        assert!(
+            matches!(err, WorkspaceError::Corrupted { .. }),
+            "expected Corrupted, got {err:?}"
         );
     }
 }

@@ -7,7 +7,10 @@ pub mod settings;
 pub mod storage;
 
 pub use error::WorkspaceError;
-pub use manifest::{CURRENT_FORMAT_VERSION, ConnectionConfig, WorkspaceInfo, WorkspaceManifest};
+pub use manifest::{
+    CURRENT_FORMAT_VERSION, ConnectionConfig, WorkspaceInfo, WorkspaceManifest, load_manifest_from,
+    parse_manifest,
+};
 pub use settings::{
     UserSettings, load_user_settings, load_user_settings_from, parse_user_settings,
     user_settings_path,

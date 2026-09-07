@@ -36,7 +36,7 @@ Four files that must always reflect reality. Each fact has exactly ONE home — 
 
 ## Project Status
 
-Phase 1 (Connect & Run) — complete 2026-09-03: PostgreSQL driver with TLS, pooled services with lifecycle, GPUI window with SQL input and streaming result grid, 15 integration tests against Docker PG. Phase 2 (Editor) in progress: `tempr_editor::Buffer` (rope) landed 2026-09-03. **See docs/PROGRESS.md for current status.**
+Phase 1 (Connect & Run) — complete 2026-09-03: PostgreSQL driver with TLS, pooled services with lifecycle, GPUI window with SQL input and streaming result grid, 15 integration tests against Docker PG. Phase 2 (Editor) — complete 2026-09-07: rope buffer, tree-sitter syntax tree with statement detection, command palette, three-layer keybindings, full editing ops, `EditorView` with execute-statement-under-cursor. **See docs/PROGRESS.md for current status.**
 
 ## Locked Decisions
 
@@ -116,4 +116,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 (Editor) — in progress (rope buffer + tree-sitter syntax tree 2026-09-03; command palette + configurable keybindings 2026-09-05).
+Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 — complete (2026-09-07: rope buffer + tree-sitter tree, palette + three-layer keybindings, editing ops, `EditorView`, execute-statement-under-cursor; all 8 boxes verified). Phase 3 (Intelligence) — next.
