@@ -391,12 +391,17 @@ impl DriverConnection for PostgresConnection {
         let fn_params = as_params(&fn_binds);
         let sql = format!(
             "SELECT p.oid::int8, n.nspname, p.proname, \
-                    COALESCE(p.proargnames, ARRAY[]::text[]), \
-                    ARRAY(SELECT format_type(t, NULL) FROM unnest(p.proargtypes) AS t), \
+                    args.names, args.types, \
                     format_type(p.prorettype, NULL), l.lanname \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              JOIN pg_language l ON l.oid = p.prolang \
+             LEFT JOIN LATERAL ( \
+                 SELECT COALESCE(array_agg(COALESCE(p.proargnames[u.ord], '') ORDER BY u.ord), ARRAY[]::text[]) AS names, \
+                        COALESCE(array_agg(format_type(u.t, NULL) ORDER BY u.ord), ARRAY[]::text[]) AS types \
+                 FROM unnest(COALESCE(p.proallargtypes, p.proargtypes::oid[])) WITH ORDINALITY AS u(t, ord) \
+                 WHERE COALESCE(p.proargmodes[u.ord], 'i') IN ('i', 'b', 'v') \
+             ) args ON true \
              WHERE p.prokind = 'f' AND {fn_where} \
              ORDER BY n.nspname, p.proname"
         );

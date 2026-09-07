@@ -655,6 +655,22 @@ async fn pg_snapshot_includes_functions() {
     .await
     .expect("setup function");
 
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute(
+            "DROP FUNCTION IF EXISTS out_param_probe(integer, text)",
+            &[],
+        )
+        .await?;
+        conn.execute(
+            "CREATE FUNCTION out_param_probe(IN a integer, OUT b integer, IN c text) \
+             AS $$ SELECT 1 $$ LANGUAGE sql",
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("setup out_param_probe function");
+
     let entries = cs
         .with_metadata_connection_fn(id, |mut conn| async move {
             conn.snapshot_schema(SchemaScope::SearchPath).await
@@ -694,10 +710,40 @@ async fn pg_snapshot_includes_functions() {
         other => panic!("expected a Function entry, got {other:?}"),
     }
 
+    let out_probe = entries
+        .iter()
+        .find_map(|e| match e {
+            SchemaSnapshotEntry::Function { name, .. } if name == "out_param_probe" => {
+                Some(e.clone())
+            }
+            _ => None,
+        })
+        .expect("out_param_probe missing from snapshot");
+
+    match out_probe {
+        SchemaSnapshotEntry::Function { parameters, .. } => {
+            assert_eq!(
+                parameters,
+                vec![
+                    ("a".to_string(), "integer".to_string()),
+                    ("c".to_string(), "text".to_string()),
+                ]
+            );
+        }
+        other => panic!("expected a Function entry, got {other:?}"),
+    }
+
     cs.with_metadata_connection_fn(id, |mut conn| async move {
         conn.execute("DROP FUNCTION add_two(integer, integer)", &[])
             .await
     })
     .await
     .expect("cleanup");
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP FUNCTION out_param_probe(integer, text)", &[])
+            .await
+    })
+    .await
+    .expect("cleanup out_param_probe");
 }
