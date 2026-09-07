@@ -12,9 +12,10 @@ pub struct EngineId(pub String);
 #[derive(Debug, Clone)]
 pub enum SchemaScope {
     /// Schemas the connection can reference unqualified — its `search_path`
-    /// plus `public`. The default for catalog refreshes: it matches what
-    /// unqualified SQL can actually name, and keeps large multi-tenant
-    /// databases from loading schemas nobody in this session will reference.
+    /// plus `public`. Intended for catalog refreshes once the schema service
+    /// adopts it: it matches what unqualified SQL can actually name, and keeps
+    /// large multi-tenant databases from loading schemas nobody in this session
+    /// will reference.
     SearchPath,
     /// Every non-system schema.
     All,
