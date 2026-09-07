@@ -565,6 +565,11 @@ async fn pg_search_path_scope_excludes_off_path_schemas() {
         conn.execute("CREATE SCHEMA off_path", &[]).await?;
         conn.execute("CREATE TABLE off_path.hidden (id int)", &[])
             .await?;
+        conn.execute("DROP SCHEMA IF EXISTS on_path CASCADE", &[])
+            .await?;
+        conn.execute("CREATE SCHEMA on_path", &[]).await?;
+        conn.execute("CREATE TABLE on_path.probe (id int)", &[])
+            .await?;
         conn.execute("DROP TABLE IF EXISTS on_path_probe", &[])
             .await?;
         conn.execute("CREATE TABLE on_path_probe (id int)", &[])
@@ -573,8 +578,16 @@ async fn pg_search_path_scope_excludes_off_path_schemas() {
     .await
     .expect("setup schemas");
 
+    // `SET search_path` and the snapshot must run in the SAME session: the
+    // pooled metadata connection is shared, so a `SET` in one
+    // `with_metadata_connection_fn` call is not guaranteed visible to the
+    // next. Putting `on_path` on the search_path here — and nowhere else —
+    // is what exercises the `current_schemas(false)` half of the clause;
+    // `public` alone would pass even if that branch were deleted.
     let scoped = cs
         .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.execute("SET search_path TO on_path, public", &[])
+                .await?;
             conn.snapshot_schema(SchemaScope::SearchPath).await
         })
         .await
@@ -596,6 +609,10 @@ async fn pg_search_path_scope_excludes_off_path_schemas() {
     };
 
     assert!(
+        has(&scoped, "on_path", "probe"),
+        "schema on the search_path must be in scope"
+    );
+    assert!(
         has(&scoped, "public", "on_path_probe"),
         "public must be in scope"
     );
@@ -609,7 +626,10 @@ async fn pg_search_path_scope_excludes_off_path_schemas() {
     );
 
     cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("SET search_path TO \"$user\", public", &[])
+            .await?;
         conn.execute("DROP SCHEMA off_path CASCADE", &[]).await?;
+        conn.execute("DROP SCHEMA on_path CASCADE", &[]).await?;
         conn.execute("DROP TABLE on_path_probe", &[]).await
     })
     .await
