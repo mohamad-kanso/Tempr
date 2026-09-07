@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, Subscription,
-    Window, actions, div, prelude::*, px, rgb, uniform_list,
+    Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, ScrollStrategy,
+    Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb, uniform_list,
 };
 use tempr_domain::CommandId;
 use tempr_services::{CommandMatch, CommandService};
@@ -41,6 +41,9 @@ pub struct Palette {
     /// Focus to restore when the palette closes (whatever was focused when
     /// it opened), so the confirmed command dispatches against it.
     previous_focus: Option<FocusHandle>,
+    /// Keeps the selected row inside the viewport when the list is longer
+    /// than `MAX_VISIBLE_ROWS`.
+    scroll_handle: UniformListScrollHandle,
     focus_handle: FocusHandle,
     _input_subscription: Subscription,
 }
@@ -65,6 +68,7 @@ impl Palette {
             selected: 0,
             open: false,
             previous_focus: None,
+            scroll_handle: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _input_subscription,
         }
@@ -110,6 +114,7 @@ impl Palette {
         let query = self.input.read(cx).text().to_string();
         self.matches = self.service.search(&query);
         self.selected = 0;
+        self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -126,6 +131,7 @@ impl Palette {
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         if !self.matches.is_empty() {
             self.selected = (self.selected + 1) % self.matches.len();
+            self.reveal_selected();
             cx.notify();
         }
     }
@@ -133,8 +139,16 @@ impl Palette {
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
         if !self.matches.is_empty() {
             self.selected = (self.selected + self.matches.len() - 1) % self.matches.len();
+            self.reveal_selected();
             cx.notify();
         }
+    }
+
+    /// Scroll the selected row into view; `Nearest` is a no-op when it is
+    /// already visible, so arrow keys inside the viewport do not jump.
+    fn reveal_selected(&self) {
+        self.scroll_handle
+            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
     }
 
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
@@ -149,8 +163,10 @@ impl Palette {
         div()
             .id(ix)
             .flex()
+            .w_full()
             .items_center()
             .justify_between()
+            .gap_4()
             .h(px(ROW_HEIGHT))
             .px_3()
             .bg(rgb(if selected {
@@ -227,6 +243,7 @@ impl Render for Palette {
                                     range.map(|ix| this.render_row(ix)).collect::<Vec<_>>()
                                 }),
                             )
+                            .track_scroll(&self.scroll_handle)
                             .h_full(),
                         ),
                     )
