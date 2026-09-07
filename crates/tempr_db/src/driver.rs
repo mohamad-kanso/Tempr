@@ -121,4 +121,13 @@ pub enum SchemaSnapshotEntry {
         unique: bool,
         index_type: String,
     },
+    Function {
+        native_id: u64,
+        schema: String,
+        name: String,
+        /// `(argument name, formatted type)`; unnamed arguments are `$1`, `$2`, …
+        parameters: Vec<(String, String)>,
+        return_type: String,
+        language: String,
+    },
 }

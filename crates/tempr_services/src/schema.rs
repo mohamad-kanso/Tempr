@@ -115,6 +115,23 @@ impl SchemaService {
                         index_type: index_type.clone(),
                     });
                 }
+                SchemaSnapshotEntry::Function {
+                    native_id: _,
+                    schema,
+                    name,
+                    parameters,
+                    return_type,
+                    language,
+                } => {
+                    objects.push(SchemaObject::Function {
+                        id: SchemaObjectId::new(),
+                        schema: schema.clone(),
+                        name: name.clone(),
+                        parameters: parameters.clone(),
+                        return_type: return_type.clone(),
+                        language: language.clone(),
+                    });
+                }
                 _ => {}
             }
         }

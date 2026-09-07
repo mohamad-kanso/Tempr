@@ -635,3 +635,69 @@ async fn pg_search_path_scope_excludes_off_path_schemas() {
     .await
     .expect("cleanup");
 }
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_snapshot_includes_functions() {
+    let (_bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP FUNCTION IF EXISTS add_two(integer, integer)", &[])
+            .await?;
+        conn.execute(
+            "CREATE FUNCTION add_two(a integer, b integer) RETURNS integer \
+             LANGUAGE sql AS $$ SELECT a + b $$",
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("setup function");
+
+    let entries = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("snapshot");
+
+    let func = entries
+        .iter()
+        .find_map(|e| match e {
+            SchemaSnapshotEntry::Function { name, .. } if name == "add_two" => Some(e.clone()),
+            _ => None,
+        })
+        .expect("add_two missing from snapshot");
+
+    match func {
+        SchemaSnapshotEntry::Function {
+            native_id,
+            schema,
+            parameters,
+            return_type,
+            language,
+            ..
+        } => {
+            assert_ne!(native_id, 0);
+            assert_eq!(schema, "public");
+            assert_eq!(
+                parameters,
+                vec![
+                    ("a".to_string(), "integer".to_string()),
+                    ("b".to_string(), "integer".to_string()),
+                ]
+            );
+            assert_eq!(return_type, "integer");
+            assert_eq!(language, "sql");
+        }
+        other => panic!("expected a Function entry, got {other:?}"),
+    }
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP FUNCTION add_two(integer, integer)", &[])
+            .await
+    })
+    .await
+    .expect("cleanup");
+}

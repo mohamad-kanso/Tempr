@@ -170,6 +170,24 @@ fn scope_clause(scope: &SchemaScope, ns: &str, rel: &str) -> (String, Vec<String
     }
 }
 
+/// Scope clause for `pg_proc` queries. `ns` is the alias of the joined
+/// `pg_namespace` row. `SchemaScope::Table` degrades to its schema, since a
+/// function is not owned by a table.
+fn function_scope_clause(scope: &SchemaScope, ns: &str) -> (String, Vec<String>) {
+    match scope {
+        SchemaScope::SearchPath => (
+            format!("({ns}.nspname = ANY (current_schemas(false)) OR {ns}.nspname = 'public')"),
+            Vec::new(),
+        ),
+        SchemaScope::All => (
+            format!("{ns}.nspname NOT IN ('pg_catalog', 'information_schema')"),
+            Vec::new(),
+        ),
+        SchemaScope::Schema(s) => (format!("{ns}.nspname = $1"), vec![s.clone()]),
+        SchemaScope::Table { schema, .. } => (format!("{ns}.nspname = $1"), vec![schema.clone()]),
+    }
+}
+
 /// Borrow bind values as `tokio_postgres` parameters.
 fn as_params(values: &[String]) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
     values
@@ -364,6 +382,52 @@ impl DriverConnection for PostgresConnection {
                 columns,
                 unique,
                 index_type,
+            });
+        }
+
+        // Plain functions only: 'p' is a procedure, 'a' an aggregate, 'w' a window
+        // function — none of which complete like a scalar call.
+        let (fn_where, fn_binds) = function_scope_clause(&scope, "n");
+        let fn_params = as_params(&fn_binds);
+        let sql = format!(
+            "SELECT p.oid::int8, n.nspname, p.proname, \
+                    COALESCE(p.proargnames, ARRAY[]::text[]), \
+                    ARRAY(SELECT format_type(t, NULL) FROM unnest(p.proargtypes) AS t), \
+                    format_type(p.prorettype, NULL), l.lanname \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             JOIN pg_language l ON l.oid = p.prolang \
+             WHERE p.prokind = 'f' AND {fn_where} \
+             ORDER BY n.nspname, p.proname"
+        );
+        for row in self
+            .client
+            .query(&sql, &fn_params)
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?
+        {
+            let oid: i64 = row.get(0);
+            let arg_names: Vec<String> = row.get(3);
+            let arg_types: Vec<String> = row.get(4);
+            let parameters = arg_types
+                .into_iter()
+                .enumerate()
+                .map(|(i, ty)| {
+                    let name = arg_names
+                        .get(i)
+                        .filter(|n| !n.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| format!("${}", i + 1));
+                    (name, ty)
+                })
+                .collect();
+            entries.push(SchemaSnapshotEntry::Function {
+                native_id: oid as u64,
+                schema: row.get(1),
+                name: row.get(2),
+                parameters,
+                return_type: row.get(5),
+                language: row.get(6),
             });
         }
 
