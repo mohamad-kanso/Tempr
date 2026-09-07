@@ -472,14 +472,14 @@ impl DriverConnection for PostgresConnection {
         let sql = format!(
             "SELECT c.oid::int8, 0::int2, c.xmin::text::int8 \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('r', 'p', 'v', 'm') AND {where_clause} \
+             WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {where_clause} \
              UNION ALL \
              SELECT (a.attrelid::int8 << 16) | a.attnum::int8, 1::int2, a.xmin::text::int8 \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE a.attnum > 0 AND NOT a.attisdropped \
-               AND c.relkind IN ('r', 'p', 'v', 'm') AND {where_clause}"
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {where_clause}"
         );
 
         // The clause appears twice, so the binds do too.
