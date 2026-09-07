@@ -154,6 +154,10 @@ impl CancelHandle for PostgresCancelHandle {
 /// rows in the calling query. Bind values start at `$1`.
 fn scope_clause(scope: &SchemaScope, ns: &str, rel: &str) -> (String, Vec<String>) {
     match scope {
+        SchemaScope::SearchPath => (
+            format!("({ns}.nspname = ANY (current_schemas(false)) OR {ns}.nspname = 'public')"),
+            Vec::new(),
+        ),
         SchemaScope::All => (
             format!("{ns}.nspname NOT IN ('pg_catalog', 'information_schema')"),
             Vec::new(),

@@ -552,3 +552,66 @@ async fn pg_snapshot_entries_carry_stable_native_ids() {
     .await
     .expect("cleanup");
 }
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_search_path_scope_excludes_off_path_schemas() {
+    let (_bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP SCHEMA IF EXISTS off_path CASCADE", &[])
+            .await?;
+        conn.execute("CREATE SCHEMA off_path", &[]).await?;
+        conn.execute("CREATE TABLE off_path.hidden (id int)", &[])
+            .await?;
+        conn.execute("DROP TABLE IF EXISTS on_path_probe", &[])
+            .await?;
+        conn.execute("CREATE TABLE on_path_probe (id int)", &[])
+            .await
+    })
+    .await
+    .expect("setup schemas");
+
+    let scoped = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("search-path snapshot");
+    let all = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::All).await
+        })
+        .await
+        .expect("all snapshot");
+
+    let has = |entries: &[SchemaSnapshotEntry], want_schema: &str, want_name: &str| {
+        entries.iter().any(|e| match e {
+            SchemaSnapshotEntry::Table { schema, name, .. } => {
+                schema == want_schema && name == want_name
+            }
+            _ => false,
+        })
+    };
+
+    assert!(
+        has(&scoped, "public", "on_path_probe"),
+        "public must be in scope"
+    );
+    assert!(
+        !has(&scoped, "off_path", "hidden"),
+        "off-path schema must be excluded"
+    );
+    assert!(
+        has(&all, "off_path", "hidden"),
+        "All scope must still see it"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP SCHEMA off_path CASCADE", &[]).await?;
+        conn.execute("DROP TABLE on_path_probe", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}

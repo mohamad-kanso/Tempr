@@ -11,9 +11,18 @@ pub struct EngineId(pub String);
 /// Scope for schema introspection.
 #[derive(Debug, Clone)]
 pub enum SchemaScope {
+    /// Schemas the connection can reference unqualified — its `search_path`
+    /// plus `public`. The default for catalog refreshes: it matches what
+    /// unqualified SQL can actually name, and keeps large multi-tenant
+    /// databases from loading schemas nobody in this session will reference.
+    SearchPath,
+    /// Every non-system schema.
     All,
     Schema(String),
-    Table { schema: String, table: String },
+    Table {
+        schema: String,
+        table: String,
+    },
 }
 
 /// The root trait that every database engine plugin implements.
