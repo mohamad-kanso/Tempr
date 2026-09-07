@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use tempr_db::{SchemaScope, SchemaSnapshotEntry};
 use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode, Value};
 use tempr_events::{AppEventKind, EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService};
@@ -479,4 +480,75 @@ async fn pg_tls_require_fails_against_a_plaintext_only_server() {
         "expected a TLS error, got: {err}"
     );
     assert_eq!(cs.state(conn.id), tempr_domain::ConnectionState::Failed);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_snapshot_entries_carry_stable_native_ids() {
+    let (_bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS native_id_probe", &[])
+            .await?;
+        conn.execute(
+            "CREATE TABLE native_id_probe (id bigint primary key, label text not null)",
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("setup table");
+
+    let first = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::All).await
+        })
+        .await
+        .expect("first snapshot");
+    let second = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::All).await
+        })
+        .await
+        .expect("second snapshot");
+
+    let table_id = |entries: &[SchemaSnapshotEntry]| -> u64 {
+        entries
+            .iter()
+            .find_map(|e| match e {
+                SchemaSnapshotEntry::Table {
+                    native_id, name, ..
+                } if name == "native_id_probe" => Some(*native_id),
+                _ => None,
+            })
+            .expect("probe table missing from snapshot")
+    };
+    let a = table_id(&first);
+    let b = table_id(&second);
+    assert_ne!(a, 0, "native_id must be a real OID");
+    assert_eq!(a, b, "native_id must be stable across refreshes");
+
+    // Columns encode (attrelid << 16 | attnum) — same relation, distinct ids.
+    let mut col_ids: Vec<u64> = first
+        .iter()
+        .filter_map(|e| match e {
+            SchemaSnapshotEntry::Column {
+                native_id,
+                parent_table,
+                ..
+            } if parent_table == "native_id_probe" => Some(*native_id),
+            _ => None,
+        })
+        .collect();
+    col_ids.sort_unstable();
+    assert_eq!(col_ids.len(), 2, "expected two columns on the probe table");
+    assert_ne!(col_ids[0], col_ids[1]);
+    assert_eq!(col_ids[0] >> 16, a, "column ids embed their relation OID");
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE native_id_probe", &[]).await
+    })
+    .await
+    .expect("cleanup");
 }

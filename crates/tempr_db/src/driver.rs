@@ -72,19 +72,29 @@ pub trait CancelHandle: Send + Sync {
 }
 
 /// A single entry in a schema snapshot — flat list with implicit parent-child.
+///
+/// `native_id` is the database engine's own identifier for the object and must
+/// be stable across refreshes and restarts: PostgreSQL uses `pg_class.oid` for
+/// relations, `pg_proc.oid` for functions, and `(attrelid << 16) | attnum` for
+/// columns. A driver whose engine has no stable identifier should hash the
+/// object's qualified name into this field instead; the catalog then treats a
+/// rename as a delete plus an insert, which is correct but coarser.
 #[derive(Debug, Clone)]
 pub enum SchemaSnapshotEntry {
     Table {
+        native_id: u64,
         schema: String,
         name: String,
         estimated_rows: Option<u64>,
     },
     View {
+        native_id: u64,
         schema: String,
         name: String,
         definition: String,
     },
     Column {
+        native_id: u64,
         parent_schema: String,
         parent_table: String,
         name: String,
@@ -94,6 +104,7 @@ pub enum SchemaSnapshotEntry {
         default: Option<String>,
     },
     Index {
+        native_id: u64,
         parent_schema: String,
         parent_table: String,
         name: String,

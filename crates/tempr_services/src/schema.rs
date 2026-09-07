@@ -70,6 +70,7 @@ impl SchemaService {
             let id = SchemaObjectId::new();
             match entry {
                 SchemaSnapshotEntry::Column {
+                    native_id: _,
                     parent_schema,
                     parent_table,
                     name,
@@ -93,6 +94,7 @@ impl SchemaService {
                     });
                 }
                 SchemaSnapshotEntry::Index {
+                    native_id: _,
                     parent_schema,
                     parent_table,
                     name,

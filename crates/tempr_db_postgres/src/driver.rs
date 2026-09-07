@@ -149,6 +149,31 @@ impl CancelHandle for PostgresCancelHandle {
     }
 }
 
+/// SQL fragment restricting a catalog query to `scope`, plus the values to
+/// bind. `ns` and `rel` are the aliases of the `pg_namespace` and `pg_class`
+/// rows in the calling query. Bind values start at `$1`.
+fn scope_clause(scope: &SchemaScope, ns: &str, rel: &str) -> (String, Vec<String>) {
+    match scope {
+        SchemaScope::All => (
+            format!("{ns}.nspname NOT IN ('pg_catalog', 'information_schema')"),
+            Vec::new(),
+        ),
+        SchemaScope::Schema(s) => (format!("{ns}.nspname = $1"), vec![s.clone()]),
+        SchemaScope::Table { schema, table } => (
+            format!("{ns}.nspname = $1 AND {rel}.relname = $2"),
+            vec![schema.clone(), table.clone()],
+        ),
+    }
+}
+
+/// Borrow bind values as `tokio_postgres` parameters.
+fn as_params(values: &[String]) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+    values
+        .iter()
+        .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl DriverConnection for PostgresConnection {
     fn is_closed(&self) -> bool {
@@ -221,161 +246,117 @@ impl DriverConnection for PostgresConnection {
         scope: SchemaScope,
     ) -> Result<Vec<SchemaSnapshotEntry>, DriverError> {
         let mut entries = Vec::new();
+        let (where_clause, binds) = scope_clause(&scope, "n", "c");
+        let params = as_params(&binds);
 
-        // Tables — parameterized to prevent SQL injection and to honor scope.
-        match &scope {
-            SchemaScope::All => {
-                let rows = self
-                    .client
-                    .query(
-                        "SELECT schemaname, tablename FROM pg_tables \
-                         WHERE schemaname NOT IN ('pg_catalog', 'information_schema')",
-                        &[],
-                    )
-                    .await
-                    .map_err(|e| DriverError::Query(e.to_string()))?;
-                for row in rows {
-                    entries.push(SchemaSnapshotEntry::Table {
-                        schema: row.get(0),
-                        name: row.get(1),
-                        estimated_rows: None,
-                    });
-                }
-            }
-            SchemaScope::Schema(s) => {
-                let rows = self
-                    .client
-                    .query(
-                        "SELECT schemaname, tablename FROM pg_tables WHERE schemaname = $1",
-                        &[s],
-                    )
-                    .await
-                    .map_err(|e| DriverError::Query(e.to_string()))?;
-                for row in rows {
-                    entries.push(SchemaSnapshotEntry::Table {
-                        schema: row.get(0),
-                        name: row.get(1),
-                        estimated_rows: None,
-                    });
-                }
-            }
-            SchemaScope::Table { schema, table } => {
-                let rows = self
-                    .client
-                    .query(
-                        "SELECT schemaname, tablename FROM pg_tables \
-                         WHERE schemaname = $1 AND tablename = $2",
-                        &[schema, table],
-                    )
-                    .await
-                    .map_err(|e| DriverError::Query(e.to_string()))?;
-                for row in rows {
-                    entries.push(SchemaSnapshotEntry::Table {
-                        schema: row.get(0),
-                        name: row.get(1),
-                        estimated_rows: None,
-                    });
-                }
-            }
-        }
-
-        // Columns — same scope filter as the table query above.
-        let col_rows = match &scope {
-            SchemaScope::All => {
-                self.client
-                    .query(
-                        "SELECT table_schema, table_name, column_name, data_type, \
-                     is_nullable, ordinal_position, column_default \
-                     FROM information_schema.columns \
-                     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                     ORDER BY table_schema, table_name, ordinal_position",
-                        &[],
-                    )
-                    .await
-            }
-            SchemaScope::Schema(s) => {
-                self.client
-                    .query(
-                        "SELECT table_schema, table_name, column_name, data_type, \
-                     is_nullable, ordinal_position, column_default \
-                     FROM information_schema.columns \
-                     WHERE table_schema = $1 \
-                     ORDER BY table_schema, table_name, ordinal_position",
-                        &[s],
-                    )
-                    .await
-            }
-            SchemaScope::Table { schema, table } => {
-                self.client
-                    .query(
-                        "SELECT table_schema, table_name, column_name, data_type, \
-                     is_nullable, ordinal_position, column_default \
-                     FROM information_schema.columns \
-                     WHERE table_schema = $1 AND table_name = $2 \
-                     ORDER BY table_schema, table_name, ordinal_position",
-                        &[schema, table],
-                    )
-                    .await
-            }
-        }
-        .map_err(|e| DriverError::Query(e.to_string()))?;
-
-        for row in col_rows {
-            let nullable_str: Option<String> = row.get(4);
-            let ordinal: i32 = row.get(5);
-            entries.push(SchemaSnapshotEntry::Column {
-                parent_schema: row.get(0),
-                parent_table: row.get(1),
+        // Tables and partitioned tables.
+        let sql = format!(
+            "SELECT c.oid::int8, n.nspname, c.relname, c.reltuples::int8 \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p') AND {where_clause}"
+        );
+        for row in self
+            .client
+            .query(&sql, &params)
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?
+        {
+            let oid: i64 = row.get(0);
+            let reltuples: i64 = row.get(3);
+            entries.push(SchemaSnapshotEntry::Table {
+                native_id: oid as u64,
+                schema: row.get(1),
                 name: row.get(2),
-                data_type: row.get(3),
-                nullable: nullable_str.map(|s| s == "YES").unwrap_or(true),
-                ordinal: ordinal as usize,
-                default: row.get(6),
+                // reltuples is -1 until the relation has been analyzed.
+                estimated_rows: (reltuples >= 0).then_some(reltuples as u64),
             });
         }
 
-        // Indexes — join pg_index/pg_attribute directly for exact, ordered
-        // column names instead of parsing `indexdef` text (which breaks on
-        // expression indexes and multi-word index types).
-        const IDX_SELECT: &str = "SELECT n.nspname, t.relname, i.relname, ix.indisunique, \
-             am.amname, array_agg(a.attname ORDER BY x.ordinality) \
+        // Views and materialized views.
+        let sql = format!(
+            "SELECT c.oid::int8, n.nspname, c.relname, pg_get_viewdef(c.oid, true) \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('v', 'm') AND {where_clause}"
+        );
+        for row in self
+            .client
+            .query(&sql, &params)
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?
+        {
+            let oid: i64 = row.get(0);
+            entries.push(SchemaSnapshotEntry::View {
+                native_id: oid as u64,
+                schema: row.get(1),
+                name: row.get(2),
+                definition: row.get(3),
+            });
+        }
+
+        // Columns of every relation kind that has them.
+        let sql = format!(
+            "SELECT (a.attrelid::int8 << 16) | a.attnum::int8, n.nspname, c.relname, a.attname, \
+                    format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attnum, \
+                    pg_get_expr(d.adbin, d.adrelid) \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE a.attnum > 0 AND NOT a.attisdropped \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {where_clause} \
+             ORDER BY n.nspname, c.relname, a.attnum"
+        );
+        for row in self
+            .client
+            .query(&sql, &params)
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?
+        {
+            let native: i64 = row.get(0);
+            let not_null: bool = row.get(5);
+            let attnum: i16 = row.get(6);
+            entries.push(SchemaSnapshotEntry::Column {
+                native_id: native as u64,
+                parent_schema: row.get(1),
+                parent_table: row.get(2),
+                name: row.get(3),
+                data_type: row.get(4),
+                nullable: !not_null,
+                ordinal: attnum as usize,
+                default: row.get(7),
+            });
+        }
+
+        // Indexes — pg_index join for exact, ordered column names.
+        let sql = format!(
+            "SELECT i.oid::int8, n.nspname, t.relname, i.relname, ix.indisunique, am.amname, \
+                    array_agg(a.attname ORDER BY x.ordinality) \
              FROM pg_index ix \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              JOIN pg_am am ON am.oid = i.relam \
              JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS x(attnum, ordinality) ON true \
-             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = x.attnum";
-        const IDX_GROUP_BY: &str =
-            "GROUP BY n.nspname, t.relname, i.relname, ix.indisunique, am.amname";
-
-        let idx_rows = match &scope {
-            SchemaScope::All => {
-                let sql = format!(
-                    "{IDX_SELECT} WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') {IDX_GROUP_BY}"
-                );
-                self.client.query(&sql, &[]).await
-            }
-            SchemaScope::Schema(s) => {
-                let sql = format!("{IDX_SELECT} WHERE n.nspname = $1 {IDX_GROUP_BY}");
-                self.client.query(&sql, &[s]).await
-            }
-            SchemaScope::Table { schema, table } => {
-                let sql =
-                    format!("{IDX_SELECT} WHERE n.nspname = $1 AND t.relname = $2 {IDX_GROUP_BY}");
-                self.client.query(&sql, &[schema, table]).await
-            }
-        }
-        .map_err(|e| DriverError::Query(e.to_string()))?;
-
-        for row in idx_rows {
-            let unique: bool = row.get(3);
-            let index_type: String = row.get(4);
-            let columns: Vec<String> = row.get(5);
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = x.attnum \
+             WHERE {} \
+             GROUP BY i.oid, n.nspname, t.relname, i.relname, ix.indisunique, am.amname",
+            scope_clause(&scope, "n", "t").0
+        );
+        for row in self
+            .client
+            .query(&sql, &params)
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?
+        {
+            let oid: i64 = row.get(0);
+            let unique: bool = row.get(4);
+            let index_type: String = row.get(5);
+            let columns: Vec<String> = row.get(6);
             entries.push(SchemaSnapshotEntry::Index {
-                parent_schema: row.get(0),
-                parent_table: row.get(1),
-                name: row.get(2),
+                native_id: oid as u64,
+                parent_schema: row.get(1),
+                parent_table: row.get(2),
+                name: row.get(3),
                 columns,
                 unique,
                 index_type,
