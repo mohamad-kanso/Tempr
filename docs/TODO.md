@@ -28,6 +28,7 @@
 
 - [ ] Parse strategy for pathological files: a 10 MB dump of ~180k one-line statements re-parses in ~150 ms (tree-sitter re-walks the flat `program` sibling list); options — parse on a background thread from a `Tree` clone, or viewport-scoped `set_included_ranges`; realistic files (2.5k statements) are at 1.6 ms already
 - [ ] Inner-statement execution inside `BEGIN … END` blocks / transactions: `StatementRange` reports the whole block as one range (kind `Block`/`Transaction`); descend into children when the cursor is inside
+- [ ] `EditorView` scroll: `set_selections` picks Top/Bottom from last frame's `visible_lines`; `ScrollStrategy::Nearest` (used by the palette since 2026-09-07) does the same with no bookkeeping — swap it and drop the side pick
 - [ ] Palette: highlight matched characters (`CommandMatch::indices`) in titles; show "no keybinding" hint; remember last query per session
 - [ ] Apply the workspace keybinding layer (`WorkspaceManifest::keybindings`) when workspace open lands (`CommandService::set_keybinding_layers([user, workspace])`); rebind live on settings change (`cx.clear_key_bindings()` + `commands::install`)
 - [ ] Plugin commands need a GPUI action shape (a generic `PluginCommand { id }` action or per-plugin `actions!`) before `CommandContribution` from 08-plugin-api can register through `CommandService`

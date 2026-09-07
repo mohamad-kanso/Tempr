@@ -389,9 +389,13 @@ impl MainWindow {
                     .completed_run(run)
                     .is_some_and(|r| r.outcome == QueryOutcome::Cancelled);
                 if cancelled {
-                    self.set_status(format!("Cancelled — {rows} rows (partial)"), false, cx);
+                    self.set_status(
+                        format!("Cancelled — {rows} {} (partial)", row_word(rows)),
+                        false,
+                        cx,
+                    );
                 } else {
-                    self.set_status(format!("Done — {rows} rows"), false, cx);
+                    self.set_status(format!("Done — {rows} {}", row_word(rows)), false, cx);
                 }
                 if self.dev.bench_scroll_then_exit {
                     self.start_bench(window, cx);
@@ -440,7 +444,7 @@ impl MainWindow {
             }
             UiEvent::RowsReceived { run, .. } if self.current_run == Some(run) => {
                 let rows = self.grid.read(cx).row_count();
-                self.set_status(format!("Running… {rows} rows"), false, cx);
+                self.set_status(format!("Running… {rows} {}", row_word(rows)), false, cx);
             }
             // QueryStarted/QueryFinished: the outcome task owns final status.
             _ => {}
@@ -525,6 +529,11 @@ impl MainWindow {
     }
 }
 
+/// "row"/"rows" for a status line count.
+fn row_word(rows: usize) -> &'static str {
+    if rows == 1 { "row" } else { "rows" }
+}
+
 impl Focusable for MainWindow {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -601,5 +610,17 @@ impl Render for MainWindow {
                             .child(self.status.clone()),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_word;
+
+    #[test]
+    fn row_word_is_singular_only_for_one() {
+        assert_eq!(row_word(0), "rows");
+        assert_eq!(row_word(1), "row");
+        assert_eq!(row_word(2), "rows");
     }
 }
