@@ -43,6 +43,7 @@
 | D21 | 2026-09-03 | Editor buffer = `ropey` 1.x rope in new `tempr_editor` crate; public API is byte-offset based (ropey char indices never leak); `edit` is a validated, atomic batch returning `Result`; `Buffer` is a pure model (no event bus) | Claude (Phase 2) |
 | D22 | 2026-09-03 | SQL grammar = `tree-sitter-sequel` (DerekStride, MIT) on `tree-sitter` 0.25; `Buffer` records `InputEdit`s eagerly but re-parses **lazily** on read, so `edit` stays sub-ms on any document size | Claude (Phase 2) |
 | D23 | 2026-09-05 | Commands = GPUI action types in one typed catalog (`tempr_ui::commands`); `CommandService` owns metadata + layered keybindings (defaults ← `~/.config/tempr/settings.toml` ← `workspace.toml` `[keybindings]`, command → keystrokes, empty = unbind); palette = `Input` + `uniform_list` over in-house fuzzy search; execution stays in the UI, service records `CommandExecuted` | Claude (Phase 2) |
+| D24 | 2026-09-07 | Workspace keybinding layer is applied at startup from a `workspace.toml` discovered by path (`TEMPR_WORKSPACE`, else the current directory) — ahead of workspace open; sync `parse_manifest`/`load_manifest_from` sit beside the async `Storage` trait for pre-runtime callers | Claude (Phase 2 exit) |
 
 ---
 
@@ -296,3 +297,12 @@
 
 **Consequences**: Plugin commands (08-plugin-api `CommandContribution`) will register through the same service; their actions need a GPUI action type or a generic `PluginCommand { id }` action — decided when plugins land. `05-services.md` CommandService signatures updated to the real ones; `by_keybinding`/`execute` on the service do not exist. Per-character match highlighting in the palette and the workspace settings layer are TODO. The user-facing keybinding format is documented in 07-storage (file) and 11-gpui (catalog).
 
+## D24 — Workspace keybindings load at startup, before workspace open (2026-09-07)
+
+**By**: Claude (Phase 2 exit sweep), on the user's call when the sweep found box 5 unmet.
+
+**Decision**: The binary resolves a `workspace.toml` path at startup — `TEMPR_WORKSPACE` (a workspace directory, or the manifest file itself) when set, otherwise `./workspace.toml` — reads its `[keybindings]` table, and passes it to `CommandService::set_keybinding_layers(vec![user, workspace])`. A missing manifest is the normal case (defaults + user layer only); a corrupt one is non-fatal: defaults are kept, the error is logged and shown once in the status bar, exactly as for `settings.toml`. To serve callers that need the manifest before an async runtime exists, `tempr_workspace::manifest` gains sync `parse_manifest` / `load_manifest_from` next to the async `Storage::load_manifest`; env-var reading stays in the binary, never in a library crate.
+
+**Why**: Phase 2's exit criterion is "keybindings are configurable via the workspace format". Every piece existed — the manifest field, the layering, the tests — except a runtime that ever read a `workspace.toml`, because workspace open (connection list, recents, picker UI) is still parked. Blocking a phase on unrelated UI work, or quietly rewriting the criterion down to the user layer, both misreport where the build stands; loading the file by path satisfies the criterion as written in ~40 lines and is the same code workspace open will call later.
+
+**Consequences**: `Storage` is no longer the only path to a manifest — the sync helpers are documented as the pre-runtime exception and must stay read-only (writes remain atomic through `Storage::save_manifest`). Layers are still resolved once at startup: editing `workspace.toml` or `settings.toml` needs a restart until live rebind lands (TODO). When workspace open arrives it replaces the path resolution, not the layering, and `TEMPR_WORKSPACE` becomes a dev knob for pointing at a workspace without the picker.

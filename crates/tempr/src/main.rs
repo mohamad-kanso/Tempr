@@ -3,6 +3,7 @@
 //! `gpui_tokio`; the UI thread renders and dispatches only.
 
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{Level, error, info};
 use tracing_subscriber::FmtSubscriber;
@@ -94,6 +95,45 @@ fn connection_from_env() -> Result<Option<Connection>> {
     }))
 }
 
+/// Path of the `workspace.toml` whose `[keybindings]` form the top layer.
+///
+/// `TEMPR_WORKSPACE` names either the workspace directory or the manifest
+/// file itself; without it the current directory is used. Full workspace open
+/// (connection list, recents) is still ahead — see docs/TODO.md.
+fn workspace_manifest_path() -> PathBuf {
+    match std::env::var_os("TEMPR_WORKSPACE") {
+        Some(v) => {
+            let p = PathBuf::from(v);
+            // A directory (existing, or named without an extension) holds the
+            // manifest; anything else is taken as the manifest file itself.
+            if p.is_dir() || p.extension().is_none() {
+                p.join("workspace.toml")
+            } else {
+                p
+            }
+        }
+        None => PathBuf::from("workspace.toml"),
+    }
+}
+
+/// Workspace-level keybinding overrides, plus a notice when the manifest
+/// exists but could not be read. A missing manifest is the normal case.
+fn workspace_keybindings() -> (tempr_domain::KeybindingOverrides, Option<String>) {
+    let path = workspace_manifest_path();
+    match tempr_workspace::load_manifest_from(&path) {
+        Ok(Some(manifest)) => {
+            info!(path = %path.display(), "workspace manifest loaded");
+            (manifest.keybindings, None)
+        }
+        Ok(None) => (Default::default(), None),
+        Err(e) => {
+            let path = path.display().to_string();
+            tracing::warn!(error = %e, path, "ignoring workspace manifest; using defaults");
+            (Default::default(), Some(format!("{path} ignored: {e}")))
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
@@ -104,9 +144,10 @@ fn main() -> Result<()> {
     let services = build_services();
     let connection = connection_from_env()?;
 
-    // Keybinding layers: user settings (~/.config/tempr/settings.toml) now;
-    // the workspace layer joins when workspace open lands.
-    // A broken settings file must not prevent the window from opening.
+    // Keybinding layers, lowest first: user settings
+    // (~/.config/tempr/settings.toml) then the workspace manifest.
+    // A broken settings or manifest file must not prevent the window from
+    // opening — both fall back to defaults with a status-bar notice.
     let (user_settings, settings_notice) = match tempr_workspace::load_user_settings() {
         Ok(s) => (s, None),
         Err(e) => {
@@ -120,9 +161,15 @@ fn main() -> Result<()> {
             )
         }
     };
+    let (workspace_keys, workspace_notice) = workspace_keybindings();
     services
         .command
-        .set_keybinding_layers(vec![user_settings.keybindings.clone()]);
+        .set_keybinding_layers(vec![user_settings.keybindings.clone(), workspace_keys]);
+    // Both files can be broken at once; the status bar shows one line.
+    let startup_notice = match (settings_notice, workspace_notice) {
+        (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+        (a, b) => a.or(b),
+    };
 
     // Keyboard-only audit: print every command with its effective keys.
     if std::env::var("TEMPR_LIST_COMMANDS").is_ok_and(|v| v == "1") {
@@ -153,7 +200,7 @@ fn main() -> Result<()> {
             .ok()
             .filter(|s| !s.trim().is_empty()),
         bench_scroll_then_exit: std::env::var("TEMPR_BENCH_SCROLL").is_ok_and(|v| v == "1"),
-        startup_notice: settings_notice,
+        startup_notice,
     };
     if dev.bench_scroll_then_exit && (dev.startup_sql.is_none() || connection.is_none()) {
         anyhow::bail!("TEMPR_BENCH_SCROLL=1 requires TEMPR_STARTUP_SQL and DATABASE_URL");

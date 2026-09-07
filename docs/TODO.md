@@ -15,7 +15,7 @@
 - [ ] `ThemeProvider` tokens replace the placeholder palette consts in `tempr_ui::theme` (no hard-coded colors rule, 11-gpui.md)
 - [ ] Profile the 10% of bench frames > 20 ms (p95 23 ms, max 59 ms at 100k rows, release): suspects are text shaping of ~60 fresh cells per frame and per-frame `format_value` allocations — try a shaped-line cache keyed by (row, col) or pre-formatting strings on append; add a per-frame histogram to `ScrollBench`
 - [ ] `ScrollBench`: detect a throttled compositor (e.g. > 25% of frames ≥ 500 ms) and mark the report invalid instead of reporting fps
-- [ ] Workspace open + connection picker in `MainWindow` (workspace connection list from `workspace.toml`, secrets via OS keychain — new dependency → DECISIONS entry) replaces the `DATABASE_URL` stand-in; surface a malformed `DATABASE_URL` in the UI instead of exiting before the window opens; error toasts driven by `AppEvent`
+- [ ] Workspace open + connection picker in `MainWindow` (workspace connection list from `workspace.toml`, secrets via OS keychain — new dependency → DECISIONS entry) replaces the `DATABASE_URL` stand-in and the `TEMPR_WORKSPACE`/cwd manifest lookup from D24 (the keybinding layering itself stays); surface a malformed `DATABASE_URL` in the UI instead of exiting before the window opens; error toasts driven by `AppEvent`
 - [ ] `ResultGrid`: column virtualization + resize, copy-on-select, 2D keyboard navigation (11-gpui.md Table row); columnar `RowStore` with spill-to-disk (13-result-grid.md) once result sizes demand it
 - [ ] `Input`: undo/redo, auto-resize; multi-line SQL input arrives with the Phase 2 editor (rope + tree-sitter)
 
@@ -30,17 +30,13 @@
 - [ ] Inner-statement execution inside `BEGIN … END` blocks / transactions: `StatementRange` reports the whole block as one range (kind `Block`/`Transaction`); descend into children when the cursor is inside
 - [ ] `EditorView` scroll: `set_selections` picks Top/Bottom from last frame's `visible_lines`; `ScrollStrategy::Nearest` (used by the palette since 2026-09-07) does the same with no bookkeeping — swap it and drop the side pick
 - [ ] Palette: highlight matched characters (`CommandMatch::indices`) in titles; show "no keybinding" hint; remember last query per session
-- [ ] Apply the workspace keybinding layer (`WorkspaceManifest::keybindings`) when workspace open lands (`CommandService::set_keybinding_layers([user, workspace])`); rebind live on settings change (`cx.clear_key_bindings()` + `commands::install`)
+- [ ] `format_version` is never checked when a manifest is read (`Storage::load_manifest` and the sync `load_manifest_from` both ignore it): a future v2 `workspace.toml` loads silently in an old binary, unknown fields dropped — validate and report a typed error before workspace open ships
+- [ ] Rebind live when `settings.toml` / `workspace.toml` change (`cx.clear_key_bindings()` + `commands::install`) and add a settings validation command; today the three layers resolve once at startup (→ D24, restart required), invalid keystrokes are logged with a fallback to defaults, and a parse error shows once in the status bar
 - [ ] Plugin commands need a GPUI action shape (a generic `PluginCommand { id }` action or per-plugin `actions!`) before `CommandContribution` from 08-plugin-api can register through `CommandService`
 - [ ] `EditorView` follow-ups: horizontal scroll / soft wrap (long lines are clipped today), find/replace, add cursor above/below and select-next-occurrence, gutter run buttons per statement, `BufferChanged` publisher so other views can observe the buffer (10-editor data flow), shaped-line cache keyed by (line, text, highlights) if profiling shows re-shaping visible lines each frame matters
 - [ ] `AppEvent::CommandExecuted` keymap semantics: today it fires only for palette-dispatched commands; key-driven actions bypass the service, so listeners (history, plugins) see a partial stream — either record from a global action observer or document it as palette-only
-- [ ] Live rebind on settings change and a `settings.toml` validation command (today invalid keystrokes are logged, the command falls back to its defaults, and the parse error is shown once in the status bar)
 - [ ] Editing ops follow-ups: indent/outdent, join lines, transpose, select word/line, add cursor above/below, word motions across line breaks for `prev_word_boundary` when the previous line is empty
 - [ ] `EditHistory` bounds: cap depth and coalesce typing bursts (today every keystroke stores its removed/inserted text forever; a select-all + paste on a 10 MB file retains full copies)
-- [ ] Phase 2: Tree-sitter PostgreSQL grammar integration + incremental parse
-- [ ] Phase 2: Statement boundary detector ($$ delimiters, comments, string literals)
-- [ ] Phase 2: Command palette (fuzzy search, all registered commands, configurable keybindings)
-- [ ] Phase 2: Keyboard-only audit — every user-facing action listed with keybinding
 - [ ] Phase 3: Catalog cache (schema metadata from PostgreSQL, local cache, incremental refresh)
 - [ ] Phase 3: Completion provider (context-aware, < 5 ms, 10,000 objects)
 - [ ] Phase 3: Semantic analyzer (column ref resolution, ambiguity detection)

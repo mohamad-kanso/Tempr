@@ -125,6 +125,8 @@ Settings are resolved in strict precedence order:
 2. **User settings** — stored in `~/.config/tempr/settings.toml`. These are the user's personal preferences that apply across all their workspaces.
 3. **Workspace settings** — stored in `<workspace>/workspace.toml`. These override both layers for this workspace only.
 
+All three layers are resolved once at startup. Until workspace open lands, the binary finds the workspace manifest by path — `TEMPR_WORKSPACE` (a workspace directory or the manifest file) when set, otherwise `./workspace.toml` — and reads it with the synchronous `manifest::load_manifest_from`, the one read path outside `Storage` (→ D24). A missing manifest is normal; a corrupt one is non-fatal (defaults stand, the error reaches the status bar).
+
 This layering means a user can set their preferred theme globally and override it per-workspace for projects that use a different style. It also means workspaces are portable: a workspace with no settings overrides inherits the user's defaults, and a workspace with explicit settings works for anyone who opens it (modulo personal preferences that are not overridden).
 
 ## Data Flow
