@@ -343,17 +343,21 @@ impl SchemaService {
     /// schema and name are unknown, so nothing can be scoped to it), when
     /// every changed object's schema cannot be resolved from the cache, or
     /// when more than 40% of known objects moved — past that a single full
-    /// introspection is the cheaper query.
+    /// introspection is the cheaper query. The returned `RefreshPath` says
+    /// which of those actually happened, so a caller — and a test — can tell
+    /// a real splice from a full-refresh fallback that merely looks the same.
     pub async fn refresh_incremental(
         &self,
         connection_id: ConnectionId,
-    ) -> Result<Arc<SchemaSnapshot>, ServiceError> {
+    ) -> Result<(Arc<SchemaSnapshot>, RefreshPath), ServiceError> {
         let cached = match self.snapshot(connection_id) {
             Some(snapshot) => Some(snapshot),
             None => self.load_cached(connection_id).await,
         };
         let Some(cached) = cached.filter(|s| !s.fingerprints.is_empty()) else {
-            return self.refresh(connection_id).await;
+            return self
+                .full_refresh_fallback(connection_id, FullRefreshReason::NoCachedFingerprints)
+                .await;
         };
 
         let swept = match self
@@ -375,7 +379,9 @@ impl SchemaService {
             // would fail there identically — propagate it instead of paying
             // for a second doomed call.
             Err(ServiceError::QueryFailed { .. }) | Err(ServiceError::NotConnected { .. }) => {
-                return self.refresh(connection_id).await;
+                return self
+                    .full_refresh_fallback(connection_id, FullRefreshReason::SweepUnavailable)
+                    .await;
             }
             Err(e) => return Err(e),
         };
@@ -383,10 +389,18 @@ impl SchemaService {
         let delta = Self::diff_fingerprints(&cached.fingerprints, &swept);
         if delta.is_empty() {
             // Nothing moved: no new snapshot, no event, no cache rewrite.
-            return Ok(cached);
+            tracing::debug!(connection = %connection_id, "refresh_incremental: unchanged");
+            return Ok((cached, RefreshPath::Unchanged));
         }
-        if !delta.added.is_empty() || delta.touched() * 5 > cached.fingerprints.len() * 2 {
-            return self.refresh(connection_id).await;
+        if !delta.added.is_empty() {
+            return self
+                .full_refresh_fallback(connection_id, FullRefreshReason::UnknownObject)
+                .await;
+        }
+        if delta.touched() * 5 > cached.fingerprints.len() * 2 {
+            return self
+                .full_refresh_fallback(connection_id, FullRefreshReason::TooMuchChanged)
+                .await;
         }
 
         // Every changed object must resolve to the schema it lives in.
@@ -404,11 +418,18 @@ impl SchemaService {
             .collect();
         schemas.sort();
         schemas.dedup();
-        if schemas.is_empty() {
-            // Every changed object was unresolvable (absent from the cached
-            // object list, or an orphan with no parent to hang a schema off
-            // of) — nothing safe to scope a targeted re-introspection to.
-            return self.refresh(connection_id).await;
+        if schemas.is_empty() && !delta.changed.is_empty() {
+            // There were changed objects, but every one of them was
+            // unresolvable (absent from the cached object list, or an orphan
+            // with no parent to hang a schema off of) — nothing safe to scope
+            // a targeted re-introspection to. A delta with an empty
+            // `changed` (pure drops) legitimately produces no schemas to
+            // read here: `splice_objects` removes a dropped id outright,
+            // independent of `touched_schemas`, so there is nothing to
+            // re-introspect and this is not a failure.
+            return self
+                .full_refresh_fallback(connection_id, FullRefreshReason::UnresolvedSchema)
+                .await;
         }
 
         let mut entries = Vec::new();
@@ -476,7 +497,24 @@ impl SchemaService {
             connection: connection_id,
             snapshot: snapshot.id,
         });
-        Ok(snapshot)
+        let path = RefreshPath::Incremental {
+            schemas: schemas.len(),
+            touched: delta.touched(),
+        };
+        tracing::debug!(connection = %connection_id, ?path, "refresh_incremental: spliced");
+        Ok((snapshot, path))
+    }
+
+    /// Run a full `refresh` and tag the result with why the incremental path
+    /// was not taken.
+    async fn full_refresh_fallback(
+        &self,
+        connection_id: ConnectionId,
+        reason: FullRefreshReason,
+    ) -> Result<(Arc<SchemaSnapshot>, RefreshPath), ServiceError> {
+        tracing::debug!(connection = %connection_id, ?reason, "refresh_incremental: full refresh fallback");
+        let snapshot = self.refresh(connection_id).await?;
+        Ok((snapshot, RefreshPath::FullRefresh(reason)))
     }
 
     /// Combine the surviving cached objects with freshly introspected ones.
@@ -505,6 +543,34 @@ impl SchemaService {
         objects.extend(refreshed);
         objects
     }
+}
+
+/// Which path an incremental refresh actually took. A caller that asked for
+/// the cheap path deserves to know when it did not get it — and a test
+/// asserting "this was incremental" is otherwise impossible to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshPath {
+    /// Nothing moved: the cached snapshot was returned untouched.
+    Unchanged,
+    /// The delta was applied by re-introspecting only the touched schemas.
+    Incremental { schemas: usize, touched: usize },
+    /// A full introspection ran instead, for this reason.
+    FullRefresh(FullRefreshReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullRefreshReason {
+    /// No cached snapshot, or a cached snapshot with no fingerprints to diff.
+    NoCachedFingerprints,
+    /// The driver could not sweep, or the sweep itself failed.
+    SweepUnavailable,
+    /// An object appeared that the cache has never seen: the sweep reports
+    /// OIDs, so there is no schema or name to scope a targeted query to.
+    UnknownObject,
+    /// More of the catalog moved than a targeted re-read would save.
+    TooMuchChanged,
+    /// Changed objects whose schema could not be resolved from the cache.
+    UnresolvedSchema,
 }
 
 /// What a fingerprint sweep says changed since the cached snapshot.
