@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tempr_db::{DriverError, ObjectKind, SchemaScope, SchemaSnapshotEntry};
+use tempr_db::{DriverError, ObjectKind, SchemaFingerprint, SchemaScope, SchemaSnapshotEntry};
 use tempr_domain::{
     ConnectionId, SchemaFingerprintRecord, SchemaObject, SchemaObjectId, SchemaObjectKind,
     SchemaSnapshot, SchemaSnapshotId,
@@ -301,6 +301,224 @@ impl SchemaService {
     pub fn version(&self, connection_id: ConnectionId) -> Option<u64> {
         self.snapshots.read().get(&connection_id).map(|s| s.version)
     }
+
+    /// Pure diff of a cached fingerprint list against a fresh sweep.
+    pub fn diff_fingerprints(
+        cached: &[SchemaFingerprintRecord],
+        swept: &[SchemaFingerprint],
+    ) -> SchemaDelta {
+        let mut before: HashMap<(SchemaObjectKind, u64), u64> = cached
+            .iter()
+            .map(|f| ((f.kind, f.native_id), f.version))
+            .collect();
+
+        let mut delta = SchemaDelta::default();
+        for f in swept {
+            let key = (domain_kind(f.kind), f.native_id);
+            match before.remove(&key) {
+                Some(version) if version == f.version => {}
+                Some(_) => delta.changed.push(key),
+                None => delta.added.push(key),
+            }
+        }
+        delta.dropped = before.into_keys().collect();
+        // `SchemaObjectKind` has no `Ord` (it is identity data, not a
+        // ranking), so order by its stable discriminant instead of the enum
+        // itself — sorting only exists here to make the delta's Vec order
+        // deterministic for equality assertions.
+        let by_kind_then_id = |a: &(SchemaObjectKind, u64), b: &(SchemaObjectKind, u64)| {
+            (a.0.discriminant(), a.1).cmp(&(b.0.discriminant(), b.1))
+        };
+        delta.added.sort_unstable_by(by_kind_then_id);
+        delta.changed.sort_unstable_by(by_kind_then_id);
+        delta.dropped.sort_unstable_by(by_kind_then_id);
+        delta
+    }
+
+    /// Sweep fingerprints and re-introspect only the schemas that moved.
+    ///
+    /// Falls back to a full refresh when there is nothing to diff against (no
+    /// cached snapshot, or a cache with no fingerprints), when the driver has
+    /// no sweep, when an object appeared that the cache has never seen (its
+    /// schema and name are unknown, so nothing can be scoped to it), when
+    /// every changed object's schema cannot be resolved from the cache, or
+    /// when more than 40% of known objects moved — past that a single full
+    /// introspection is the cheaper query.
+    pub async fn refresh_incremental(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Arc<SchemaSnapshot>, ServiceError> {
+        let cached = match self.snapshot(connection_id) {
+            Some(snapshot) => Some(snapshot),
+            None => self.load_cached(connection_id).await,
+        };
+        let Some(cached) = cached.filter(|s| !s.fingerprints.is_empty()) else {
+            return self.refresh(connection_id).await;
+        };
+
+        let swept = match self
+            .connection_service
+            .with_metadata_connection_fn(connection_id, |mut conn| async move {
+                conn.schema_fingerprints(SchemaScope::SearchPath).await
+            })
+            .await
+        {
+            Ok(swept) => swept,
+            // `with_metadata_connection_fn` wraps every `DriverError` —
+            // including `Unsupported` from a driver with no sweep — into
+            // `ServiceError::QueryFailed`; there is no distinct variant to
+            // single out "unsupported" from a transient query error, so both
+            // fall back here. `NotConnected` covers a pool that dropped
+            // between the caller checking in and this call running. Falling
+            // back to `refresh` re-runs the same connection lookup, so a
+            // `ConnectionNotFound` (missing pool despite a `Connected` state)
+            // would fail there identically — propagate it instead of paying
+            // for a second doomed call.
+            Err(ServiceError::QueryFailed { .. }) | Err(ServiceError::NotConnected { .. }) => {
+                return self.refresh(connection_id).await;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let delta = Self::diff_fingerprints(&cached.fingerprints, &swept);
+        if delta.is_empty() {
+            // Nothing moved: no new snapshot, no event, no cache rewrite.
+            return Ok(cached);
+        }
+        if !delta.added.is_empty() || delta.touched() * 5 > cached.fingerprints.len() * 2 {
+            return self.refresh(connection_id).await;
+        }
+
+        // Every changed object must resolve to the schema it lives in.
+        // `SchemaObject::Table`/`View`/`Function` carry `schema` directly;
+        // `Column` and `Index` do not, so their schema is resolved by
+        // walking the parent link recorded on the cached object.
+        let mut schemas: Vec<String> = delta
+            .changed
+            .iter()
+            .filter_map(|(kind, native_id)| {
+                let id = SchemaObjectId::derived(connection_id, *kind, *native_id);
+                let object = cached.objects.iter().find(|o| o.id() == id)?;
+                object_schema(&cached.objects, object)
+            })
+            .collect();
+        schemas.sort();
+        schemas.dedup();
+        if schemas.is_empty() {
+            // Every changed object was unresolvable (absent from the cached
+            // object list, or an orphan with no parent to hang a schema off
+            // of) — nothing safe to scope a targeted re-introspection to.
+            return self.refresh(connection_id).await;
+        }
+
+        let mut entries = Vec::new();
+        for schema in &schemas {
+            let scope = SchemaScope::Schema(schema.clone());
+            let mut part = self
+                .connection_service
+                .with_metadata_connection_fn(connection_id, |mut conn| async move {
+                    conn.snapshot_schema(scope).await
+                })
+                .await?;
+            entries.append(&mut part);
+        }
+        let refreshed = Self::objects_from_entries(connection_id, &entries);
+
+        // The touched schemas were re-introspected in full, so every cached
+        // object that lived in one of them is superseded — dropped either
+        // because it is gone from the fresh sweep, or because it is about to
+        // be replaced by `refreshed`. Objects outside the touched schemas are
+        // left untouched, except for anything the sweep says is gone
+        // (`dropped` can name objects in schemas we never re-introspected,
+        // since removal needs no re-introspection to act on).
+        let dropped: std::collections::HashSet<SchemaObjectId> = delta
+            .dropped
+            .iter()
+            .map(|(kind, native_id)| SchemaObjectId::derived(connection_id, *kind, *native_id))
+            .collect();
+        let mut objects: Vec<SchemaObject> = cached
+            .objects
+            .iter()
+            .filter(|o| {
+                if dropped.contains(&o.id()) {
+                    return false;
+                }
+                match object_schema(&cached.objects, o) {
+                    Some(schema) => !schemas.contains(&schema),
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+        objects.extend(refreshed);
+
+        let snapshot = Arc::new(SchemaSnapshot {
+            id: SchemaSnapshotId::new(),
+            connection_id,
+            version: cached.version + 1,
+            fetched_at: chrono::Utc::now(),
+            objects,
+            keywords: cached.keywords.clone(),
+            fingerprints: swept
+                .into_iter()
+                .map(|f| SchemaFingerprintRecord {
+                    kind: domain_kind(f.kind),
+                    native_id: f.native_id,
+                    version: f.version,
+                })
+                .collect(),
+        });
+
+        self.snapshots
+            .write()
+            .insert(connection_id, snapshot.clone());
+        self.save_cached(&snapshot).await;
+        self.event_bus.publish(AppEvent::SchemaRefreshed {
+            connection: connection_id,
+            snapshot: snapshot.id,
+        });
+        Ok(snapshot)
+    }
+}
+
+/// What a fingerprint sweep says changed since the cached snapshot.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SchemaDelta {
+    pub added: Vec<(SchemaObjectKind, u64)>,
+    pub changed: Vec<(SchemaObjectKind, u64)>,
+    pub dropped: Vec<(SchemaObjectKind, u64)>,
+}
+
+impl SchemaDelta {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.dropped.is_empty()
+    }
+
+    /// Objects touched, weighed against the full-refresh threshold.
+    pub fn touched(&self) -> usize {
+        self.added.len() + self.changed.len() + self.dropped.len()
+    }
+}
+
+/// The schema a domain object lives in. `Table`/`View`/`Function` carry it
+/// directly; `Column` and `Index` do not, so it is resolved by walking the
+/// parent link recorded on the object, one hop, against the same object list.
+fn object_schema(objects: &[SchemaObject], object: &SchemaObject) -> Option<String> {
+    match object {
+        SchemaObject::Table { schema, .. }
+        | SchemaObject::View { schema, .. }
+        | SchemaObject::Function { schema, .. } => Some(schema.clone()),
+        SchemaObject::Column { parent_id, .. } => objects
+            .iter()
+            .find(|o| o.id() == *parent_id)
+            .and_then(|parent| object_schema(objects, parent)),
+        SchemaObject::Index {
+            parent_table_id, ..
+        } => objects
+            .iter()
+            .find(|o| o.id() == *parent_table_id)
+            .and_then(|parent| object_schema(objects, parent)),
+    }
 }
 
 /// The sweep cannot tell a table from a view — both are `pg_class` rows —
@@ -514,5 +732,87 @@ mod tests {
             after_third.id, third.id,
             "a content change must be written to disk"
         );
+    }
+
+    #[test]
+    fn diff_classifies_changed_new_and_dropped() {
+        let cached = vec![
+            SchemaFingerprintRecord {
+                kind: SchemaObjectKind::Table,
+                native_id: 1,
+                version: 10,
+            },
+            SchemaFingerprintRecord {
+                kind: SchemaObjectKind::Table,
+                native_id: 2,
+                version: 20,
+            },
+            SchemaFingerprintRecord {
+                kind: SchemaObjectKind::Column,
+                native_id: 100,
+                version: 30,
+            },
+        ];
+        let swept = vec![
+            SchemaFingerprint {
+                native_id: 1,
+                kind: ObjectKind::Relation,
+                version: 10,
+            }, // unchanged
+            SchemaFingerprint {
+                native_id: 2,
+                kind: ObjectKind::Relation,
+                version: 21,
+            }, // changed
+            SchemaFingerprint {
+                native_id: 3,
+                kind: ObjectKind::Relation,
+                version: 40,
+            }, // new
+               // column 100 absent → dropped
+        ];
+
+        let delta = SchemaService::diff_fingerprints(&cached, &swept);
+        assert_eq!(delta.changed, vec![(SchemaObjectKind::Table, 2)]);
+        assert_eq!(delta.added, vec![(SchemaObjectKind::Table, 3)]);
+        assert_eq!(delta.dropped, vec![(SchemaObjectKind::Column, 100)]);
+        assert_eq!(delta.touched(), 3);
+        assert!(!delta.is_empty());
+    }
+
+    #[test]
+    fn an_identical_sweep_is_an_empty_delta() {
+        let cached = vec![SchemaFingerprintRecord {
+            kind: SchemaObjectKind::Table,
+            native_id: 1,
+            version: 10,
+        }];
+        let swept = vec![SchemaFingerprint {
+            native_id: 1,
+            kind: ObjectKind::Relation,
+            version: 10,
+        }];
+        let delta = SchemaService::diff_fingerprints(&cached, &swept);
+        assert!(delta.is_empty());
+        assert_eq!(delta.touched(), 0);
+    }
+
+    #[test]
+    fn a_column_id_never_matches_a_relation_id_with_the_same_number() {
+        // The pair (kind, native_id) is the key precisely because these two
+        // numbers can coincide on a database whose OID counter has wrapped.
+        let cached = vec![SchemaFingerprintRecord {
+            kind: SchemaObjectKind::Column,
+            native_id: 16384,
+            version: 1,
+        }];
+        let swept = vec![SchemaFingerprint {
+            native_id: 16384,
+            kind: ObjectKind::Relation,
+            version: 1,
+        }];
+        let delta = SchemaService::diff_fingerprints(&cached, &swept);
+        assert_eq!(delta.added, vec![(SchemaObjectKind::Table, 16384)]);
+        assert_eq!(delta.dropped, vec![(SchemaObjectKind::Column, 16384)]);
     }
 }
