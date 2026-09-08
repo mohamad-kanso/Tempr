@@ -6,7 +6,8 @@ pub mod error;
 pub mod stream;
 
 pub use driver::{
-    CancelHandle, DatabaseDriver, DriverConnection, EngineId, SchemaScope, SchemaSnapshotEntry,
+    CancelHandle, DatabaseDriver, DriverConnection, EngineId, ObjectKind, SchemaFingerprint,
+    SchemaScope, SchemaSnapshotEntry,
 };
 pub use error::DriverError;
 pub use stream::{QueryStream, QueryStreamImpl};

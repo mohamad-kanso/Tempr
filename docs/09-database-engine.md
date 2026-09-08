@@ -115,33 +115,66 @@ pub trait DatabaseDriver: Send + Sync {
 
 ### DriverConnection
 
-The active connection handle returned by `DatabaseDriver::connect`. Every method is cancellable (the async task can be dropped to abort the operation).
+The active connection handle returned by `DatabaseDriver::connect`. Every method is cancellable (the async task can be dropped to abort the operation). `DriverConnection: Send + Sync` — `Sync` so a cancel handle can be derived without exclusive access (see `cancel_handle` below).
 
 ```rust
 #[async_trait]
-pub trait DriverConnection: Send {
+pub trait DriverConnection: Send + Sync {
     /// Execute a SQL statement with bound parameters and return
     /// a streaming result handle. For DDL/DML that returns no rows,
     /// the stream yields zero batches and reports the affected row count
     /// via `QueryStream::rows_affected()`.
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryStream, DriverError>;
 
-    /// Cancel the currently executing query on this connection.
+    /// Cancel the currently executing query on this connection. Requires
+    /// exclusive access; a concurrent caller uses `cancel_handle()` instead.
     /// PostgreSQL: sends a CancelRequest on a separate connection.
     /// Called from the cancel path in QueryService (see [Query lifecycle](#query-lifecycle)).
     async fn cancel(&mut self) -> Result<(), DriverError>;
 
-    /// Perform a full schema introspection within the given scope
-    /// (database, schema, or all). Returns a structured snapshot that
-    /// SchemaService persists to the catalog cache.
-    /// This method is called on the dedicated metadata pool slot.
-    async fn snapshot_schema(&mut self, scope: SchemaScope) -> Result<SchemaSnapshot, DriverError>;
+    /// Whether the transport is known dead (no I/O). Used by the pool to
+    /// evict broken connections before handing them out.
+    fn is_closed(&self) -> bool;
 
-    /// Open a transaction. The returned Transaction handle supports
-    /// commit/rollback and wraps the same DriverConnection.
-    async fn transaction(&mut self) -> Result<Transaction<'_>, DriverError>;
+    /// A cheap, cloneable handle that can cancel the query running on this
+    /// connection from a different task, without `&mut` access.
+    fn cancel_handle(&self) -> Box<dyn CancelHandle>;
+
+    /// Perform a full schema introspection within the given scope.
+    /// Returns a structured snapshot that SchemaService persists to the
+    /// catalog cache. Called on the dedicated metadata pool slot.
+    async fn snapshot_schema(&mut self, scope: SchemaScope) -> Result<Vec<SchemaSnapshotEntry>, DriverError>;
+
+    /// Cheap change-detection sweep over `scope`: one row per relation and
+    /// per column, carrying a version that moves whenever the object's
+    /// definition changes. Callers diff two sweeps and re-introspect only
+    /// what moved. Default body returns `DriverError::Unsupported`, so a
+    /// driver that has no such mechanism falls back to a full
+    /// `snapshot_schema` refresh rather than failing.
+    async fn schema_fingerprints(&mut self, scope: SchemaScope) -> Result<Vec<SchemaFingerprint>, DriverError> {
+        let _ = scope;
+        Err(DriverError::Unsupported("schema_fingerprints".to_string()))
+    }
+
+    /// The engine's own reserved-word list, fetched once per schema refresh
+    /// and cached alongside the catalog — never queried on the completion
+    /// request path. Default body returns an empty list for engines with
+    /// no such catalog function.
+    async fn keywords(&mut self) -> Result<Vec<String>, DriverError> {
+        Ok(Vec::new())
+    }
 }
 ```
+
+**Object identity (`native_id`).** Every `SchemaSnapshotEntry` (see [Canonical Types](#canonical-types)) carries a `native_id: u64` — the engine's own identifier for the object, stable across refreshes and server restarts. PostgreSQL uses `pg_class.oid` for tables/views, `pg_proc.oid` for functions, and `(attrelid << 16) | attnum` for columns (a column has no OID of its own, so this packs the owning relation's OID with the column's ordinal position into one stable value). This is what makes the incremental refresh in `schema_fingerprints` (below) possible: a diff between two sweeps is a diff of `native_id`s, not a heuristic name match. A driver whose engine has no stable object identifier should hash the object's fully-qualified name into `native_id` instead; the catalog then treats a rename as a delete plus an insert, which is correct but coarser (a renamed object loses its accumulated identity — cache history, any future "go to definition" target — across the rename).
+
+**`SchemaScope::SearchPath`.** The schemas the connection can reference unqualified, computed as `current_schemas(false)` (PostgreSQL's function returning the active `search_path`, expanded, without implicit schemas) plus `public` unconditionally — `public` is included even when a `search_path` omits it, since it is almost always still reachable and omitting it would surprise users. `SearchPath` scopes what unqualified SQL can actually name and keeps a large multi-tenant database (hundreds of per-tenant schemas) from loading every schema into the catalog when a session only ever touches a handful. This variant exists at the driver level today and is exercised by the integration tests, but nothing calls it yet: the only refresh call site (`SchemaService::refresh` in `crates/tempr_services/src/schema.rs`) still passes `SchemaScope::All` unconditionally, and `SchemaScope` has no `Default` impl. `SearchPath` is what stage 2's `SchemaService` will switch catalog refreshes to; until then, `All` remains the scope actually used, and will keep being available afterward for an explicit "refresh everything" action.
+
+**Functions.** `SchemaSnapshotEntry::Function` introspects plain scalar functions only (PostgreSQL `pg_proc.prokind = 'f'`; procedures, aggregates and window functions do not complete like a call and are excluded). Its `parameters` are built from `COALESCE(proallargtypes, proargtypes::oid[])`, filtered to the argument modes that participate in a call (`IN`, `INOUT`, `VARIADIC`) — `OUT` parameters are dropped from the list entirely rather than appearing as trailing arguments, so they neither show up in completion nor shift the index used to synthesize a name (`$1`, `$2`, …) for an argument the catalog has no name for.
+
+**`schema_fingerprints`.** A fingerprint is `(native_id, ObjectKind, version)`. On PostgreSQL, `version` is the catalog row's own `xmin` (the transaction id that last wrote it) for both relations and columns — any DDL that touches the row moves it, including `ALTER TABLE ... ALTER COLUMN ... TYPE`, which may rewrite `pg_attribute` without touching `pg_class`; sweeping both object kinds means such a change is never missed. `xmin` freezing (an old, vacuumed row reports the sentinel value `2`) can produce a false-positive "changed" reading against a stale cached value, but never a false negative, so the failure mode is an extra re-introspection, not a missed change. Drivers that cannot support this cheap sweep return `DriverError::Unsupported` from the default trait body, and the caller (`SchemaService`, in a later stage) falls back to a full `snapshot_schema`.
+
+**`keywords`.** PostgreSQL's list comes from `pg_get_keywords()` — the server's own reserved/unreserved word list for the connected version, used by the intelligence layer to avoid completing or highlighting a keyword as an identifier. Fetched once alongside a schema refresh, never during a completion keystroke; the default trait body returns an empty list for engines without an equivalent catalog function.
 
 ### QueryStream
 
@@ -265,9 +298,69 @@ pub enum ValueType {
 /// Scope for schema introspection.
 #[derive(Debug, Clone)]
 pub enum SchemaScope {
+    /// Schemas the connection can reference unqualified — its `search_path`
+    /// plus `public`. The default for catalog refreshes.
+    SearchPath,
+    /// Every non-system schema.
     All,
     Schema(String),
     Table { schema: String, table: String },
+}
+
+/// A single entry in a schema snapshot — flat list with implicit
+/// parent-child relationships via `parent_schema`/`parent_table`.
+/// `native_id` is the engine's own stable identifier for the object; see
+/// the `native_id` discussion under `DriverConnection` above.
+#[derive(Debug, Clone)]
+pub enum SchemaSnapshotEntry {
+    Table { native_id: u64, schema: String, name: String, estimated_rows: Option<u64> },
+    View { native_id: u64, schema: String, name: String, definition: String },
+    Column {
+        native_id: u64,
+        parent_schema: String,
+        parent_table: String,
+        name: String,
+        data_type: String,
+        nullable: bool,
+        ordinal: usize,
+        default: Option<String>,
+    },
+    Index {
+        native_id: u64,
+        parent_schema: String,
+        parent_table: String,
+        name: String,
+        columns: Vec<String>,
+        unique: bool,
+        index_type: String,
+    },
+    Function {
+        native_id: u64,
+        schema: String,
+        name: String,
+        /// `(argument name, formatted type)`; unnamed arguments are `$1`, `$2`, …
+        parameters: Vec<(String, String)>,
+        return_type: String,
+        language: String,
+    },
+}
+
+/// What a `SchemaFingerprint` refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectKind {
+    Relation,
+    Column,
+}
+
+/// A cheap change marker for one schema object, returned by
+/// `DriverConnection::schema_fingerprints`. `version` changes whenever the
+/// object's definition changes; comparing two sweeps yields the set of
+/// objects worth re-introspecting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaFingerprint {
+    pub native_id: u64,
+    pub kind: ObjectKind,
+    pub version: u64,
 }
 
 /// Error type for all driver operations.
@@ -287,6 +380,11 @@ pub enum DriverError {
     EngineNotFound(String),
     #[error("internal: {0}")]
     Internal(String),
+    /// A driver has no implementation for an optional capability with a
+    /// default trait body — e.g. `schema_fingerprints` on an engine with no
+    /// cheap change-detection mechanism. The caller falls back accordingly.
+    #[error("unsupported by this driver: {0}")]
+    Unsupported(String),
 }
 
 /// Transaction handle. Dropping without commit/rollback triggers
@@ -324,6 +422,14 @@ The PostgreSQL driver is a static plugin that wraps `tokio-postgres` behind the 
 - **Pooling:** Tempr's pool holds a `Vec<tokio_postgres::Client>`, not a single `tokio_postgres::Connection`. Each pool slot is a fully authenticated client. The dedicated metadata slot holds a separate client that uses `tokio_postgres::Client::copy_out` for schema introspection via `COPY (query) TO STDOUT` (fastest path for bulk metadata reads).
 - **Cancellation:** `tokio_postgres::Client::cancel` is called via a separate cancellation connection (raw socket with `CancelRequest` message). The cancel future is spawned in a separate task so it cannot be blocked by a stalled query.
 - **Batch control:** `tokio_postgres::Client::query_raw` returns a `RowStream`. Tempr's `PostgresStream` polls this stream until it has accumulated `batch_size` rows, then yields the batch. The portal is closed when the stream is dropped, cancelling the server-side query.
+
+### Catalog introspection
+
+`snapshot_schema` and `schema_fingerprints` query `pg_catalog` (`pg_class`, `pg_namespace`, `pg_attribute`, `pg_attrdef`, `pg_proc`, `pg_index`, `pg_am`, `pg_language`) directly rather than `pg_tables` or `information_schema`, because neither of the latter two exposes OIDs — and OIDs are what `native_id` (see [Interfaces](#interfaces)) is built from. Three further observable changes come along with the rewrite:
+
+- `SchemaSnapshotEntry::Column::data_type` is produced by `format_type(atttypid, atttypmod)` instead of `information_schema.columns.data_type`, so a `varchar(50)` column now reports `character varying(50)` (length included) where it previously reported bare `character varying`. This is more precise and is what a hover tooltip will want to show.
+- `SchemaSnapshotEntry::Column::ordinal` is now `pg_attribute.attnum` instead of `information_schema.columns.ordinal_position`, so it has gaps after a `DROP COLUMN`: a table with columns `a, b, c` that drops `b` reports ordinals `1, 3` for the survivors, where `information_schema` renumbered them to `1, 2`.
+- Columns are no longer privilege-filtered. `information_schema.columns` showed only columns the connecting role had some privilege on; `pg_attribute` returns every column of an in-scope relation regardless of grants. A connection with narrower privileges than expected will now see (and cache) columns it previously didn't.
 
 ### PostgreSQL type mapping
 
