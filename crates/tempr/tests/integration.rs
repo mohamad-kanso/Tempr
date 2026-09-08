@@ -330,14 +330,54 @@ async fn pg_schema_refresh() {
     let (bus, cs) = setup_pg_cs();
     let id = connect_test_pg(&cs).await;
 
+    let qs = QueryService::new(bus.clone(), cs.clone());
+    qs.execute("DROP TABLE IF EXISTS schema_refresh_probe", id)
+        .await
+        .expect("drop probe table failed");
+    qs.execute("CREATE TABLE schema_refresh_probe (id int, label text)", id)
+        .await
+        .expect("create probe table failed");
+
     let ss = SchemaService::new(bus.clone(), cs.clone());
     let snapshot = ss.refresh(id).await.expect("schema refresh failed");
 
     assert!(snapshot.version >= 1);
-    assert!(!snapshot.objects.is_empty());
+
+    let find_table = |snap: &tempr_domain::SchemaSnapshot| {
+        snap.objects
+            .iter()
+            .find(|o| matches!(o, tempr_domain::SchemaObject::Table { name, .. } if name == "schema_refresh_probe"))
+            .expect("probe table not found in snapshot")
+            .clone()
+    };
+    let table = find_table(&snapshot);
+    let table_id = table.id();
+
+    let find_column = |snap: &tempr_domain::SchemaSnapshot, col_name: &str| {
+        snap.objects
+            .iter()
+            .find(|o| {
+                matches!(o, tempr_domain::SchemaObject::Column { parent_id, name, .. } if *parent_id == table_id && name == col_name)
+            })
+            .unwrap_or_else(|| panic!("probe column {col_name} not found in snapshot"))
+            .clone()
+    };
+    find_column(&snapshot, "id");
+    find_column(&snapshot, "label");
 
     let snapshot2 = ss.refresh(id).await.expect("second refresh failed");
     assert_eq!(snapshot2.version, snapshot.version + 1);
+
+    let table2 = find_table(&snapshot2);
+    assert_eq!(
+        table2.id(),
+        table_id,
+        "probe table must keep the same id across refreshes"
+    );
+
+    qs.execute("DROP TABLE schema_refresh_probe", id)
+        .await
+        .expect("cleanup drop failed");
 }
 
 #[tokio::test]
