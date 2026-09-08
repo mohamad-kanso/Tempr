@@ -188,24 +188,68 @@ fn function_scope_clause(scope: &SchemaScope, ns: &str) -> (String, Vec<String>)
     }
 }
 
-/// The fingerprint query repeats its scope clause in both halves of a UNION,
-/// so the second half's placeholders must continue where the first left off:
-/// `$1, $2` become `$3, $4`. `count` is how many binds one clause uses.
-fn renumber_second_clause(sql: &str, count: usize) -> String {
-    if count == 0 {
+/// The fingerprint query repeats a scope clause in every segment of a
+/// `UNION ALL`, and each segment writes its own placeholders starting back at
+/// `$1` (since every clause-builder — `scope_clause`, `function_scope_clause`
+/// — numbers from `$1`). This renumbers every segment after the first so the
+/// combined query's placeholders are consecutive: segment `i`'s bind values
+/// continue where every earlier segment's left off.
+///
+/// `binds_per_segment[i]` is how many `$N` placeholders segment `i` (0-based,
+/// including the first) contributes. Its length must match the number of
+/// `UNION ALL` segments in `sql`; on a mismatch `sql` is returned unchanged
+/// rather than panicking, since a malformed rewrite is a programmer error in
+/// the calling query, not something to fail loudly on for a caller.
+///
+/// Placeholders are rewritten by scanning digit runs, not by substring
+/// replacement, so a `$1` never matches inside a `$10` — substring
+/// replacement would corrupt it into `$100` (or similar) the moment any scope
+/// ever bound ten or more values.
+fn renumber_union_segments(sql: &str, binds_per_segment: &[usize]) -> String {
+    let segments: Vec<&str> = sql.split(" UNION ALL ").collect();
+    if segments.len() != binds_per_segment.len() {
         return sql.to_string();
     }
-    let (head, tail) = match sql.split_once(" UNION ALL ") {
-        Some(parts) => parts,
-        None => return sql.to_string(),
-    };
-    let mut renumbered = tail.to_string();
-    // Rewrite from the highest placeholder down, so $1 -> $3 never collides
-    // with an existing $2 that still has to move.
-    for i in (1..=count).rev() {
-        renumbered = renumbered.replace(&format!("${i}"), &format!("${}", i + count));
+
+    let mut offset = 0usize;
+    let mut renumbered = Vec::with_capacity(segments.len());
+    for (segment, count) in segments.iter().zip(binds_per_segment) {
+        renumbered.push(shift_placeholders(segment, offset));
+        offset += count;
     }
-    format!("{head} UNION ALL {renumbered}")
+    renumbered.join(" UNION ALL ")
+}
+
+/// Rewrites every `$<digits>` placeholder in `segment` to `$<digits + offset>`
+/// by scanning whole digit runs, so `$1` is never confused with the `$1` that
+/// prefixes `$10`.
+fn shift_placeholders(segment: &str, offset: usize) -> String {
+    if offset == 0 {
+        return segment.to_string();
+    }
+    let mut out = String::with_capacity(segment.len());
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek().is_some_and(char::is_ascii_digit) {
+            let mut digits = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    digits.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push('$');
+            match digits.parse::<usize>() {
+                Ok(n) => out.push_str(&(n + offset).to_string()),
+                Err(_) => out.push_str(&digits),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Borrow bind values as `tokio_postgres` parameters.
@@ -291,11 +335,13 @@ impl DriverConnection for PostgresConnection {
         let (where_clause, binds) = scope_clause(&scope, "n", "c");
         let params = as_params(&binds);
 
-        // Tables and partitioned tables.
+        // Tables, partitioned tables, and foreign tables. Views/materialized
+        // views are queried separately below; together the two relkind lists
+        // cover the same set as the column query's ('r', 'p', 'v', 'm', 'f').
         let sql = format!(
             "SELECT c.oid::int8, n.nspname, c.relname, c.reltuples::int8 \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('r', 'p') AND {where_clause}"
+             WHERE c.relkind IN ('r', 'p', 'f') AND {where_clause}"
         );
         for row in self
             .client
@@ -463,8 +509,20 @@ impl DriverConnection for PostgresConnection {
         &mut self,
         scope: SchemaScope,
     ) -> Result<Vec<SchemaFingerprint>, DriverError> {
-        let (where_clause, binds) = scope_clause(&scope, "n", "c");
-        let params = as_params(&binds);
+        // Four segments, one per `ObjectKind` discriminant (0..3, matching
+        // declaration order). Each clause-builder numbers its own
+        // placeholders from `$1`; `renumber_union_segments` below makes the
+        // combined query's placeholders consecutive. The relation and column
+        // segments share `scope_clause(&scope, "n", "c")` and so share a bind
+        // count, but the index segment scopes through the parent table (like
+        // `snapshot_schema`'s index query) and the function segment uses
+        // `function_scope_clause` — both can bind a different number of
+        // values than the relation/column segments (e.g. `SchemaScope::Table`
+        // binds 2 for a relation/column but only 1 for a function, which has
+        // no table to match against).
+        let (relation_where, relation_binds) = scope_clause(&scope, "n", "c");
+        let (index_where, index_binds) = scope_clause(&scope, "n", "t");
+        let (function_where, function_binds) = function_scope_clause(&scope, "n");
 
         // xmin is the transaction that last wrote the catalog row, so any DDL
         // moves it. A frozen row reports 2, which differs from the cached value
@@ -472,45 +530,73 @@ impl DriverConnection for PostgresConnection {
         let sql = format!(
             "SELECT c.oid::int8, 0::int2, c.xmin::text::int8 \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {where_clause} \
+             WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {relation_where} \
              UNION ALL \
              SELECT (a.attrelid::int8 << 16) | a.attnum::int8, 1::int2, a.xmin::text::int8 \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE a.attnum > 0 AND NOT a.attisdropped \
-               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {where_clause}"
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {relation_where} \
+             UNION ALL \
+             SELECT i.oid::int8, 2::int2, i.xmin::text::int8 \
+             FROM pg_class i \
+             JOIN pg_index ix ON ix.indexrelid = i.oid \
+             JOIN pg_class t ON t.oid = ix.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE i.relkind = 'i' AND {index_where} \
+             UNION ALL \
+             SELECT p.oid::int8, 3::int2, p.xmin::text::int8 \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE p.prokind = 'f' AND {function_where}"
         );
 
-        // The clause appears twice, so the binds do too.
-        let mut doubled: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
-        doubled.extend_from_slice(&params);
-        doubled.extend_from_slice(&params);
-        let sql = renumber_second_clause(&sql, binds.len());
+        let binds_per_segment = [
+            relation_binds.len(),
+            relation_binds.len(),
+            index_binds.len(),
+            function_binds.len(),
+        ];
+        let sql = renumber_union_segments(&sql, &binds_per_segment);
+
+        let mut all_binds: Vec<String> =
+            Vec::with_capacity(2 * relation_binds.len() + index_binds.len() + function_binds.len());
+        all_binds.extend(relation_binds.iter().cloned());
+        all_binds.extend(relation_binds.iter().cloned());
+        all_binds.extend(index_binds.iter().cloned());
+        all_binds.extend(function_binds.iter().cloned());
+        let params = as_params(&all_binds);
 
         let rows = self
             .client
-            .query(&sql, &doubled)
+            .query(&sql, &params)
             .await
             .map_err(|e| DriverError::Query(e.to_string()))?;
 
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|row| {
                 let native: i64 = row.get(0);
                 let kind: i16 = row.get(1);
                 let version: i64 = row.get(2);
-                SchemaFingerprint {
+                let kind = match kind {
+                    0 => ObjectKind::Relation,
+                    1 => ObjectKind::Column,
+                    2 => ObjectKind::Index,
+                    3 => ObjectKind::Function,
+                    other => {
+                        return Err(DriverError::Internal(format!(
+                            "schema_fingerprints: unrecognized object kind discriminant {other}"
+                        )));
+                    }
+                };
+                Ok(SchemaFingerprint {
                     native_id: native as u64,
-                    kind: if kind == 0 {
-                        ObjectKind::Relation
-                    } else {
-                        ObjectKind::Column
-                    },
+                    kind,
                     version: version as u64,
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn keywords(&mut self) -> Result<Vec<String>, DriverError> {
@@ -528,9 +614,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn second_union_clause_placeholders_are_renumbered() {
+    fn two_segments_with_two_binds_each_are_renumbered() {
         let sql = "SELECT 1 WHERE a = $1 AND b = $2 UNION ALL SELECT 2 WHERE a = $1 AND b = $2";
-        let out = renumber_second_clause(sql, 2);
+        let out = renumber_union_segments(sql, &[2, 2]);
         assert_eq!(
             out,
             "SELECT 1 WHERE a = $1 AND b = $2 UNION ALL SELECT 2 WHERE a = $3 AND b = $4"
@@ -538,8 +624,69 @@ mod tests {
     }
 
     #[test]
+    fn four_segments_with_two_binds_each_are_renumbered() {
+        let sql = "SELECT 1 WHERE a = $1 AND b = $2 \
+                    UNION ALL SELECT 2 WHERE a = $1 AND b = $2 \
+                    UNION ALL SELECT 3 WHERE a = $1 AND b = $2 \
+                    UNION ALL SELECT 4 WHERE a = $1 AND b = $2";
+        let out = renumber_union_segments(sql, &[2, 2, 2, 2]);
+        assert_eq!(
+            out,
+            "SELECT 1 WHERE a = $1 AND b = $2 \
+             UNION ALL SELECT 2 WHERE a = $3 AND b = $4 \
+             UNION ALL SELECT 3 WHERE a = $5 AND b = $6 \
+             UNION ALL SELECT 4 WHERE a = $7 AND b = $8"
+        );
+    }
+
+    #[test]
+    fn segments_with_uneven_bind_counts_are_renumbered_by_running_offset() {
+        // Mirrors `schema_fingerprints`: the relation and column segments
+        // each bind 2 values, the index segment binds 2 (scoped through the
+        // parent table), and the function segment binds only 1 — so offsets
+        // must accumulate per-segment, not as a uniform `i * count`.
+        let sql = "SELECT 1 WHERE a = $1 AND b = $2 \
+                    UNION ALL SELECT 2 WHERE a = $1 AND b = $2 \
+                    UNION ALL SELECT 3 WHERE a = $1 AND b = $2 \
+                    UNION ALL SELECT 4 WHERE a = $1";
+        let out = renumber_union_segments(sql, &[2, 2, 2, 1]);
+        assert_eq!(
+            out,
+            "SELECT 1 WHERE a = $1 AND b = $2 \
+             UNION ALL SELECT 2 WHERE a = $3 AND b = $4 \
+             UNION ALL SELECT 3 WHERE a = $5 AND b = $6 \
+             UNION ALL SELECT 4 WHERE a = $7"
+        );
+    }
+
+    #[test]
     fn renumbering_is_a_no_op_without_binds() {
         let sql = "SELECT 1 UNION ALL SELECT 2";
-        assert_eq!(renumber_second_clause(sql, 0), sql);
+        assert_eq!(renumber_union_segments(sql, &[0, 0]), sql);
+    }
+
+    #[test]
+    fn ten_placeholders_in_one_segment_are_not_corrupted_by_digit_prefix_matching() {
+        // The first segment binds 1 value; the second binds 10 ($1..$10). A
+        // substring-replace renumbering (the old implementation) would turn
+        // "$1" into "$2" as a blind text swap and hit the "$1" that prefixes
+        // "$10", corrupting it. Scanning digit runs must shift $1 -> $2 and
+        // $10 -> $11 without cross-contamination.
+        let sql = "SELECT 1 WHERE a = $1 \
+                    UNION ALL SELECT 2 WHERE a = $1 AND b = $2 AND c = $3 AND d = $4 \
+                    AND e = $5 AND f = $6 AND g = $7 AND h = $8 AND i = $9 AND j = $10";
+        let out = renumber_union_segments(sql, &[1, 10]);
+        assert_eq!(
+            out,
+            "SELECT 1 WHERE a = $1 \
+             UNION ALL SELECT 2 WHERE a = $2 AND b = $3 AND c = $4 AND d = $5 \
+             AND e = $6 AND f = $7 AND g = $8 AND h = $9 AND i = $10 AND j = $11"
+        );
+    }
+
+    #[test]
+    fn mismatched_segment_count_returns_sql_unchanged() {
+        let sql = "SELECT 1 WHERE a = $1 UNION ALL SELECT 2 WHERE a = $1";
+        assert_eq!(renumber_union_segments(sql, &[1, 1, 1]), sql);
     }
 }

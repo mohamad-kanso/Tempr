@@ -73,9 +73,10 @@ pub trait DriverConnection: Send + Sync {
         scope: SchemaScope,
     ) -> Result<Vec<SchemaSnapshotEntry>, DriverError>;
 
-    /// Cheap change-detection sweep over `scope`: one row per relation and per
-    /// column, carrying a version that moves when the object's definition
-    /// changes. Callers diff two sweeps and re-introspect only what moved.
+    /// Cheap change-detection sweep over `scope`: one row per relation,
+    /// column, index, and function, carrying a version that moves when the
+    /// object's definition changes. Callers diff two sweeps and
+    /// re-introspect only what moved.
     ///
     /// Drivers that cannot do this return `DriverError::Unsupported`, and the
     /// caller falls back to a full introspection.
@@ -102,16 +103,29 @@ pub trait CancelHandle: Send + Sync {
     async fn cancel(&self) -> Result<(), DriverError>;
 }
 
-/// What a fingerprint refers to.
+/// What a fingerprint refers to. `schema_fingerprints` emits an integer
+/// discriminant per row (0, 1, 2, 3) in the same order as these variants are
+/// declared; a driver mapping that integer back must match exhaustively so an
+/// unrecognized value cannot silently be mistaken for `Column`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
+    /// A table, partitioned table, view, materialized view, or foreign table.
     Relation,
+    /// A column of a relation.
     Column,
+    /// An index.
+    Index,
+    /// A function.
+    Function,
 }
 
 /// A cheap change marker for one schema object. `version` changes whenever the
 /// object's definition changes; comparing two sweeps yields the set of objects
 /// worth re-introspecting. PostgreSQL uses the catalog row's `xmin`.
+///
+/// `native_id` is unique and stable only *within* `kind` — the same contract
+/// as `SchemaSnapshotEntry::native_id` (see its doc comment). Consumers must
+/// key on the pair `(kind, native_id)`, never on `native_id` alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaFingerprint {
     pub native_id: u64,
@@ -123,10 +137,22 @@ pub struct SchemaFingerprint {
 ///
 /// `native_id` is the database engine's own identifier for the object and must
 /// be stable across refreshes and restarts: PostgreSQL uses `pg_class.oid` for
-/// relations, `pg_proc.oid` for functions, and `(attrelid << 16) | attnum` for
-/// columns. A driver whose engine has no stable identifier should hash the
-/// object's qualified name into this field instead; the catalog then treats a
-/// rename as a delete plus an insert, which is correct but coarser.
+/// relations and indexes, `pg_proc.oid` for functions, and
+/// `(attrelid << 16) | attnum` for columns. A driver whose engine has no
+/// stable identifier should hash the object's qualified name into this field
+/// instead; the catalog then treats a rename as a delete plus an insert,
+/// which is correct but coarser.
+///
+/// **`native_id` is unique and stable only *within* an object kind** — it is
+/// NOT a global identifier across kinds. `Table` and `View` share PostgreSQL's
+/// `pg_class.oid` space and never collide with each other, but a packed
+/// column id, an index's `pg_class.oid`, and a function's `pg_proc.oid` are
+/// drawn from different numberings and can coincide (once a database's OID
+/// counter passes roughly 81 million, or after OID wraparound, a
+/// `pg_class.oid` can equal a packed column id or a `pg_proc.oid`). Consumers
+/// must key on the pair (kind, `native_id`) — kind being implicit in which
+/// variant of this enum an entry is, or `ObjectKind` for a
+/// `SchemaFingerprint` — and must never key on `native_id` alone.
 #[derive(Debug, Clone)]
 pub enum SchemaSnapshotEntry {
     Table {

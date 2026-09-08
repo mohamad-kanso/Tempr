@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tempr_db::{ObjectKind, SchemaFingerprint, SchemaScope, SchemaSnapshotEntry};
@@ -110,6 +111,46 @@ async fn connect_test_pg(cs: &ConnectionService) -> ConnectionId {
 
     cs.connect(&conn).await.expect("connect failed");
     id
+}
+
+/// Look up a `SchemaSnapshotEntry::Index`'s `native_id` by name via a fresh
+/// snapshot.
+async fn index_native_id(cs: &ConnectionService, id: ConnectionId, index_name: &str) -> u64 {
+    let entries = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("snapshot");
+    entries
+        .iter()
+        .find_map(|e| match e {
+            SchemaSnapshotEntry::Index {
+                native_id, name, ..
+            } if name == index_name => Some(*native_id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("index {index_name} missing from snapshot"))
+}
+
+/// Look up a `SchemaSnapshotEntry::Function`'s `native_id` by name via a
+/// fresh snapshot.
+async fn function_native_id(cs: &ConnectionService, id: ConnectionId, fn_name: &str) -> u64 {
+    let entries = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("snapshot");
+    entries
+        .iter()
+        .find_map(|e| match e {
+            SchemaSnapshotEntry::Function {
+                native_id, name, ..
+            } if name == fn_name => Some(*native_id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("function {fn_name} missing from snapshot"))
 }
 
 #[tokio::test]
@@ -916,6 +957,279 @@ async fn pg_fingerprints_respect_table_scope_binds() {
     })
     .await
     .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_fingerprints_detect_index_changes() {
+    // Before this fix the sweep only queried pg_class (relkind IN ('r','p',
+    // 'v','m','f')) and pg_attribute, so an index — relkind 'i' — never
+    // appeared in the fingerprint set at all: dropping and recreating one
+    // left the parent table's own relation fingerprint byte-identical
+    // (`index_update_stats` updates pg_class in place), so the sweep looked
+    // clean when it wasn't.
+    let (_bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS fp_idx_probe", &[])
+            .await?;
+        conn.execute("CREATE TABLE fp_idx_probe (id int, label text)", &[])
+            .await?;
+        conn.execute("CREATE INDEX fp_idx_probe_a ON fp_idx_probe (id)", &[])
+            .await
+    })
+    .await
+    .expect("setup table and index");
+
+    let before = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.schema_fingerprints(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("first fingerprints");
+    let before_index_oid = index_native_id(&cs, id, "fp_idx_probe_a").await;
+
+    assert!(
+        before
+            .iter()
+            .any(|f| f.kind == ObjectKind::Index && f.native_id == before_index_oid),
+        "fingerprint sweep must include the pre-existing index; indexes were \
+         previously invisible to the sweep entirely"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP INDEX fp_idx_probe_a", &[]).await?;
+        conn.execute(
+            "CREATE UNIQUE INDEX fp_idx_probe_b ON fp_idx_probe (label)",
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("drop and recreate index");
+
+    let after = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.schema_fingerprints(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("second fingerprints");
+    let after_index_oid = index_native_id(&cs, id, "fp_idx_probe_b").await;
+
+    let before_indexes: HashSet<u64> = before
+        .iter()
+        .filter(|f| f.kind == ObjectKind::Index)
+        .map(|f| f.native_id)
+        .collect();
+    let after_indexes: HashSet<u64> = after
+        .iter()
+        .filter(|f| f.kind == ObjectKind::Index)
+        .map(|f| f.native_id)
+        .collect();
+
+    assert_ne!(
+        before_indexes, after_indexes,
+        "dropping and recreating an index must change the set of Index fingerprints"
+    );
+    assert!(after_indexes.contains(&after_index_oid));
+    assert!(!after_indexes.contains(&before_index_oid));
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE fp_idx_probe", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_fingerprints_detect_function_changes() {
+    // Functions live in pg_proc, which the old sweep never queried, so
+    // `CREATE OR REPLACE FUNCTION` with a changed body was invisible.
+    let (_bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP FUNCTION IF EXISTS fp_fn_probe()", &[])
+            .await?;
+        conn.execute(
+            "CREATE FUNCTION fp_fn_probe() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$",
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("setup function");
+
+    let before = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.schema_fingerprints(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("first fingerprints");
+    let fn_oid = function_native_id(&cs, id, "fp_fn_probe").await;
+
+    let before_version = before
+        .iter()
+        .find(|f| f.kind == ObjectKind::Function && f.native_id == fn_oid)
+        .map(|f| f.version)
+        .expect(
+            "function fingerprint missing before change; functions were \
+             previously invisible to the sweep entirely",
+        );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute(
+            "CREATE OR REPLACE FUNCTION fp_fn_probe() RETURNS integer \
+             LANGUAGE sql AS $$ SELECT 2 $$",
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("replace function");
+
+    let after = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.schema_fingerprints(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("second fingerprints");
+
+    let after_version = after
+        .iter()
+        .find(|f| f.kind == ObjectKind::Function && f.native_id == fn_oid)
+        .map(|f| f.version)
+        .expect("function fingerprint missing after change");
+
+    assert_ne!(
+        before_version, after_version,
+        "CREATE OR REPLACE FUNCTION with a different body must move the function's fingerprint version"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP FUNCTION fp_fn_probe()", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_foreign_table_aligns_with_column_query_relkinds() {
+    // The table query used to list relkind IN ('r', 'p') while the column
+    // query and the fingerprint sweep used ('r', 'p', 'v', 'm', 'f'): a
+    // foreign table produced Column entries with no matching Table entry.
+    // postgres_fdw lets us create a real foreign table against this same
+    // server to exercise that path end to end.
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    let qs = QueryService::new(bus.clone(), cs.clone());
+    let check_run = qs
+        .execute(
+            "SELECT 1 FROM pg_extension WHERE extname = 'postgres_fdw'",
+            id,
+        )
+        .await
+        .expect("check for postgres_fdw");
+    let extension_preexisted = qs
+        .completed_run(check_run)
+        .and_then(|run| run.result_set)
+        .map(|rs| !rs.rows.is_empty())
+        .unwrap_or(false);
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP FOREIGN TABLE IF EXISTS fp_ft_probe", &[])
+            .await?;
+        conn.execute("DROP SERVER IF EXISTS fp_ft_probe_srv CASCADE", &[])
+            .await?;
+        conn.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw", &[])
+            .await?;
+        conn.execute(
+            "CREATE SERVER fp_ft_probe_srv FOREIGN DATA WRAPPER postgres_fdw \
+             OPTIONS (host 'localhost', dbname 'tempr', port '5432')",
+            &[],
+        )
+        .await?;
+        conn.execute(
+            "CREATE USER MAPPING FOR CURRENT_USER SERVER fp_ft_probe_srv \
+             OPTIONS (user 'tempr', password 'tempr')",
+            &[],
+        )
+        .await?;
+        conn.execute(
+            "CREATE FOREIGN TABLE fp_ft_probe (id int) SERVER fp_ft_probe_srv \
+             OPTIONS (schema_name 'public', table_name 'fp_ft_probe_target')",
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("setup foreign table");
+
+    let entries = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.snapshot_schema(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("snapshot");
+
+    let ft_oid = entries
+        .iter()
+        .find_map(|e| match e {
+            SchemaSnapshotEntry::Table {
+                native_id, name, ..
+            } if name == "fp_ft_probe" => Some(*native_id),
+            _ => None,
+        })
+        .expect(
+            "CREATE FOREIGN TABLE must produce a Table snapshot entry; previously the \
+             table query's relkind list omitted 'f', orphaning the foreign table's columns",
+        );
+
+    assert!(
+        entries.iter().any(|e| matches!(
+            e,
+            SchemaSnapshotEntry::Column { parent_table, .. } if parent_table == "fp_ft_probe"
+        )),
+        "the foreign table should still have Column entries"
+    );
+
+    let fps = cs
+        .with_metadata_connection_fn(id, |mut conn| async move {
+            conn.schema_fingerprints(SchemaScope::SearchPath).await
+        })
+        .await
+        .expect("fingerprints");
+    assert!(
+        fps.iter()
+            .any(|f| f.kind == ObjectKind::Relation && f.native_id == ft_oid),
+        "the foreign table's relation fingerprint must be present, matching what \
+         full introspection returns for the same object"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP FOREIGN TABLE fp_ft_probe", &[]).await?;
+        conn.execute(
+            "DROP USER MAPPING FOR CURRENT_USER SERVER fp_ft_probe_srv",
+            &[],
+        )
+        .await?;
+        conn.execute("DROP SERVER fp_ft_probe_srv", &[]).await
+    })
+    .await
+    .expect("cleanup foreign table objects");
+
+    if !extension_preexisted {
+        cs.with_metadata_connection_fn(id, |mut conn| async move {
+            conn.execute("DROP EXTENSION IF EXISTS postgres_fdw", &[])
+                .await
+        })
+        .await
+        .expect("cleanup postgres_fdw extension");
+    }
 }
 
 #[tokio::test]
