@@ -70,10 +70,32 @@ impl CatalogCacheFile for FileCatalogCache {
         if let Some(parent) = self.path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = self.path.with_extension("tcat.tmp");
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &self.path).await?;
-        Ok(())
+        // Each call gets its own uniquely-named temp file, in the same directory
+        // as the destination (so the final rename stays on one filesystem).
+        // Otherwise two concurrent `save()` calls for the same connection would
+        // share one temp path and race: both fds land on the same inode, one
+        // rename wins, and the loser writes straight into the now-live
+        // destination through its stale fd, producing a torn file.
+        let file_name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = self
+            .path
+            .with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+        let result = async {
+            tokio::fs::write(&tmp, &bytes).await?;
+            tokio::fs::rename(&tmp, &self.path).await?;
+            Ok::<(), WorkspaceError>(())
+        }
+        .await;
+        if result.is_err() {
+            // Best-effort cleanup: a failed save should not leave debris behind.
+            // Ignore any error from this — it must never mask the real failure.
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        result
     }
 
     fn path(&self) -> PathBuf {
@@ -334,6 +356,43 @@ mod tests {
         assert!(
             names.iter().all(|n| !n.ends_with(".tmp")),
             "atomic write must not leave a temp file: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_do_not_race() {
+        let (_dir, storage) = make_storage().await;
+        let connection = tempr_domain::ConnectionId::new();
+        let cache = storage.catalog_cache(connection);
+
+        let mut snapshot_a = sample_snapshot(connection);
+        snapshot_a.version = 1;
+        let mut snapshot_b = sample_snapshot(connection);
+        snapshot_b.version = 2;
+
+        let (result_a, result_b) = tokio::join!(cache.save(&snapshot_a), cache.save(&snapshot_b));
+        assert!(result_a.is_ok(), "save a: {result_a:?}");
+        assert!(result_b.is_ok(), "save b: {result_b:?}");
+
+        let loaded = cache
+            .load()
+            .await
+            .expect("load must not error")
+            .expect("file must exist and decode cleanly");
+        assert!(
+            loaded.version == snapshot_a.version || loaded.version == snapshot_b.version,
+            "loaded snapshot must equal one of the two concurrently written snapshots"
+        );
+
+        let dir = cache.path().parent().expect("parent").to_path_buf();
+        let mut entries = tokio::fs::read_dir(&dir).await.expect("read dir");
+        let mut names = Vec::new();
+        while let Some(e) = entries.next_entry().await.expect("entry") {
+            names.push(e.file_name().to_string_lossy().to_string());
+        }
+        assert!(
+            names.iter().all(|n| !n.ends_with(".tmp")),
+            "concurrent saves must not leave a temp file behind: {names:?}"
         );
     }
 }
