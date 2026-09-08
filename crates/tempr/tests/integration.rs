@@ -1615,8 +1615,11 @@ async fn pg_incremental_refresh_resolves_a_renamed_view_on_a_non_public_schema()
         // via `FullRefreshReason::TooMuchChanged`, which sees the rename
         // regardless of the schema-resolution bug this test exists to catch.
         for i in 0..5 {
-            conn.execute(&format!("CREATE TABLE {schema_name}.filler{i} (a int)"), &[])
-                .await?;
+            conn.execute(
+                &format!("CREATE TABLE {schema_name}.filler{i} (a int)"),
+                &[],
+            )
+            .await?;
         }
         Ok(())
     })
