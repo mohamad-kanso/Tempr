@@ -7,6 +7,13 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via gpui's linux input stack" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained — transitive via gpui (cosmic-text/fontdb, usvg)" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained — transitive via gpui (resvg/usvg)" },
+    # bincode, a DIRECT dependency chosen in D27 for the .tcat catalog codec:
+    # the bincode team ceased development permanently after a doxxing/
+    # harassment incident (not a code defect) and call 2.0.1 stable; no fix
+    # is available. Accepted for now under D27's own terms (small, pure-Rust,
+    # already-serde-shaped) — revisit at the spec's §8 load probe alongside
+    # the rkyv/SQLite alternatives D27 already weighed.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (team ceased development after a harassment incident); accepted per D27, revisit at the load probe" },
 ]
 
 [licenses]
