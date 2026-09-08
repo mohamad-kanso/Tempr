@@ -162,18 +162,33 @@ impl QueryService {
 
 ### SchemaService
 
-`SchemaService` triggers and tracks schema refreshes for each connection, holds the latest `SchemaSnapshot` per connection in memory, and publishes `SchemaRefreshed` events so that the intelligence engine and schema explorer can update without polling. It delegates the actual introspection to the database driver via `ConnectionService::with_connection_fn` / `with_metadata_connection_fn` and persists refreshed snapshots to the catalog cache (see [Storage](07-storage.md)). Schema refreshes are triggered on three occasions: connection established, explicit user action, and detected DDL change (future).
+`SchemaService` triggers and tracks schema refreshes for each connection, holds the latest `SchemaSnapshot` per connection in memory, and publishes `SchemaRefreshed` events so that the intelligence engine and schema explorer can update without polling. It delegates the actual introspection to the database driver via `ConnectionService::with_connection_fn` / `with_metadata_connection_fn`. `SchemaService::new` runs in-memory only; `SchemaService::with_cache` additionally persists refreshed snapshots to, and can load them from, the catalog cache (`Storage::catalog_cache`, see [Storage](07-storage.md)) — a service built without `with_cache` never touches disk. Schema refreshes are triggered on three occasions: connection established, explicit user action, and detected DDL change (future).
 
-**Owned state:** in-memory snapshot map (`ConnectionId → SchemaSnapshot`), refresh task handles, staleness timestamps.
+**Owned state:** in-memory snapshot map (`ConnectionId → Arc<SchemaSnapshot>`), an optional `Arc<dyn Storage>` for the catalog cache (absent when no workspace root is writable — a degradation, never an error).
 
 **Key async methods:**
 
 ```rust
 impl SchemaService {
-    pub async fn refresh(&self, connection_id: ConnectionId) -> Result<SchemaSnapshot, SchemaError>;
+    pub fn new(event_bus: Arc<EventBus>, connection_service: Arc<ConnectionService>) -> Arc<Self>;
+    pub fn with_cache(event_bus: Arc<EventBus>, connection_service: Arc<ConnectionService>, storage: Arc<dyn Storage>) -> Arc<Self>;
+
+    /// Full introspection: derives ids, fetches keywords and a fingerprint
+    /// sweep, saves to the catalog cache (best-effort) if one is configured.
+    pub async fn refresh(&self, connection_id: ConnectionId) -> Result<Arc<SchemaSnapshot>, ServiceError>;
+
+    /// Diffs a fresh fingerprint sweep against the cached snapshot's
+    /// fingerprints and re-introspects only the touched schemas; falls back
+    /// to `refresh` when there is nothing to diff against or too much changed.
+    pub async fn refresh_incremental(&self, connection_id: ConnectionId) -> Result<Arc<SchemaSnapshot>, ServiceError>;
+
+    /// Loads the cached snapshot (if any) into the in-memory map without
+    /// touching the database. `None` when there is no cache configured, no
+    /// file, or the file fails to decode.
+    pub async fn load_cached(&self, connection_id: ConnectionId) -> Option<Arc<SchemaSnapshot>>;
+
     pub fn snapshot(&self, connection_id: ConnectionId) -> Option<Arc<SchemaSnapshot>>;
     pub fn version(&self, connection_id: ConnectionId) -> Option<u64>;
-    pub async fn refresh_all(&self) -> Result<(), SchemaError>;
 }
 ```
 

@@ -44,6 +44,8 @@
 | D22 | 2026-09-03 | SQL grammar = `tree-sitter-sequel` (DerekStride, MIT) on `tree-sitter` 0.25; `Buffer` records `InputEdit`s eagerly but re-parses **lazily** on read, so `edit` stays sub-ms on any document size | Claude (Phase 2) |
 | D23 | 2026-09-05 | Commands = GPUI action types in one typed catalog (`tempr_ui::commands`); `CommandService` owns metadata + layered keybindings (defaults ← `~/.config/tempr/settings.toml` ← `workspace.toml` `[keybindings]`, command → keystrokes, empty = unbind); palette = `Input` + `uniform_list` over in-house fuzzy search; execution stays in the UI, service records `CommandExecuted` | Claude (Phase 2) |
 | D24 | 2026-09-07 | Workspace keybinding layer is applied at startup from a `workspace.toml` discovered by path (`TEMPR_WORKSPACE`, else the current directory) — ahead of workspace open; sync `parse_manifest`/`load_manifest_from` sit beside the async `Storage` trait for pre-runtime callers | Claude (Phase 2 exit) |
+| D25 | 2026-09-08 | Schema object identity is derived (UUIDv5 over connection id + kind + native id), not random | Claude (Phase 3 stage 2) |
+| D26 | 2026-09-08 | Incremental refresh diffs an `(oid, xmin)` sweep against cached fingerprints, re-introspecting per touched schema | Claude (Phase 3 stage 2) |
 | D27 | 2026-09-08 | Catalog cache format (`.tcat`) is bincode 2.x behind a versioned header (magic, version, flags, content hash); any mismatch discards and re-introspects rather than erroring | Claude (Phase 3 stage 2) |
 
 ---
@@ -308,9 +310,23 @@
 
 **Consequences**: `Storage` is no longer the only path to a manifest — the sync helpers are documented as the pre-runtime exception and must stay read-only (writes remain atomic through `Storage::save_manifest`). Layers are still resolved once at startup: editing `workspace.toml` or `settings.toml` needs a restart until live rebind lands (TODO). When workspace open arrives it replaces the path resolution, not the layering, and `TEMPR_WORKSPACE` becomes a dev knob for pointing at a workspace without the picker.
 
+## D25 — Schema object identity is derived, not random (2026-09-08)
+
+**By**: Claude (Phase 3 stage 2).
+**Decision**: `SchemaObjectId` for a catalog object is UUIDv5 over the owning connection's id as namespace and `(kind discriminant, native_id)` as name, via `SchemaObjectId::derived`.
+**Why**: a cache that cannot be diffed is a cache that must be thrown away on every refresh; kind is in the key because a packed column id can numerically equal a relation OID after OID wraparound.
+**Consequences**: renumbering `SchemaObjectKind::discriminant` orphans every cache file in the wild; drivers with no stable native id hash their qualified name into the same field and get rename-as-delete-plus-insert.
+
+## D26 — Incremental refresh diffs an `(oid, xmin)` sweep (2026-09-08)
+
+**By**: Claude (Phase 3 stage 2).
+**Decision**: The driver's fingerprint sweep is one query; `SchemaService::refresh_incremental` diffs it against the fingerprints stored with the cached snapshot and re-introspects only the affected schemas. Full refresh is the fallback in four cases: no cached fingerprints, no driver support, an object the cache has never seen, and more than 40% of objects touched.
+**Why**: PostgreSQL has no change feed, event triggers would write into the user's database, and a frozen `xmin` produces a false positive (a harmless re-introspect) rather than a missed change.
+**Consequences**: re-introspection is per schema, not per object, because catalog queries are shaped by schema and name while the sweep returns only OIDs.
+
 ## D27 — Catalog cache format is bincode behind a versioned header (2026-09-08)
 
 **By**: Claude (Phase 3 stage 2), implementing spec decision 4.
-**Decision**: `.tcat` files are a fixed header (magic `TCAT`, `u16` format version, `u16` flags, `u64` content hash) followed by `bincode` of the `SchemaSnapshot`. `bincode` 2.x is adopted as a dependency under the D18 rule (small, pure-Rust, already-serde-shaped). Any file whose magic, version or hash does not match is discarded and re-introspected.
+**Decision**: `.tcat` files are a fixed header (magic `TCAT`, `u16` format version, `u16` flags, `u64` content hash) followed by `bincode` of the private `CatalogSnapshot` mirror (bincode cannot decode `SchemaSnapshot`'s internally-tagged enum directly — see Consequences). `bincode` 2.x is adopted as a dependency under the D18 rule (small, pure-Rust, already-serde-shaped). Any file whose magic, version or hash does not match is discarded and re-introspected.
 **Why**: the catalog is derived data, so the cheapest safe failure mode is to throw it away; that makes format evolution a version bump rather than a migration. `bincode` needs no schema and reuses the serde derives the domain already has. Resolves OD#1 in 07-storage, which had weighed `rkyv` and an SQLite table — `rkyv`'s zero-copy win is real but unmeasured, and it buys a `SAFETY` burden before any number justifies it.
 **Consequences**: a second serialization format in the tree (TOML for manifests, JSON for storage, bincode for caches). `CATALOG_FORMAT_VERSION` must be bumped on any layout change, and the load probe in the spec's §8 is the evidence that would justify revisiting the choice. `SchemaObject`'s `#[serde(tag = "kind", ...)]` JSON shape cannot round-trip through bincode's serde bridge (internally-tagged enums need `deserialize_any`, which bincode's non-self-describing `Deserializer` does not implement); `tempr_workspace::catalog` carries a private, externally-tagged mirror (`CatalogObject`/`CatalogSnapshot`) as the bincode wire shape instead, so `tempr_domain` and its JSON format are untouched. Separately, `cargo deny check` flags bincode itself as unmaintained (RUSTSEC-2025-0141: the maintainers stopped development after a harassment incident, not a code defect); `deny.toml` ignores it under this decision's own terms, to be revisited at the same §8 load probe.

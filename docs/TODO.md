@@ -11,8 +11,6 @@
 - [ ] Lazy wire streaming via `query_raw()` — `PostgresStream` currently buffers full result set via `client.query()`, then yields `batch_size` chunks. True `query_raw` streaming was attempted but fails with `Error { kind: Closed }` specifically when called through `QueryService::execute()` (works fine via raw driver or closures). Root cause undetermined — suspected `Box<dyn DriverConnection>` + async trait boundary interaction. Investigate as follow-up.
 
 - [ ] `DriverConnection::ping` (active round-trip) on top of the existing `is_closed` recycle check (09-database-engine: idle ping every 30 s, reconnect with backoff → `Reconnecting`/`Failed` states, evict a connection whose query failed with a transport error)
-- [ ] Per-connection setting for the default catalog scope: today `SchemaScope::All` is the only refresh scope a driver call ever passes (`SchemaService::refresh` hasn't switched over yet); moving catalog refreshes to `SchemaScope::SearchPath`, plus a manual "refresh all schemas" action (`SchemaScope::All`) as the explicit escape hatch, is planned for a later Phase 3 stage, and a per-connection default (sticking with `SearchPath` vs `All`) should live on the connection config once that lands
-- [ ] `SchemaService` still hardcodes `estimated_rows: None` and `definition: String::new()` on the snapshot entries it hands to callers, even though `PostgresConnection::snapshot_schema` now returns both (`reltuples`-derived row counts, `pg_get_viewdef` definitions) — wire them through when a later Phase 3 stage lands object identity in `SchemaService`
 - [ ] The `schema_fingerprints` sweep does not filter by `has_function_privilege` and does not exclude extension-owned objects, consistent with the other catalog queries in `snapshot_schema` — revisit if a catalog gets noisy with objects the user cannot use or did not create
 - [ ] Per-connection `pool_max_size` from the workspace connection config instead of the service-wide `PoolConfig`
 - [ ] `ThemeProvider` tokens replace the placeholder palette consts in `tempr_ui::theme` (no hard-coded colors rule, 11-gpui.md)
@@ -21,6 +19,11 @@
 - [ ] Workspace open + connection picker in `MainWindow` (workspace connection list from `workspace.toml`, secrets via OS keychain — new dependency → DECISIONS entry) replaces the `DATABASE_URL` stand-in and the `TEMPR_WORKSPACE`/cwd manifest lookup from D24 (the keybinding layering itself stays); surface a malformed `DATABASE_URL` in the UI instead of exiting before the window opens; error toasts driven by `AppEvent`
 - [ ] `ResultGrid`: column virtualization + resize, copy-on-select, 2D keyboard navigation (11-gpui.md Table row); columnar `RowStore` with spill-to-disk (13-result-grid.md) once result sizes demand it
 - [ ] `Input`: undo/redo, auto-resize; multi-line SQL input arrives with the Phase 2 editor (rope + tree-sitter)
+- [ ] Catalog cache eviction: `max_cache_size` setting + LRU by last access (07-storage.md's own follow-up from the `.tcat` cache landing in Phase 3 stage 2) — today a `.tempr/cache/catalog/` entry is never removed once written
+- [ ] Per-connection catalog scope setting: `SchemaService::refresh`/`refresh_incremental` now always scope to `SchemaScope::SearchPath` (Phase 3 stage 2); a manual "refresh all schemas" action (`SchemaScope::All`) as the explicit escape hatch, and a per-connection default sticking with `SearchPath` vs `All`, should live on the connection config
+- [ ] `Storage::save_manifest` derives its temp file name from the destination path (`workspace.toml.tmp`, fixed) rather than a per-call unique name, so two concurrent saves race the same way the catalog cache did before `FileCatalogCache::save` was fixed to use a `uuid`-suffixed temp name — apply the same fix here
+- [ ] Domain `SchemaObject`s carry no `native_id` field, so `SchemaService`'s incremental-refresh diff has to reverse-derive `SchemaObjectId`s from a dropped relation's fingerprint and try both `SchemaObjectKind::Table` and `::View` (a `pg_class` sweep can't say which it was) — carrying the native id on `SchemaObject` would remove that ambiguity entirely
+- [ ] `cargo deny` carries an ignore for RUSTSEC-2025-0141 (bincode unmaintained, D27) — revisit at the catalog load probe (07-storage.md OD#1), with `postcard` as the candidate replacement
 
 ## Next
 
@@ -40,7 +43,6 @@
 - [ ] `AppEvent::CommandExecuted` keymap semantics: today it fires only for palette-dispatched commands; key-driven actions bypass the service, so listeners (history, plugins) see a partial stream — either record from a global action observer or document it as palette-only
 - [ ] Editing ops follow-ups: indent/outdent, join lines, transpose, select word/line, add cursor above/below, word motions across line breaks for `prev_word_boundary` when the previous line is empty
 - [ ] `EditHistory` bounds: cap depth and coalesce typing bursts (today every keystroke stores its removed/inserted text forever; a select-all + paste on a 10 MB file retains full copies)
-- [ ] Phase 3: Catalog cache (schema metadata from PostgreSQL, local cache, incremental refresh)
 - [ ] Phase 3: Completion provider (context-aware, < 5 ms, 10,000 objects)
 - [ ] Phase 3: Semantic analyzer (column ref resolution, ambiguity detection)
 - [ ] Phase 3: Real-time diagnostics (syntax via tree-sitter + semantic via analyzer)

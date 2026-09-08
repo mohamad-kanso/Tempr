@@ -23,6 +23,7 @@ tempr_domain.workspace       = true
 # tests/integration.rs (live PostgreSQL, ignored without DATABASE_URL)
 tokio.workspace       = true
 parking_lot.workspace = true
+tempfile.workspace    = true
 
 [lints]
 workspace = true

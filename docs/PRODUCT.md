@@ -51,7 +51,7 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 - AC: Every user-facing action appears in a published keybinding audit table. Insert/delete at mid-document position in a 10 MB file completes in < 1 ms.
 
 ### 4. SQL Intelligence (Phase 3)
-- 🔜 Catalog cache loads schema metadata (databases, schemas, tables, columns, types, indexes) from PostgreSQL
+- ✅ Catalog cache loads schema metadata (tables, columns, indexes, functions, views) from PostgreSQL, caches it locally as `.tcat`, and refreshes incrementally with full refresh on demand *(`SchemaService::with_cache`/`refresh`/`refresh_incremental`/`load_cached`; ids stable across refreshes, incremental diff via fingerprint sweep, offline load verified with no database connection; 2026-09-08, → D25, D26, D27)*
 - 🔜 Completion provider offers context-aware suggestions ranked by relevance
 - 🔜 Completion latency from keystroke to popup < 5 ms for cached catalogs with up to 10,000 schema objects
 - 🔜 Semantic analyzer resolves column references; detects ambiguous and unresolvable names

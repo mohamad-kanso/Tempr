@@ -4,7 +4,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tempr_db::{ObjectKind, SchemaFingerprint, SchemaScope, SchemaSnapshotEntry};
-use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode, Value};
+use tempr_domain::{
+    Connection, ConnectionId, DriverKind, SchemaObject, SchemaObjectId, SchemaSnapshot, SecretRef,
+    TlsMode, Value,
+};
 use tempr_events::{AppEventKind, EventBus, EventFilter};
 use tempr_services::{ConnectionService, QueryService, SchemaService};
 
@@ -1293,4 +1296,134 @@ async fn pg_keywords_come_from_the_server() {
         "keywords are lower-cased"
     );
     assert!(words.iter().any(|w| w == "join"));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_object_ids_survive_a_second_refresh() {
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS id_stability", &[])
+            .await?;
+        conn.execute("CREATE TABLE id_stability (id int, label text)", &[])
+            .await
+    })
+    .await
+    .expect("setup");
+
+    let service = SchemaService::new(bus, cs.clone());
+    let first = service.refresh(id).await.expect("first refresh");
+    let second = service.refresh(id).await.expect("second refresh");
+
+    let ids = |s: &SchemaSnapshot| -> Vec<SchemaObjectId> {
+        let mut v: Vec<_> = s.objects.iter().map(|o| o.id()).collect();
+        v.sort_by_key(|i| i.0);
+        v
+    };
+    assert_eq!(ids(&first), ids(&second), "ids must be reproducible");
+    assert!(!first.keywords.is_empty(), "keywords came from the server");
+    assert!(!first.fingerprints.is_empty(), "fingerprints were stored");
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE id_stability", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_incremental_refresh_keeps_untouched_ids_and_sees_the_new_column() {
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS inc_touched", &[])
+            .await?;
+        conn.execute("DROP TABLE IF EXISTS inc_untouched", &[])
+            .await?;
+        conn.execute("CREATE TABLE inc_touched (id int)", &[])
+            .await?;
+        conn.execute("CREATE TABLE inc_untouched (id int)", &[])
+            .await
+    })
+    .await
+    .expect("setup");
+
+    let service = SchemaService::new(bus, cs.clone());
+    let before = service.refresh(id).await.expect("full refresh");
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("ALTER TABLE inc_touched ADD COLUMN label text", &[])
+            .await
+    })
+    .await
+    .expect("alter");
+
+    let after = service.refresh_incremental(id).await.expect("incremental");
+    assert_eq!(after.version, before.version + 1);
+
+    let column_named = |s: &SchemaSnapshot, want: &str| {
+        s.objects
+            .iter()
+            .any(|o| matches!(o, SchemaObject::Column { name, .. } if name == want))
+    };
+    assert!(!column_named(&before, "label"), "column did not exist yet");
+    assert!(
+        column_named(&after, "label"),
+        "incremental refresh missed the new column"
+    );
+
+    let untouched_id = |s: &SchemaSnapshot| {
+        s.objects.iter().find_map(|o| match o {
+            SchemaObject::Table { id, name, .. } if name == "inc_untouched" => Some(*id),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        untouched_id(&before),
+        untouched_id(&after),
+        "an untouched table must keep its identity"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE inc_touched", &[]).await?;
+        conn.execute("DROP TABLE inc_untouched", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_catalog_is_readable_without_the_server() {
+    // The phase's offline criterion: introspect once, then serve the catalog
+    // from disk with a service that never talks to the database.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage: std::sync::Arc<dyn tempr_workspace::Storage> =
+        std::sync::Arc::new(tempr_workspace::FileSystemStorage::new(dir.path()));
+    storage
+        .init_workspace_dir()
+        .await
+        .expect("init workspace dir");
+
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+    let service = SchemaService::with_cache(bus.clone(), cs.clone(), storage.clone());
+    let written = service.refresh(id).await.expect("refresh");
+    assert!(!written.objects.is_empty());
+
+    // A brand-new service over the same storage, and a connection service
+    // pointing nowhere: nothing here can reach PostgreSQL.
+    let offline_cs = ConnectionService::new(bus.clone());
+    let offline = SchemaService::with_cache(bus, offline_cs, storage);
+    let loaded = offline.load_cached(id).await.expect("cache hit");
+
+    assert_eq!(loaded.id, written.id);
+    assert_eq!(loaded.objects.len(), written.objects.len());
+    assert_eq!(loaded.keywords, written.keywords);
+    assert!(
+        offline.snapshot(id).is_some(),
+        "loading populates the in-memory map"
+    );
 }
