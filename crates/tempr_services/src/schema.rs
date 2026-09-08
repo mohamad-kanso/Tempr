@@ -53,6 +53,19 @@ impl SchemaService {
         let storage = self.storage.as_ref()?;
         let cache = storage.catalog_cache(connection_id);
         match cache.load().await {
+            Ok(Some(snapshot)) if snapshot.connection_id != connection_id => {
+                // The cache file is keyed by connection id, so this should
+                // never happen — but the id is stored in the snapshot body
+                // itself, and never checked against the connection it was
+                // loaded for. Treat a mismatch as a cache miss rather than
+                // silently handing one connection's catalog to another.
+                tracing::warn!(
+                    expected = %connection_id,
+                    found = %snapshot.connection_id,
+                    "catalog cache connection_id mismatch; treating as a miss"
+                );
+                None
+            }
             Ok(Some(snapshot)) => {
                 let snapshot = Arc::new(snapshot);
                 self.snapshots
@@ -406,27 +419,40 @@ impl SchemaService {
         // Every changed object must resolve to the schema it lives in.
         // `SchemaObject::Table`/`View`/`Function` carry `schema` directly;
         // `Column` and `Index` do not, so their schema is resolved by
-        // walking the parent link recorded on the cached object.
-        let mut schemas: Vec<String> = delta
-            .changed
-            .iter()
-            .filter_map(|(kind, native_id)| {
-                let id = SchemaObjectId::derived(connection_id, *kind, *native_id);
-                let object = cached.objects.iter().find(|o| o.id() == id)?;
-                object_schema(&cached.objects, object)
-            })
-            .collect();
+        // walking the parent link recorded on the cached object. A changed
+        // fingerprint's `kind` came from `domain_kind`, which folds every
+        // `pg_class` row into `Table` — a sweep cannot tell a table from a
+        // view — so a changed view's key looks like `(Table, oid)` and its
+        // id must be tried under both candidate kinds, exactly like a
+        // dropped key (`candidate_ids` below is shared by both paths so they
+        // cannot drift apart again).
+        let by_id = index_by_id(&cached.objects);
+        let mut schemas: Vec<String> = Vec::new();
+        let mut unresolved = false;
+        for (kind, native_id) in &delta.changed {
+            let object = candidate_ids(connection_id, *kind, *native_id)
+                .into_iter()
+                .find_map(|id| by_id.get(&id).copied());
+            match object.and_then(|object| object_schema(&by_id, object)) {
+                Some(schema) => schemas.push(schema),
+                None => unresolved = true,
+            }
+        }
         schemas.sort();
         schemas.dedup();
-        if schemas.is_empty() && !delta.changed.is_empty() {
-            // There were changed objects, but every one of them was
-            // unresolvable (absent from the cached object list, or an orphan
-            // with no parent to hang a schema off of) — nothing safe to scope
-            // a targeted re-introspection to. A delta with an empty
-            // `changed` (pure drops) legitimately produces no schemas to
-            // read here: `splice_objects` removes a dropped id outright,
-            // independent of `touched_schemas`, so there is nothing to
-            // re-introspect and this is not a failure.
+        if unresolved {
+            // At least one changed object was unresolvable (absent from the
+            // cached object list, or an orphan with no parent to hang a
+            // schema off of). Splicing anyway would leave that object's
+            // schema stale with no later sweep able to catch it — the
+            // fingerprint we're about to cache would already match the new
+            // server state. A partial splice is worse than a slower full
+            // refresh, so fall back whenever ANY changed key fails to
+            // resolve, not only when all of them do. A delta with an empty
+            // `changed` (pure drops) never reaches this loop, so it never
+            // sets `unresolved` — `splice_objects` removes a dropped id
+            // outright, independent of `touched_schemas`, so there is
+            // nothing to re-introspect and that case is not a failure.
             return self
                 .full_refresh_fallback(connection_id, FullRefreshReason::UnresolvedSchema)
                 .await;
@@ -445,30 +471,15 @@ impl SchemaService {
         }
         let refreshed = Self::objects_from_entries(connection_id, &entries);
 
-        // A dropped fingerprint's `kind` came from `domain_kind`, which folds
-        // every `pg_class` row into `Table` — a sweep cannot tell a table
-        // from a view. So a dropped view's fingerprint says `Table`, and the
-        // id derived from it never matches the view's actual cached id
-        // (derived under `View`). Derive both candidates for a `Table`-kind
-        // drop and let whichever one is actually cached be removed — ids are
-        // cheap to over-compute but a stale object that slips past this
-        // filter is never removed again. `Column`, `Index`, and `Function`
-        // are unambiguous: `domain_kind` maps them 1:1, so no other kind
-        // needs this treatment.
+        // A dropped fingerprint has the same `Table`-folds-`View` ambiguity
+        // as a changed one (see above) — derive both candidates and let
+        // whichever one is actually cached be removed. Ids are cheap to
+        // over-compute but a stale object that slips past this filter is
+        // never removed again.
         let dropped: HashSet<SchemaObjectId> = delta
             .dropped
             .iter()
-            .flat_map(|(kind, native_id)| {
-                let mut ids = vec![SchemaObjectId::derived(connection_id, *kind, *native_id)];
-                if *kind == SchemaObjectKind::Table {
-                    ids.push(SchemaObjectId::derived(
-                        connection_id,
-                        SchemaObjectKind::View,
-                        *native_id,
-                    ));
-                }
-                ids
-            })
+            .flat_map(|(kind, native_id)| candidate_ids(connection_id, *kind, *native_id))
             .collect();
         let objects = Self::splice_objects(&cached.objects, refreshed, &dropped, &schemas);
 
@@ -527,13 +538,14 @@ impl SchemaService {
         dropped: &HashSet<SchemaObjectId>,
         touched_schemas: &[String],
     ) -> Vec<SchemaObject> {
+        let by_id = index_by_id(cached);
         let mut objects: Vec<SchemaObject> = cached
             .iter()
             .filter(|o| {
                 if dropped.contains(&o.id()) {
                     return false;
                 }
-                match object_schema(cached, o) {
+                match object_schema(&by_id, o) {
                     Some(schema) => !touched_schemas.contains(&schema),
                     None => true,
                 }
@@ -592,25 +604,60 @@ impl SchemaDelta {
     }
 }
 
+/// Build the id → object index `object_schema` needs, once per caller. At
+/// the spec's 10,000-object target, resolving every cached object's schema
+/// by linear-scanning the object list per lookup costs on the order of
+/// 10^8 id comparisons for a single splice; this map turns each lookup into
+/// a single hash-table hit.
+fn index_by_id(objects: &[SchemaObject]) -> HashMap<SchemaObjectId, &SchemaObject> {
+    objects.iter().map(|o| (o.id(), o)).collect()
+}
+
 /// The schema a domain object lives in. `Table`/`View`/`Function` carry it
 /// directly; `Column` and `Index` do not, so it is resolved by walking the
-/// parent link recorded on the object, one hop, against the same object list.
-fn object_schema(objects: &[SchemaObject], object: &SchemaObject) -> Option<String> {
+/// parent link recorded on the object, one hop, against the id index built
+/// by `index_by_id`.
+fn object_schema(
+    by_id: &HashMap<SchemaObjectId, &SchemaObject>,
+    object: &SchemaObject,
+) -> Option<String> {
     match object {
         SchemaObject::Table { schema, .. }
         | SchemaObject::View { schema, .. }
         | SchemaObject::Function { schema, .. } => Some(schema.clone()),
-        SchemaObject::Column { parent_id, .. } => objects
-            .iter()
-            .find(|o| o.id() == *parent_id)
-            .and_then(|parent| object_schema(objects, parent)),
+        SchemaObject::Column { parent_id, .. } => by_id
+            .get(parent_id)
+            .and_then(|parent| object_schema(by_id, parent)),
         SchemaObject::Index {
             parent_table_id, ..
-        } => objects
-            .iter()
-            .find(|o| o.id() == *parent_table_id)
-            .and_then(|parent| object_schema(objects, parent)),
+        } => by_id
+            .get(parent_table_id)
+            .and_then(|parent| object_schema(by_id, parent)),
     }
+}
+
+/// Every cached id a fingerprint key could actually be. A fingerprint key's
+/// kind came from `domain_kind`, which folds every `pg_class` row into
+/// `Table` because the sweep cannot tell a table from a view — so a key of
+/// kind `Table` might be cached as a `View`. Returning both candidates (in
+/// derivation order) lets a caller try the domain kind first and fall back
+/// to `View`; every other kind maps 1:1 and gets exactly one candidate. Used
+/// by both the changed-schema resolution and the dropped-id set so they
+/// cannot drift apart again.
+fn candidate_ids(
+    connection_id: ConnectionId,
+    kind: SchemaObjectKind,
+    native_id: u64,
+) -> Vec<SchemaObjectId> {
+    let mut ids = vec![SchemaObjectId::derived(connection_id, kind, native_id)];
+    if kind == SchemaObjectKind::Table {
+        ids.push(SchemaObjectId::derived(
+            connection_id,
+            SchemaObjectKind::View,
+            native_id,
+        ));
+    }
+    ids
 }
 
 /// The sweep cannot tell a table from a view — both are `pg_class` rows —

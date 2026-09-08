@@ -1580,6 +1580,101 @@ async fn pg_incremental_refresh_falls_back_to_full_refresh_on_an_added_column() 
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_incremental_refresh_resolves_a_renamed_view_on_a_non_public_schema() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
+    // A `pg_class` sweep cannot distinguish a table from a view, so a changed
+    // view's fingerprint key looks like `(Table, oid)` — `domain_kind` folds
+    // both to `Table`. Before the fix, resolving a changed key's schema only
+    // tried `SchemaObjectId::derived(conn, Table, oid)`, which never matches
+    // the view's actual cached id (derived under `View`), so the view's
+    // schema was never re-introspected and a rename was silently lost: the
+    // new snapshot stored the view's new fingerprint under its old name, so
+    // no later sweep would ever report it changed again. This puts a view on
+    // a non-`public` schema on the search path (so `snapshot_schema` must
+    // actually re-read that schema, not just fall back to `public`), renames
+    // it, and asserts the incremental splice sees the rename.
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    let schema_name = "inc_view_probe_schema";
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"), &[])
+            .await?;
+        conn.execute(&format!("CREATE SCHEMA {schema_name}"), &[])
+            .await?;
+        conn.execute(&format!("SET search_path TO {schema_name}, public"), &[])
+            .await?;
+        conn.execute(
+            &format!("CREATE VIEW {schema_name}.inc_view_before AS SELECT 1 AS n"),
+            &[],
+        )
+        .await?;
+        // Filler, so the view's rename (a single relation-level fingerprint
+        // change) stays well under `refresh_incremental`'s 40%-changed
+        // full-refresh threshold — otherwise this test would trivially pass
+        // via `FullRefreshReason::TooMuchChanged`, which sees the rename
+        // regardless of the schema-resolution bug this test exists to catch.
+        for i in 0..5 {
+            conn.execute(&format!("CREATE TABLE {schema_name}.filler{i} (a int)"), &[])
+                .await?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("setup");
+
+    let service = SchemaService::new(bus, cs.clone());
+    let before = service.refresh(id).await.expect("full refresh");
+
+    let find_view = |s: &SchemaSnapshot, want: &str| -> Option<SchemaObjectId> {
+        s.objects.iter().find_map(|o| match o {
+            SchemaObject::View { id, name, .. } if name == want => Some(*id),
+            _ => None,
+        })
+    };
+    assert!(
+        find_view(&before, "inc_view_before").is_some(),
+        "baseline full refresh must see the view before the rename"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute(
+            &format!("ALTER VIEW {schema_name}.inc_view_before RENAME TO inc_view_after"),
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("rename view");
+
+    let (after, path) = service
+        .refresh_incremental(id)
+        .await
+        .expect("incremental refresh (renamed view)");
+    assert!(
+        matches!(path, RefreshPath::Incremental { .. }),
+        "a renamed view is a changed-only delta and must take the incremental splice, got {path:?}"
+    );
+    assert!(
+        find_view(&after, "inc_view_after").is_some(),
+        "renamed view must be present under its new name after the incremental splice"
+    );
+    assert!(
+        find_view(&after, "inc_view_before").is_none(),
+        "renamed view must be gone under its old name after the incremental splice"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("SET search_path TO public", &[]).await?;
+        conn.execute(&format!("DROP SCHEMA {schema_name} CASCADE"), &[])
+            .await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_catalog_is_readable_without_the_server() {
     // Held for the whole test: this creates its own persistent `public`
     // object below, so it must not race the other DDL-mutating tests either.

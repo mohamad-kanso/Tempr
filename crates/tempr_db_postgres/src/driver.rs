@@ -527,6 +527,16 @@ impl DriverConnection for PostgresConnection {
         // xmin is the transaction that last wrote the catalog row, so any DDL
         // moves it. A frozen row reports 2, which differs from the cached value
         // and forces a re-introspect — a false positive, never a missed change.
+        //
+        // The index segment matches both 'i' (plain) and 'I' (partitioned)
+        // index relkinds. `snapshot_schema`'s index query has no relkind
+        // filter at all — every `pg_index.indexrelid` is one or the other —
+        // so it already returns both; without 'I' here a partitioned index
+        // was cached but never swept, so it could never be reported dropped.
+        // The relation, column, and function segments were checked against
+        // their `snapshot_schema` counterparts and cover the same relkinds
+        // (`'r','p','v','m','f'` and `prokind = 'f'`) — no other mismatch
+        // was found.
         let sql = format!(
             "SELECT c.oid::int8, 0::int2, c.xmin::text::int8 \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -544,7 +554,7 @@ impl DriverConnection for PostgresConnection {
              JOIN pg_index ix ON ix.indexrelid = i.oid \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
-             WHERE i.relkind = 'i' AND {index_where} \
+             WHERE i.relkind IN ('i', 'I') AND {index_where} \
              UNION ALL \
              SELECT p.oid::int8, 3::int2, p.xmin::text::int8 \
              FROM pg_proc p \
