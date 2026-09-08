@@ -425,7 +425,11 @@ The PostgreSQL driver is a static plugin that wraps `tokio-postgres` behind the 
 
 ### Catalog introspection
 
-`snapshot_schema` and `schema_fingerprints` query `pg_catalog` (`pg_class`, `pg_namespace`, `pg_attribute`, `pg_attrdef`, `pg_proc`, `pg_index`, `pg_am`, `pg_language`) directly rather than `pg_tables` or `information_schema`, because neither of the latter two exposes OIDs — and OIDs are what `native_id` (see [Interfaces](#interfaces)) is built from. One further observable change comes along with the rewrite: `SchemaSnapshotEntry::Column::data_type` is produced by `format_type(atttypid, atttypmod)` instead of `information_schema.columns.data_type`, so a `varchar(50)` column now reports `character varying(50)` (length included) where it previously reported bare `character varying`. This is more precise and is what a hover tooltip will want to show.
+`snapshot_schema` and `schema_fingerprints` query `pg_catalog` (`pg_class`, `pg_namespace`, `pg_attribute`, `pg_attrdef`, `pg_proc`, `pg_index`, `pg_am`, `pg_language`) directly rather than `pg_tables` or `information_schema`, because neither of the latter two exposes OIDs — and OIDs are what `native_id` (see [Interfaces](#interfaces)) is built from. Three further observable changes come along with the rewrite:
+
+- `SchemaSnapshotEntry::Column::data_type` is produced by `format_type(atttypid, atttypmod)` instead of `information_schema.columns.data_type`, so a `varchar(50)` column now reports `character varying(50)` (length included) where it previously reported bare `character varying`. This is more precise and is what a hover tooltip will want to show.
+- `SchemaSnapshotEntry::Column::ordinal` is now `pg_attribute.attnum` instead of `information_schema.columns.ordinal_position`, so it has gaps after a `DROP COLUMN`: a table with columns `a, b, c` that drops `b` reports ordinals `1, 3` for the survivors, where `information_schema` renumbered them to `1, 2`.
+- Columns are no longer privilege-filtered. `information_schema.columns` showed only columns the connecting role had some privilege on; `pg_attribute` returns every column of an in-scope relation regardless of grants. A connection with narrower privileges than expected will now see (and cache) columns it previously didn't.
 
 ### PostgreSQL type mapping
 
