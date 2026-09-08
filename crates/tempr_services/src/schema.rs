@@ -150,6 +150,8 @@ impl SchemaService {
             version,
             fetched_at: chrono::Utc::now(),
             objects,
+            keywords: Vec::new(),
+            fingerprints: Vec::new(),
         });
 
         self.snapshots

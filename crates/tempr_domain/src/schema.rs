@@ -36,6 +36,23 @@ pub struct SchemaSnapshot {
     pub version: u64,
     pub fetched_at: DateTime<Utc>,
     pub objects: Vec<SchemaObject>,
+    /// The engine's keyword list, fetched with the snapshot so completion
+    /// never queries the database (docs/12-sql-intelligence.md).
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Change markers for every object in scope at the time of the snapshot.
+    /// An incremental refresh diffs a fresh sweep against these.
+    #[serde(default)]
+    pub fingerprints: Vec<SchemaFingerprintRecord>,
+}
+
+/// One object's change marker, as reported by the driver's fingerprint sweep
+/// and persisted with the snapshot so a later sweep can be diffed against it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaFingerprintRecord {
+    pub kind: SchemaObjectKind,
+    pub native_id: u64,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +131,8 @@ mod tests {
             version: 1,
             fetched_at: Utc::now(),
             objects,
+            keywords: Vec::new(),
+            fingerprints: Vec::new(),
         }
     }
 
@@ -141,6 +160,40 @@ mod tests {
             default: None,
         };
         assert_eq!(obj.kind(), SchemaObjectKind::Column);
+    }
+
+    #[test]
+    fn snapshot_serde_carries_keywords_and_fingerprints() {
+        let mut snapshot = make_snapshot(vec![]);
+        snapshot.keywords = vec!["select".to_string(), "join".to_string()];
+        snapshot.fingerprints = vec![SchemaFingerprintRecord {
+            kind: SchemaObjectKind::Table,
+            native_id: 16384,
+            version: 42,
+        }];
+
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let back: SchemaSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.keywords, snapshot.keywords);
+        assert_eq!(back.fingerprints.len(), 1);
+        assert_eq!(back.fingerprints[0].native_id, 16384);
+        assert_eq!(back.fingerprints[0].kind, SchemaObjectKind::Table);
+    }
+
+    #[test]
+    fn older_snapshots_without_the_new_fields_still_load() {
+        // A snapshot serialized before these fields existed must not fail to
+        // parse — the cache would otherwise be discarded on every upgrade.
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "connection_id": "00000000-0000-0000-0000-000000000002",
+            "version": 3,
+            "fetched_at": "2026-09-08T00:00:00Z",
+            "objects": []
+        }"#;
+        let back: SchemaSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert!(back.keywords.is_empty());
+        assert!(back.fingerprints.is_empty());
     }
 
     #[test]
