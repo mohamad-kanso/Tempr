@@ -2,6 +2,33 @@ use crate::ids::{ConnectionId, SchemaObjectId, SchemaSnapshotId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// What a schema object is. Part of every object's identity: `native_id` is
+/// unique only within a kind (a packed column id can numerically equal a
+/// relation OID), so consumers key on the pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaObjectKind {
+    Table,
+    View,
+    Column,
+    Index,
+    Function,
+}
+
+impl SchemaObjectKind {
+    /// Stable discriminant used in identity derivation. Never renumber these:
+    /// a change orphans every cache file in the wild.
+    pub fn discriminant(self) -> u8 {
+        match self {
+            SchemaObjectKind::Table => 0,
+            SchemaObjectKind::View => 1,
+            SchemaObjectKind::Column => 2,
+            SchemaObjectKind::Index => 3,
+            SchemaObjectKind::Function => 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaSnapshot {
     pub id: SchemaSnapshotId,
@@ -63,6 +90,16 @@ impl SchemaObject {
             | SchemaObject::Function { id, .. } => *id,
         }
     }
+
+    pub fn kind(&self) -> SchemaObjectKind {
+        match self {
+            SchemaObject::Table { .. } => SchemaObjectKind::Table,
+            SchemaObject::View { .. } => SchemaObjectKind::View,
+            SchemaObject::Column { .. } => SchemaObjectKind::Column,
+            SchemaObject::Index { .. } => SchemaObjectKind::Index,
+            SchemaObject::Function { .. } => SchemaObjectKind::Function,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -90,6 +127,20 @@ mod tests {
             estimated_rows: Some(1000),
         };
         assert_eq!(obj.id(), id);
+    }
+
+    #[test]
+    fn schema_object_reports_its_kind() {
+        let obj = SchemaObject::Column {
+            id: SchemaObjectId::new(),
+            parent_id: SchemaObjectId::new(),
+            name: "id".to_string(),
+            data_type: "int8".to_string(),
+            nullable: false,
+            ordinal: 1,
+            default: None,
+        };
+        assert_eq!(obj.kind(), SchemaObjectKind::Column);
     }
 
     #[test]
