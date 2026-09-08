@@ -19,4 +19,4 @@ pub use settings::{
     UserSettings, load_user_settings, load_user_settings_from, parse_user_settings,
     user_settings_path,
 };
-pub use storage::{FileSystemStorage, Storage};
+pub use storage::{CatalogCacheFile, FileCatalogCache, FileSystemStorage, Storage};

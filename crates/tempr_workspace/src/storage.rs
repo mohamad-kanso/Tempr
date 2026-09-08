@@ -2,6 +2,7 @@ use crate::error::WorkspaceError;
 use crate::manifest::WorkspaceManifest;
 use async_trait::async_trait;
 use std::path::PathBuf;
+use tempr_domain::{ConnectionId, SchemaSnapshot};
 
 /// Gateway for all workspace file-system access.
 /// No module performs raw std::fs calls outside this trait.
@@ -19,6 +20,10 @@ pub trait Storage: Send + Sync {
     /// Returns the path to the `.tempr/` subdirectory for derived state.
     fn tempr_dir(&self) -> PathBuf;
 
+    /// Handle to this connection's catalog cache file. Creating the handle
+    /// touches no disk; `load` and `save` do.
+    fn catalog_cache(&self, connection: ConnectionId) -> Box<dyn CatalogCacheFile>;
+
     /// Returns the platform-specific application data directory for global Tempr state.
     /// On Linux: ~/.local/share/tempr, macOS: ~/Library/Application Support/tempr,
     /// Windows: %APPDATA%/tempr
@@ -29,6 +34,50 @@ pub trait Storage: Send + Sync {
         dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("tempr")
+    }
+}
+
+/// Read/write access to one connection's `.tcat` cache. Every failure to read
+/// is reported as `Ok(None)`: the cache is derived data and is rebuilt rather
+/// than repaired.
+#[async_trait]
+pub trait CatalogCacheFile: Send + Sync {
+    async fn load(&self) -> Result<Option<SchemaSnapshot>, WorkspaceError>;
+    async fn save(&self, snapshot: &SchemaSnapshot) -> Result<(), WorkspaceError>;
+    fn path(&self) -> PathBuf;
+}
+
+pub struct FileCatalogCache {
+    path: PathBuf,
+}
+
+#[async_trait]
+impl CatalogCacheFile for FileCatalogCache {
+    async fn load(&self) -> Result<Option<SchemaSnapshot>, WorkspaceError> {
+        let bytes = match tokio::fs::read(&self.path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %self.path.display(), "catalog cache unreadable");
+                return Ok(None);
+            }
+        };
+        crate::catalog::decode_catalog(&bytes)
+    }
+
+    async fn save(&self, snapshot: &SchemaSnapshot) -> Result<(), WorkspaceError> {
+        let bytes = crate::catalog::encode_catalog(snapshot)?;
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp = self.path.with_extension("tcat.tmp");
+        tokio::fs::write(&tmp, &bytes).await?;
+        tokio::fs::rename(&tmp, &self.path).await?;
+        Ok(())
+    }
+
+    fn path(&self) -> PathBuf {
+        self.path.clone()
     }
 }
 
@@ -95,6 +144,16 @@ impl Storage for FileSystemStorage {
 
     fn tempr_dir(&self) -> PathBuf {
         self.workspace_path.join(".tempr")
+    }
+
+    fn catalog_cache(&self, connection: ConnectionId) -> Box<dyn CatalogCacheFile> {
+        Box::new(FileCatalogCache {
+            path: self
+                .tempr_dir()
+                .join("cache")
+                .join("catalog")
+                .join(format!("{}.tcat", connection.0)),
+        })
     }
 }
 
@@ -186,5 +245,95 @@ mod tests {
             dir
         );
         assert!(dir.ends_with("tempr"));
+    }
+
+    fn sample_snapshot(connection: tempr_domain::ConnectionId) -> tempr_domain::SchemaSnapshot {
+        tempr_domain::SchemaSnapshot {
+            id: tempr_domain::SchemaSnapshotId::new(),
+            connection_id: connection,
+            version: 1,
+            fetched_at: chrono::Utc::now(),
+            objects: vec![],
+            keywords: vec!["select".to_string()],
+            fingerprints: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_cache_roundtrips_and_starts_empty() {
+        let (_dir, storage) = make_storage().await;
+        let connection = tempr_domain::ConnectionId::new();
+        let cache = storage.catalog_cache(connection);
+
+        assert!(cache.load().await.expect("load").is_none(), "no file yet");
+
+        let snapshot = sample_snapshot(connection);
+        cache.save(&snapshot).await.expect("save");
+        let loaded = cache.load().await.expect("load").expect("file exists");
+        assert_eq!(loaded.id, snapshot.id);
+        assert_eq!(loaded.keywords, vec!["select".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn each_connection_gets_its_own_file() {
+        let (_dir, storage) = make_storage().await;
+        let a = tempr_domain::ConnectionId::new();
+        let b = tempr_domain::ConnectionId::new();
+        storage
+            .catalog_cache(a)
+            .save(&sample_snapshot(a))
+            .await
+            .expect("save a");
+
+        assert!(
+            storage
+                .catalog_cache(b)
+                .load()
+                .await
+                .expect("load b")
+                .is_none()
+        );
+        assert_ne!(
+            storage.catalog_cache(a).path(),
+            storage.catalog_cache(b).path()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_cache_file_loads_as_none() {
+        let (_dir, storage) = make_storage().await;
+        let connection = tempr_domain::ConnectionId::new();
+        let cache = storage.catalog_cache(connection);
+        cache
+            .save(&sample_snapshot(connection))
+            .await
+            .expect("save");
+
+        tokio::fs::write(cache.path(), b"not a catalog file at all")
+            .await
+            .expect("corrupt the file");
+        assert!(cache.load().await.expect("no error").is_none());
+    }
+
+    #[tokio::test]
+    async fn saving_leaves_no_temp_file_behind() {
+        let (_dir, storage) = make_storage().await;
+        let connection = tempr_domain::ConnectionId::new();
+        let cache = storage.catalog_cache(connection);
+        cache
+            .save(&sample_snapshot(connection))
+            .await
+            .expect("save");
+
+        let dir = cache.path().parent().expect("parent").to_path_buf();
+        let mut entries = tokio::fs::read_dir(&dir).await.expect("read dir");
+        let mut names = Vec::new();
+        while let Some(e) = entries.next_entry().await.expect("entry") {
+            names.push(e.file_name().to_string_lossy().to_string());
+        }
+        assert!(
+            names.iter().all(|n| !n.ends_with(".tmp")),
+            "atomic write must not leave a temp file: {names:?}"
+        );
     }
 }
