@@ -322,7 +322,7 @@
 **By**: Claude (Phase 3 stage 2).
 **Decision**: The driver's fingerprint sweep is one query; `SchemaService::refresh_incremental` diffs it against the fingerprints stored with the cached snapshot and re-introspects only the affected schemas. Full refresh is the fallback in four cases: no cached fingerprints, no driver support, an object the cache has never seen, and more than 40% of objects touched.
 **Why**: PostgreSQL has no change feed, event triggers would write into the user's database, and a frozen `xmin` produces a false positive (a harmless re-introspect) rather than a missed change.
-**Consequences**: re-introspection is per schema, not per object, because catalog queries are shaped by schema and name while the sweep returns only OIDs.
+**Consequences**: re-introspection is per schema, not per object, because catalog queries are shaped by schema and name while the sweep returns only OIDs. A dropped fingerprint carries only `(Table, oid)` — a `pg_class` sweep cannot say whether the relation was a table or a view — so removing it must delete both the `Table`-derived and the `View`-derived id for that oid; whichever one is actually cached is the one that goes.
 
 ## D27 — Catalog cache format is bincode behind a versioned header (2026-09-08)
 

@@ -180,7 +180,10 @@ impl SchemaService {
     /// Diffs a fresh fingerprint sweep against the cached snapshot's
     /// fingerprints and re-introspects only the touched schemas; falls back
     /// to `refresh` when there is nothing to diff against or too much changed.
-    pub async fn refresh_incremental(&self, connection_id: ConnectionId) -> Result<Arc<SchemaSnapshot>, ServiceError>;
+    /// The returned `RefreshPath` says which actually happened — `Unchanged`,
+    /// `Incremental { schemas, touched }`, or `FullRefresh(FullRefreshReason)`
+    /// — so a caller never has to infer it from the snapshot's contents.
+    pub async fn refresh_incremental(&self, connection_id: ConnectionId) -> Result<(Arc<SchemaSnapshot>, RefreshPath), ServiceError>;
 
     /// Loads the cached snapshot (if any) into the in-memory map without
     /// touching the database. `None` when there is no cache configured, no
