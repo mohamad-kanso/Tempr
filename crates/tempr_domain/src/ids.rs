@@ -111,17 +111,44 @@ mod tests {
     }
 
     #[test]
-    fn derived_id_is_reproducible_across_runs() {
+    fn derived_id_matches_pinned_golden_values() {
         use crate::schema::SchemaObjectKind;
         use uuid::Uuid;
-        // A fixed connection id pins the expected output, so a change to the
-        // derivation scheme fails here instead of silently orphaning caches.
+        // The derivation is a persisted wire format: every `SchemaObjectId`
+        // ever written to a cache file on disk was computed by this exact
+        // byte layout. These are not "does it equal itself" checks — they
+        // are hardcoded UUIDs computed once from the current implementation
+        // and pinned here. If either assertion fails, the derivation scheme
+        // changed (e.g. `to_le_bytes()` became `to_ne_bytes()`, or the
+        // discriminant byte moved), and EVERY existing cache file is now
+        // silently orphaned — its ids no longer match what a fresh schema
+        // fetch would derive. `CATALOG_FORMAT_VERSION` must be bumped in the
+        // same change that updates these golden values.
+        //
+        // Byte layout encoded by both golden values: the UUIDv5 name is 9
+        // bytes, `[discriminant: u8][native_id: u64 little-endian]`, hashed
+        // with the connection id as the namespace.
         let conn = ConnectionId(Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef));
-        let id = SchemaObjectId::derived(conn, SchemaObjectKind::Column, (16384u64 << 16) | 2);
+        let native_id = (16384u64 << 16) | 2;
+
+        // kind = Column (discriminant 2). Name bytes:
+        // 02 02 00 00 00 00 00 10 00
+        let column_id = SchemaObjectId::derived(conn, SchemaObjectKind::Column, native_id);
         assert_eq!(
-            id,
-            SchemaObjectId::derived(conn, SchemaObjectKind::Column, (16384u64 << 16) | 2)
+            column_id.0,
+            Uuid::parse_str("cdd409ec-1e98-573b-b875-da6d03ad753b").unwrap()
         );
-        assert_ne!(id.0, Uuid::nil());
+
+        // Same native_id, kind = Table (discriminant 0) instead of Column.
+        // Name bytes: 00 02 00 00 00 00 00 10 00
+        // Pinning this alongside the Column value catches a reordering of
+        // the name bytes (e.g. discriminant moved after native_id instead
+        // of before it), which would otherwise leave the Column-only
+        // assertion unable to detect it.
+        let table_id = SchemaObjectId::derived(conn, SchemaObjectKind::Table, native_id);
+        assert_eq!(
+            table_id.0,
+            Uuid::parse_str("c3150d09-2dd9-5ccc-9999-43300201c946").unwrap()
+        );
     }
 }
