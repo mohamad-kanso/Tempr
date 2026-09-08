@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -424,33 +424,32 @@ impl SchemaService {
         }
         let refreshed = Self::objects_from_entries(connection_id, &entries);
 
-        // The touched schemas were re-introspected in full, so every cached
-        // object that lived in one of them is superseded — dropped either
-        // because it is gone from the fresh sweep, or because it is about to
-        // be replaced by `refreshed`. Objects outside the touched schemas are
-        // left untouched, except for anything the sweep says is gone
-        // (`dropped` can name objects in schemas we never re-introspected,
-        // since removal needs no re-introspection to act on).
-        let dropped: std::collections::HashSet<SchemaObjectId> = delta
+        // A dropped fingerprint's `kind` came from `domain_kind`, which folds
+        // every `pg_class` row into `Table` — a sweep cannot tell a table
+        // from a view. So a dropped view's fingerprint says `Table`, and the
+        // id derived from it never matches the view's actual cached id
+        // (derived under `View`). Derive both candidates for a `Table`-kind
+        // drop and let whichever one is actually cached be removed — ids are
+        // cheap to over-compute but a stale object that slips past this
+        // filter is never removed again. `Column`, `Index`, and `Function`
+        // are unambiguous: `domain_kind` maps them 1:1, so no other kind
+        // needs this treatment.
+        let dropped: HashSet<SchemaObjectId> = delta
             .dropped
             .iter()
-            .map(|(kind, native_id)| SchemaObjectId::derived(connection_id, *kind, *native_id))
-            .collect();
-        let mut objects: Vec<SchemaObject> = cached
-            .objects
-            .iter()
-            .filter(|o| {
-                if dropped.contains(&o.id()) {
-                    return false;
+            .flat_map(|(kind, native_id)| {
+                let mut ids = vec![SchemaObjectId::derived(connection_id, *kind, *native_id)];
+                if *kind == SchemaObjectKind::Table {
+                    ids.push(SchemaObjectId::derived(
+                        connection_id,
+                        SchemaObjectKind::View,
+                        *native_id,
+                    ));
                 }
-                match object_schema(&cached.objects, o) {
-                    Some(schema) => !schemas.contains(&schema),
-                    None => true,
-                }
+                ids
             })
-            .cloned()
             .collect();
-        objects.extend(refreshed);
+        let objects = Self::splice_objects(&cached.objects, refreshed, &dropped, &schemas);
 
         let snapshot = Arc::new(SchemaSnapshot {
             id: SchemaSnapshotId::new(),
@@ -478,6 +477,33 @@ impl SchemaService {
             snapshot: snapshot.id,
         });
         Ok(snapshot)
+    }
+
+    /// Combine the surviving cached objects with freshly introspected ones.
+    /// Anything in a re-introspected schema is superseded wholesale, and
+    /// anything the sweep reported as dropped is removed — including a view
+    /// whose fingerprint could only say "some relation".
+    fn splice_objects(
+        cached: &[SchemaObject],
+        refreshed: Vec<SchemaObject>,
+        dropped: &HashSet<SchemaObjectId>,
+        touched_schemas: &[String],
+    ) -> Vec<SchemaObject> {
+        let mut objects: Vec<SchemaObject> = cached
+            .iter()
+            .filter(|o| {
+                if dropped.contains(&o.id()) {
+                    return false;
+                }
+                match object_schema(cached, o) {
+                    Some(schema) => !touched_schemas.contains(&schema),
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+        objects.extend(refreshed);
+        objects
     }
 }
 
@@ -814,5 +840,158 @@ mod tests {
         let delta = SchemaService::diff_fingerprints(&cached, &swept);
         assert_eq!(delta.added, vec![(SchemaObjectKind::Table, 16384)]);
         assert_eq!(delta.dropped, vec![(SchemaObjectKind::Column, 16384)]);
+    }
+
+    fn test_table(
+        connection: ConnectionId,
+        native_id: u64,
+        schema: &str,
+        name: &str,
+    ) -> SchemaObject {
+        SchemaObject::Table {
+            id: SchemaObjectId::derived(connection, SchemaObjectKind::Table, native_id),
+            schema: schema.to_string(),
+            name: name.to_string(),
+            estimated_rows: None,
+        }
+    }
+
+    fn test_view(
+        connection: ConnectionId,
+        native_id: u64,
+        schema: &str,
+        name: &str,
+    ) -> SchemaObject {
+        SchemaObject::View {
+            id: SchemaObjectId::derived(connection, SchemaObjectKind::View, native_id),
+            schema: schema.to_string(),
+            name: name.to_string(),
+            definition: "SELECT 1".to_string(),
+        }
+    }
+
+    fn test_column(
+        connection: ConnectionId,
+        native_id: u64,
+        parent_id: SchemaObjectId,
+        name: &str,
+    ) -> SchemaObject {
+        SchemaObject::Column {
+            id: SchemaObjectId::derived(connection, SchemaObjectKind::Column, native_id),
+            parent_id,
+            name: name.to_string(),
+            data_type: "text".to_string(),
+            nullable: true,
+            ordinal: 1,
+            default: None,
+        }
+    }
+
+    /// Mirrors the production `dropped` construction in `refresh_incremental`:
+    /// a `Table`-kind fingerprint might really be a dropped view (the sweep
+    /// cannot tell them apart), so both candidate ids are derived.
+    fn dropped_ids(
+        connection: ConnectionId,
+        drops: &[(SchemaObjectKind, u64)],
+    ) -> HashSet<SchemaObjectId> {
+        drops
+            .iter()
+            .flat_map(|(kind, native_id)| {
+                let mut ids = vec![SchemaObjectId::derived(connection, *kind, *native_id)];
+                if *kind == SchemaObjectKind::Table {
+                    ids.push(SchemaObjectId::derived(
+                        connection,
+                        SchemaObjectKind::View,
+                        *native_id,
+                    ));
+                }
+                ids
+            })
+            .collect()
+    }
+
+    #[test]
+    fn splice_removes_a_dropped_view_even_though_its_fingerprint_said_table() {
+        // The Critical case: `CREATE VIEW public.v` then `DROP VIEW public.v`
+        // with nothing else changed in `public`. The sweep's dropped
+        // fingerprint can only say `(Table, oid)` — `domain_kind` folds every
+        // `pg_class` row into `Table` — while the cached view's real id was
+        // derived under `View`. Without deriving both candidates, the view
+        // would survive every incremental refresh forever.
+        let connection = ConnectionId::new();
+        let view = test_view(connection, 500, "public", "v");
+        let cached = vec![view];
+        let dropped = dropped_ids(connection, &[(SchemaObjectKind::Table, 500)]);
+
+        let objects = SchemaService::splice_objects(&cached, Vec::new(), &dropped, &[]);
+
+        assert!(
+            objects.is_empty(),
+            "dropped view must not survive: {objects:?}"
+        );
+    }
+
+    #[test]
+    fn splice_keeps_an_untouched_schema_object_despite_a_same_named_touched_one() {
+        let connection = ConnectionId::new();
+        let untouched = test_table(connection, 1, "public", "users");
+        let untouched_id = untouched.id();
+        let touched = test_table(connection, 2, "reporting", "users");
+        let cached = vec![untouched, touched];
+        let touched_schemas = vec!["reporting".to_string()];
+
+        let objects =
+            SchemaService::splice_objects(&cached, Vec::new(), &HashSet::new(), &touched_schemas);
+
+        assert_eq!(
+            objects.iter().map(|o| o.id()).collect::<Vec<_>>(),
+            vec![untouched_id],
+            "only the untouched-schema object must survive"
+        );
+    }
+
+    #[test]
+    fn splice_drops_a_touched_schema_object_the_reintrospection_did_not_return() {
+        // The table was dropped from a schema that got re-read: the fresh
+        // introspection of that schema simply no longer mentions it.
+        let connection = ConnectionId::new();
+        let gone = test_table(connection, 1, "public", "gone");
+        let cached = vec![gone];
+        let touched_schemas = vec!["public".to_string()];
+
+        let objects =
+            SchemaService::splice_objects(&cached, Vec::new(), &HashSet::new(), &touched_schemas);
+
+        assert!(
+            objects.is_empty(),
+            "superseded table must be gone: {objects:?}"
+        );
+    }
+
+    #[test]
+    fn splice_does_not_duplicate_a_column_whose_parent_table_was_superseded() {
+        let connection = ConnectionId::new();
+        let old_table = test_table(connection, 1, "public", "t");
+        let old_column = test_column(connection, 10, old_table.id(), "id");
+        let cached = vec![old_table, old_column];
+        let touched_schemas = vec!["public".to_string()];
+
+        let new_table = test_table(connection, 1, "public", "t");
+        let new_table_id = new_table.id();
+        let new_column = test_column(connection, 10, new_table.id(), "id");
+        let new_column_id = new_column.id();
+        let refreshed = vec![new_table, new_column];
+
+        let objects =
+            SchemaService::splice_objects(&cached, refreshed, &HashSet::new(), &touched_schemas);
+
+        let ids: HashSet<_> = objects.iter().map(|o| o.id()).collect();
+        let expected: HashSet<_> = [new_table_id, new_column_id].into_iter().collect();
+        assert_eq!(ids, expected, "only the refreshed copies must remain");
+        let column_count = objects
+            .iter()
+            .filter(|o| matches!(o, SchemaObject::Column { name, .. } if name == "id"))
+            .count();
+        assert_eq!(column_count, 1, "column must not appear twice");
     }
 }
