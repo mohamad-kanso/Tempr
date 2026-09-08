@@ -35,7 +35,14 @@ fn build_services() -> AppServices {
 
     let connection = ConnectionService::new(bus.clone());
     let query = QueryService::new(bus.clone(), connection.clone());
-    let schema = SchemaService::new(bus.clone(), connection.clone());
+    let storage: Arc<dyn tempr_workspace::Storage> =
+        Arc::new(tempr_workspace::FileSystemStorage::new(
+            workspace_manifest_path()
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        ));
+    let schema = SchemaService::with_cache(bus.clone(), connection.clone(), storage);
     let command = CommandService::new(bus.clone());
 
     let pg_driver = Arc::new(PostgresDriver::new()) as Arc<dyn DatabaseDriver>;
