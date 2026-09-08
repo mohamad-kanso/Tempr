@@ -282,6 +282,22 @@ pub fn content_hash(body: &[u8]) -> u64 {
     hash
 }
 
+/// Hash of everything in a snapshot that describes the database, ignoring the
+/// per-refresh bookkeeping (`id`, `version`, `fetched_at`). Two snapshots of an
+/// unchanged schema hash the same, which is what lets a writer skip a
+/// pointless rewrite.
+pub fn snapshot_content_hash(snapshot: &SchemaSnapshot) -> Result<u64, WorkspaceError> {
+    let objects: Vec<CatalogObject> = snapshot.objects.iter().map(CatalogObject::from).collect();
+    let body = bincode::serde::encode_to_vec(
+        (&objects, &snapshot.keywords, &snapshot.fingerprints),
+        bincode::config::standard(),
+    )
+    .map_err(|e| WorkspaceError::Corrupted {
+        reason: format!("catalog content hash encode failed: {e}"),
+    })?;
+    Ok(content_hash(&body))
+}
+
 /// Encode a snapshot into header + body.
 pub fn encode_catalog(snapshot: &SchemaSnapshot) -> Result<Vec<u8>, WorkspaceError> {
     let wire = CatalogSnapshot::from(snapshot);
@@ -398,5 +414,27 @@ mod tests {
         let a = encode_catalog(&snapshot).expect("encode");
         let b = encode_catalog(&snapshot).expect("encode");
         assert_eq!(a, b, "encoding must be deterministic for change detection");
+    }
+
+    #[test]
+    fn content_hash_ignores_bookkeeping_but_not_content() {
+        let a = sample();
+        let mut b = a.clone();
+        b.id = SchemaSnapshotId::new();
+        b.version = a.version + 5;
+        b.fetched_at = a.fetched_at + chrono::Duration::hours(3);
+        assert_eq!(
+            snapshot_content_hash(&a).expect("hash a"),
+            snapshot_content_hash(&b).expect("hash b"),
+            "id, version and fetched_at must not affect the content hash"
+        );
+
+        let mut c = a.clone();
+        c.keywords.push("merge".to_string());
+        assert_ne!(
+            snapshot_content_hash(&a).expect("hash a"),
+            snapshot_content_hash(&c).expect("hash c"),
+            "a content change must change the hash"
+        );
     }
 }

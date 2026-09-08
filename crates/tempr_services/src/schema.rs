@@ -75,13 +75,16 @@ impl SchemaService {
             return;
         };
         let cache = storage.catalog_cache(snapshot.connection_id);
-        // Skip the write when the content is byte-identical to what is there.
+        // Skip the write when the content that describes the database is
+        // unchanged. Compares only `objects`/`keywords`/`fingerprints` —
+        // `id`, `version` and `fetched_at` are fresh on every refresh and
+        // would otherwise make this comparison never match.
         if let Ok(Some(existing)) = cache.load().await
             && let (Ok(a), Ok(b)) = (
-                tempr_workspace::encode_catalog(&existing),
-                tempr_workspace::encode_catalog(snapshot),
+                tempr_workspace::snapshot_content_hash(&existing),
+                tempr_workspace::snapshot_content_hash(snapshot),
             )
-            && tempr_workspace::content_hash(&a) == tempr_workspace::content_hash(&b)
+            && a == b
         {
             return;
         }
@@ -457,5 +460,59 @@ mod tests {
         let a = SchemaService::objects_from_entries(ConnectionId::new(), &entries);
         let b = SchemaService::objects_from_entries(ConnectionId::new(), &entries);
         assert_ne!(a[0].id(), b[0].id(), "two databases may share OIDs");
+    }
+
+    #[tokio::test]
+    async fn save_cached_skips_rewrite_when_content_is_unchanged() {
+        // Real FileSystemStorage over a tempdir, not a mock: this exercises
+        // save_cached's dedup against actual encode/decode round-trips.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let storage: Arc<dyn tempr_workspace::Storage> =
+            Arc::new(tempr_workspace::FileSystemStorage::new(tmp.path()));
+        storage.init_workspace_dir().await.expect("init");
+
+        let bus = make_event_bus();
+        let cs = ConnectionService::new(bus.clone());
+        let svc = SchemaService::with_cache(bus, cs, storage.clone());
+
+        let connection = ConnectionId::new();
+        let base = SchemaSnapshot {
+            id: SchemaSnapshotId::new(),
+            connection_id: connection,
+            version: 1,
+            fetched_at: chrono::Utc::now(),
+            objects: vec![],
+            keywords: vec!["select".to_string()],
+            fingerprints: vec![],
+        };
+        svc.save_cached(&base).await;
+
+        let cache = storage.catalog_cache(connection);
+        let first_on_disk = cache.load().await.expect("load").expect("file exists");
+
+        // Same content, fresh bookkeeping — exactly what a no-op refresh
+        // produces (new id, bumped version, new fetched_at).
+        let mut second = base.clone();
+        second.id = SchemaSnapshotId::new();
+        second.version = base.version + 1;
+        second.fetched_at = base.fetched_at + chrono::Duration::hours(1);
+        svc.save_cached(&second).await;
+
+        let after_second = cache.load().await.expect("load").expect("file exists");
+        assert_eq!(
+            after_second.id, first_on_disk.id,
+            "unchanged content must not trigger a rewrite"
+        );
+
+        // A real content change must still be written.
+        let mut third = second.clone();
+        third.keywords.push("merge".to_string());
+        svc.save_cached(&third).await;
+
+        let after_third = cache.load().await.expect("load").expect("file exists");
+        assert_eq!(
+            after_third.id, third.id,
+            "a content change must be written to disk"
+        );
     }
 }

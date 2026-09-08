@@ -9,6 +9,7 @@ pub mod storage;
 
 pub use catalog::{
     CATALOG_FORMAT_VERSION, CATALOG_MAGIC, content_hash, decode_catalog, encode_catalog,
+    snapshot_content_hash,
 };
 pub use error::WorkspaceError;
 pub use manifest::{
