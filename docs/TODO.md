@@ -8,6 +8,8 @@
 
 ## Now
 
+- [ ] **Mouse wheel scrolls horizontally instead of vertically** (user-reported 2026-09-09): in the running app the wheel moves the view sideways, never up or down, and holding shift does not switch it — so a result set or a document longer than the viewport cannot be scrolled with the mouse at all. Keyboard scrolling is unaffected. Both `ResultGrid` and `EditorView` drive `uniform_list` through a `UniformListScrollHandle`, so suspects are: gpui's wheel-delta axis handling under Wayland (the session runs `WAYLAND_DISPLAY=wayland-0` with the x11 feature also enabled), a `ScrollWheelEvent` whose `delta` arrives as `ScrollDelta::Lines` with the axes swapped, or one of our containers consuming the vertical axis before the list sees it. Reproduce first, then check whether the same wheel behaves correctly in another gpui app on this machine before touching our code — this may be upstream or compositor-level rather than ours.
+
 - [ ] Lazy wire streaming via `query_raw()` — `PostgresStream` currently buffers full result set via `client.query()`, then yields `batch_size` chunks. True `query_raw` streaming was attempted but fails with `Error { kind: Closed }` specifically when called through `QueryService::execute()` (works fine via raw driver or closures). Root cause undetermined — suspected `Box<dyn DriverConnection>` + async trait boundary interaction. Investigate as follow-up.
 
 - [ ] `DriverConnection::ping` (active round-trip) on top of the existing `is_closed` recycle check (09-database-engine: idle ping every 30 s, reconnect with backoff → `Reconnecting`/`Failed` states, evict a connection whose query failed with a transport error)
