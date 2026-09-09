@@ -47,6 +47,7 @@
 | D25 | 2026-09-08 | Schema object identity is derived (UUIDv5 over connection id + kind + native id), not random | Claude (Phase 3 stage 2) |
 | D26 | 2026-09-08 | Incremental refresh diffs an `(oid, xmin)` sweep against cached fingerprints, re-introspecting per touched schema | Claude (Phase 3 stage 2) |
 | D27 | 2026-09-08 | Catalog cache format (`.tcat`) is bincode 2.x behind a versioned header (magic, version, flags, content hash); any mismatch discards and re-introspects rather than erroring | Claude (Phase 3 stage 2) |
+| D28 | 2026-09-09 | Catalog cache body codec switched from bincode to postcard (`CATALOG_FORMAT_VERSION` bumped to 2); everything else about the `.tcat` design is unchanged | Claude (Phase 3 stage 2) |
 
 ---
 
@@ -326,7 +327,20 @@
 
 ## D27 — Catalog cache format is bincode behind a versioned header (2026-09-08)
 
+**Superseded by**: D28
+
 **By**: Claude (Phase 3 stage 2), implementing spec decision 4.
 **Decision**: `.tcat` files are a fixed header (magic `TCAT`, `u16` format version, `u16` flags, `u64` content hash) followed by `bincode` of the private `CatalogSnapshot` mirror (bincode cannot decode `SchemaSnapshot`'s internally-tagged enum directly — see Consequences). `bincode` 2.x is adopted as a dependency under the D18 rule (small, pure-Rust, already-serde-shaped). Any file whose magic, version or hash does not match is discarded and re-introspected.
 **Why**: the catalog is derived data, so the cheapest safe failure mode is to throw it away; that makes format evolution a version bump rather than a migration. `bincode` needs no schema and reuses the serde derives the domain already has. Resolves OD#1 in 07-storage, which had weighed `rkyv` and an SQLite table — `rkyv`'s zero-copy win is real but unmeasured, and it buys a `SAFETY` burden before any number justifies it.
 **Consequences**: a second serialization format in the tree (TOML for manifests, JSON for storage, bincode for caches). `CATALOG_FORMAT_VERSION` must be bumped on any layout change, and the load probe in the spec's §8 is the evidence that would justify revisiting the choice. `SchemaObject`'s `#[serde(tag = "kind", ...)]` JSON shape cannot round-trip through bincode's serde bridge (internally-tagged enums need `deserialize_any`, which bincode's non-self-describing `Deserializer` does not implement); `tempr_workspace::catalog` carries a private, externally-tagged mirror (`CatalogObject`/`CatalogSnapshot`) as the bincode wire shape instead, so `tempr_domain` and its JSON format are untouched. Separately, `cargo deny check` flags bincode itself as unmaintained (RUSTSEC-2025-0141: the maintainers stopped development after a harassment incident, not a code defect); `deny.toml` ignores it under this decision's own terms, to be revisited at the same §8 load probe.
+
+---
+
+## D28 — Catalog cache body codec switched to postcard (2026-09-09)
+
+**Supersedes**: D27's format choice.
+
+**By**: Claude (Phase 3 stage 2, dependency follow-up), on the user's call.
+**Decision**: The `.tcat` body codec changes from `bincode` to `postcard` (`postcard::to_allocvec` / `postcard::from_bytes`, `default-features = false, features = ["use-std"]` to keep the embedded/`no_std` feature surface — and its `heapless`/`atomic-polyfill` dependency chain — out of the build). `CATALOG_FORMAT_VERSION` bumps from 1 to 2 so any `.tcat` written by the previous code is discarded and re-introspected rather than misread. `deny.toml`'s RUSTSEC-2025-0141 ignore (and its comment) is removed outright.
+**Why**: `postcard` is actively maintained where `bincode` is not, is serde-native with a documented wire format, and the switch costs nothing beyond the version bump — the cache is derived data that already discards on any format mismatch, so there is no migration to write. The real cost D27 identified — the private, externally-tagged `CatalogObject`/`CatalogSnapshot` mirror, needed because `SchemaObject`'s internally-tagged JSON shape can't round-trip through a non-self-describing `Deserializer`'s `deserialize_any` requirement — is unchanged: postcard has the identical limitation, so the mirror types stay exactly as D27 built them.
+**Consequences**: everything else about D27's design is untouched — the 16-byte header layout (magic, version, flags, FNV-1a content hash), the discard-on-mismatch contract (`Ok(None)`, never `Err`), and `snapshot_content_hash`'s scope (`objects`/`keywords`/`fingerprints`, never the bookkeeping fields) all carry forward as-is. `postcard`'s default features (`heapless-cas`) must stay disabled workspace-wide — enabling them would pull back in an unmaintained transitive dependency (`atomic-polyfill`, RUSTSEC-2023-0089) through `heapless`, defeating the point of this change. Resolves OD#1 in 07-storage.md, updated to point at this entry alongside D27.

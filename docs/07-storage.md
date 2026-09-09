@@ -62,7 +62,7 @@ Out of scope: network transport of query results, in-memory cache eviction polic
 | `~/.config/tempr/settings.toml` *(outside the workspace)* | TOML | — | User-level settings, the middle layer of 04-workspace's settings model. Today: `[keybindings]` — `"main_window::RunQuery" = ["f5", "ctrl-enter"]`, GPUI keystroke syntax, `[]` unbinds (D23). Loaded by `tempr_workspace::load_user_settings`; missing file = defaults. |
 | `.tempr/layout.json` | JSON | No | Serialized panel/dock layout. Ephemeral; regenerated if missing. |
 | `.tempr/history.db` | SQLite | No | Append-only query execution history. |
-| `.tempr/cache/catalog/` | `.tcat` — versioned header + bincode body (D27) | No | One file per connection, keyed by `ConnectionId`. Fast-load format for instant startup; content hash lets a save skip a pointless rewrite. |
+| `.tempr/cache/catalog/` | `.tcat` — versioned header + postcard body (D28, was bincode under D27) | No | One file per connection, keyed by `ConnectionId`. Fast-load format for instant startup; content hash lets a save skip a pointless rewrite. |
 | `.tempr/index/` | Binary | No | Pre-built symbol and full-text indexes over all `*.sql` files. |
 
 ### Gitignore convention
@@ -90,11 +90,11 @@ Query history is **append-heavy and read-rare** (typically queried on startup fo
 
 ### Why a binary format for catalog cache
 
-Schema catalog snapshots can be large (hundreds of tables, thousands of columns). On startup Tempr must load these to power intellisense without blocking the UI. A zero-copy or near-zero-copy binary format (such as `rkyv`, or `bincode` with pre-allocated buffers) gives us:
+Schema catalog snapshots can be large (hundreds of tables, thousands of columns). On startup Tempr must load these to power intellisense without blocking the UI. A zero-copy or near-zero-copy binary format (such as `rkyv`, or a compact serde-native format like `postcard`) gives us:
 - Sub-millisecond load times even for schemas with 500+ tables.
 - No deserialization allocation overhead in the hot startup path.
 
-> Resolved as `bincode` behind a versioned header — [D27](DECISIONS.md#d27--catalog-cache-format-is-bincode-behind-a-versioned-header-2026-09-08); layout in [Interfaces](#interfaces).
+> Resolved as a versioned-header binary body, originally `bincode` under [D27](DECISIONS.md#d27--catalog-cache-format-is-bincode-behind-a-versioned-header-2026-09-08), switched to `postcard` under [D28](DECISIONS.md#d28--catalog-cache-body-codec-switched-to-postcard-2026-09-09) once `bincode` was flagged unmaintained; layout in [Interfaces](#interfaces).
 
 ### Why a separate `.tempr/` directory
 
@@ -165,19 +165,19 @@ pub trait CatalogCacheFile: Send + Sync {
 
 #### The `.tcat` format
 
-A `.tcat` file is a fixed 16-byte header followed by a `bincode` body:
+A `.tcat` file is a fixed 16-byte header followed by a `postcard` body:
 
 | Bytes | Field | Meaning |
 |---|---|---|
 | 0–3 | magic | `b"TCAT"` |
-| 4–5 | version (`u16`, LE) | `CATALOG_FORMAT_VERSION`, bumped on any layout change |
+| 4–5 | version (`u16`, LE) | `CATALOG_FORMAT_VERSION` (currently `2`), bumped on any layout change |
 | 6–7 | flags (`u16`, LE) | reserved, currently `0` |
 | 8–15 | content hash (`u64`, LE) | FNV-1a over the body bytes |
-| 16.. | body | `bincode::serde` encoding of a private `CatalogSnapshot` mirror |
+| 16.. | body | `postcard::to_allocvec`/`from_bytes` encoding of a private `CatalogSnapshot` mirror |
 
-**Discard-on-mismatch**: `decode_catalog` returns `Ok(None)` — never `Err` — for anything it cannot use: too short, wrong magic, a version this build does not know, a body whose hash does not match the header, or a body bincode fails to decode. `Ok(None)` always means the same thing to a caller: re-introspect from the server.
+**Discard-on-mismatch**: `decode_catalog` returns `Ok(None)` — never `Err` — for anything it cannot use: too short, wrong magic, a version this build does not know, a body whose hash does not match the header, or a body postcard fails to decode. `Ok(None)` always means the same thing to a caller: re-introspect from the server. A `.tcat` written under format version 1 (bincode body) fails the version check and is discarded the same way — see [D28](DECISIONS.md#d28--catalog-cache-body-codec-switched-to-postcard-2026-09-09).
 
-**Why a private mirror type, not `SchemaSnapshot` itself**: `SchemaObject` is `#[serde(tag = "kind", ...)]` (internally tagged) for its JSON shape elsewhere in the tree. Internally-tagged enums need the deserializer to buffer arbitrary content to find the tag before it knows which variant to build (`deserialize_any`), which bincode's non-self-describing `Deserializer` does not implement. `tempr_workspace::catalog` keeps a private, externally-tagged mirror (`CatalogSnapshot` / `CatalogObject`) as bincode's wire shape instead; `SchemaObject` and its JSON format are untouched.
+**Why a private mirror type, not `SchemaSnapshot` itself**: `SchemaObject` is `#[serde(tag = "kind", ...)]` (internally tagged) for its JSON shape elsewhere in the tree. Internally-tagged enums need the deserializer to buffer arbitrary content to find the tag before it knows which variant to build (`deserialize_any`), which postcard's non-self-describing `Deserializer` does not implement (the same limitation applied to bincode, which this format replaces under D28). `tempr_workspace::catalog` keeps a private, externally-tagged mirror (`CatalogSnapshot` / `CatalogObject`) as the wire shape instead; `SchemaObject` and its JSON format are untouched.
 
 `snapshot_content_hash` hashes only `objects`, `keywords` and `fingerprints` — never `id`, `version` or `fetched_at`, which are fresh on every refresh and would otherwise make two snapshots of an identical schema hash differently.
 
@@ -268,7 +268,7 @@ For workspaces containing sensitive SQL (e.g., DDL for restricted tables), an op
 
 | # | Question | Status | Notes |
 |---|---|---|---|
-| 1 | **Catalog cache format: `rkyv` vs `bincode` vs embedded SQLite?** | Resolved → [D27](DECISIONS.md#d27--catalog-cache-format-is-bincode-behind-a-versioned-header-2026-09-08) | `bincode` 2.x behind a versioned header, chosen over `rkyv` (unmeasured zero-copy win, `SAFETY` burden) and an SQLite table (D27's own rationale). `cargo deny` carries an ignore for RUSTSEC-2025-0141 (bincode unmaintained) pending the load-probe revisit — see TODO. |
+| 1 | **Catalog cache format: `rkyv` vs `bincode` vs embedded SQLite?** | Resolved → [D27](DECISIONS.md#d27--catalog-cache-format-is-bincode-behind-a-versioned-header-2026-09-08), [D28](DECISIONS.md#d28--catalog-cache-body-codec-switched-to-postcard-2026-09-09) | A versioned header over a serde-native binary body, chosen over `rkyv` (unmeasured zero-copy win, `SAFETY` burden) and an SQLite table (D27's own rationale). The body codec was `bincode` 2.x under D27; switched to `postcard` under D28 once `cargo deny` flagged `bincode` as unmaintained (RUSTSEC-2025-0141) — `postcard` is maintained, serde-native, and the cache's discard-on-mismatch design meant the swap needed only a `CATALOG_FORMAT_VERSION` bump, no migration. |
 | 2 | **History retention defaults?** | Open | Should `history.db` auto-prune entries older than N days? What is a sane default — 30 days? 90? Should this be configurable in `settings.toml`? |
 | 3 | **Should `.tempr/index/` be regenerable entirely from `*.sql` files?** | Open | If yes, it can always be deleted and rebuilt (no persistence guarantee needed). This simplifies the contract but adds startup cost for large workspaces. |
 | 4 | **Cross-workspace history?** | Deferred | Some users may want a single global history across all workspaces. Architecture decision: per-workspace SQLite (current) vs a single `~/.tempr/history.db`. |
