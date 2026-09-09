@@ -15,4 +15,4 @@ pub use connection::{ConnectionService, PoolConfig, PooledConnection};
 pub use fuzzy::{FuzzyMatch, fuzzy_match};
 pub use query::{QueryService, RowSink};
 pub use registry::{Service, ServiceError, ServiceRegistry};
-pub use schema::SchemaService;
+pub use schema::{FullRefreshReason, RefreshPath, SchemaService};

@@ -19,5 +19,5 @@ pub use ids::{
 pub use query::{
     Batch, ColumnMeta, ColumnSpec, Query, QueryOutcome, QueryRun, ResultSet, Value, ValueType,
 };
-pub use schema::{SchemaObject, SchemaSnapshot};
+pub use schema::{SchemaFingerprintRecord, SchemaObject, SchemaObjectKind, SchemaSnapshot};
 pub use workspace::{SqlFile, Workspace, WorkspaceSettings};

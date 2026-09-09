@@ -5,9 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tempr_domain.workspace = true
-tempr_events.workspace = true
-tempr_db.workspace     = true
+tempr_domain.workspace    = true
+tempr_events.workspace    = true
+tempr_db.workspace        = true
+tempr_workspace.workspace = true
 
 deadpool.workspace     = true
 futures.workspace      = true
@@ -21,6 +22,7 @@ tracing.workspace      = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

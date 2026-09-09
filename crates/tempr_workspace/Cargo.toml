@@ -9,12 +9,15 @@ tempr_domain.workspace = true
 tempr_events.workspace = true
 
 async-trait.workspace = true
+chrono.workspace      = true
 dirs.workspace        = true
+postcard.workspace    = true
 serde.workspace       = true
 serde_json.workspace  = true
 thiserror.workspace   = true
 tokio.workspace       = true
 toml.workspace        = true
+tracing.workspace     = true
 uuid.workspace        = true
 
 [dev-dependencies]

@@ -4,9 +4,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tempr_db::{ObjectKind, SchemaFingerprint, SchemaScope, SchemaSnapshotEntry};
-use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode, Value};
+use tempr_domain::{
+    Connection, ConnectionId, DriverKind, SchemaObject, SchemaObjectId, SchemaSnapshot, SecretRef,
+    TlsMode, Value,
+};
 use tempr_events::{AppEventKind, EventBus, EventFilter};
-use tempr_services::{ConnectionService, QueryService, SchemaService};
+use tempr_services::{
+    ConnectionService, FullRefreshReason, QueryService, RefreshPath, SchemaService,
+};
 
 fn pg_connection_string() -> Option<String> {
     std::env::var("DATABASE_URL").ok()
@@ -152,6 +157,21 @@ async fn function_native_id(cs: &ConnectionService, id: ConnectionId, fn_name: &
         })
         .unwrap_or_else(|| panic!("function {fn_name} missing from snapshot"))
 }
+
+/// `SchemaScope::SearchPath` always includes `public` (see the driver's
+/// `SearchPath` match arm) regardless of the session's actual search path, so
+/// any sweep of it observes every persistent object any test has created —
+/// not just the caller's own probe tables. Most tests here only check their
+/// own objects by name and are immune to that noise, but a test that (a)
+/// creates/alters/drops a persistent `public` object, or (b) compares a
+/// sweep-derived result across two points in time (a full-snapshot equality,
+/// or a `RefreshPath` derived from a fingerprint diff) is not: concurrent DDL
+/// from any other test in category (a) can change what it sees. Every test
+/// in either category holds this lock for its whole body, which serializes
+/// exactly the tests that can actually collide and leaves the rest — the
+/// majority — running in parallel.
+static SCHEMA_REFRESH_LIVE_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
@@ -327,17 +347,58 @@ async fn pg_auth_failure_returns_error() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_schema_refresh() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     let (bus, cs) = setup_pg_cs();
     let id = connect_test_pg(&cs).await;
+
+    let qs = QueryService::new(bus.clone(), cs.clone());
+    qs.execute("DROP TABLE IF EXISTS schema_refresh_probe", id)
+        .await
+        .expect("drop probe table failed");
+    qs.execute("CREATE TABLE schema_refresh_probe (id int, label text)", id)
+        .await
+        .expect("create probe table failed");
 
     let ss = SchemaService::new(bus.clone(), cs.clone());
     let snapshot = ss.refresh(id).await.expect("schema refresh failed");
 
     assert!(snapshot.version >= 1);
-    assert!(!snapshot.objects.is_empty());
+
+    let find_table = |snap: &tempr_domain::SchemaSnapshot| {
+        snap.objects
+            .iter()
+            .find(|o| matches!(o, tempr_domain::SchemaObject::Table { name, .. } if name == "schema_refresh_probe"))
+            .expect("probe table not found in snapshot")
+            .clone()
+    };
+    let table = find_table(&snapshot);
+    let table_id = table.id();
+
+    let find_column = |snap: &tempr_domain::SchemaSnapshot, col_name: &str| {
+        snap.objects
+            .iter()
+            .find(|o| {
+                matches!(o, tempr_domain::SchemaObject::Column { parent_id, name, .. } if *parent_id == table_id && name == col_name)
+            })
+            .unwrap_or_else(|| panic!("probe column {col_name} not found in snapshot"))
+            .clone()
+    };
+    find_column(&snapshot, "id");
+    find_column(&snapshot, "label");
 
     let snapshot2 = ss.refresh(id).await.expect("second refresh failed");
     assert_eq!(snapshot2.version, snapshot.version + 1);
+
+    let table2 = find_table(&snapshot2);
+    assert_eq!(
+        table2.id(),
+        table_id,
+        "probe table must keep the same id across refreshes"
+    );
+
+    qs.execute("DROP TABLE schema_refresh_probe", id)
+        .await
+        .expect("cleanup drop failed");
 }
 
 #[tokio::test]
@@ -526,6 +587,7 @@ async fn pg_tls_require_fails_against_a_plaintext_only_server() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_snapshot_entries_carry_stable_native_ids() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     let (_bus, cs) = setup_pg_cs();
     let id = connect_test_pg(&cs).await;
 
@@ -597,6 +659,7 @@ async fn pg_snapshot_entries_carry_stable_native_ids() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_search_path_scope_excludes_off_path_schemas() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     let (_bus, cs) = setup_pg_cs();
     let id = connect_test_pg(&cs).await;
 
@@ -680,6 +743,7 @@ async fn pg_search_path_scope_excludes_off_path_schemas() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_snapshot_includes_functions() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     let (_bus, cs) = setup_pg_cs();
     let id = connect_test_pg(&cs).await;
 
@@ -792,6 +856,7 @@ async fn pg_snapshot_includes_functions() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_fingerprints_move_only_for_changed_relations() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     let (_bus, cs) = setup_pg_cs();
     let id = connect_test_pg(&cs).await;
 
@@ -878,6 +943,7 @@ async fn pg_fingerprints_move_only_for_changed_relations() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_fingerprints_respect_table_scope_binds() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     // `SearchPath`/`All` never bind parameters, so they can't catch a bug in
     // the UNION ALL placeholder renumbering. `Table` scope binds two ($1,
     // $2), forcing the second half of the fingerprint query to actually use
@@ -962,6 +1028,7 @@ async fn pg_fingerprints_respect_table_scope_binds() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_fingerprints_detect_index_changes() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     // Before this fix the sweep only queried pg_class (relkind IN ('r','p',
     // 'v','m','f')) and pg_attribute, so an index — relkind 'i' — never
     // appeared in the fingerprint set at all: dropping and recreating one
@@ -1045,6 +1112,7 @@ async fn pg_fingerprints_detect_index_changes() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_fingerprints_detect_function_changes() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     // Functions live in pg_proc, which the old sweep never queried, so
     // `CREATE OR REPLACE FUNCTION` with a changed body was invisible.
     let (_bus, cs) = setup_pg_cs();
@@ -1118,6 +1186,7 @@ async fn pg_fingerprints_detect_function_changes() {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
 async fn pg_foreign_table_aligns_with_column_query_relkinds() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
     // The table query used to list relkind IN ('r', 'p') while the column
     // query and the fingerprint sweep used ('r', 'p', 'v', 'm', 'f'): a
     // foreign table produced Column entries with no matching Table entry.
@@ -1253,4 +1322,412 @@ async fn pg_keywords_come_from_the_server() {
         "keywords are lower-cased"
     );
     assert!(words.iter().any(|w| w == "join"));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_object_ids_survive_a_second_refresh() {
+    // Compares the *entire* public-schema sweep across two refreshes, so it
+    // must not interleave with the other tests below that mutate `public`
+    // while asserting on a sweep-derived result — see
+    // `SCHEMA_REFRESH_LIVE_TEST_LOCK`.
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS id_stability", &[])
+            .await?;
+        conn.execute("CREATE TABLE id_stability (id int, label text)", &[])
+            .await
+    })
+    .await
+    .expect("setup");
+
+    let service = SchemaService::new(bus, cs.clone());
+    let first = service.refresh(id).await.expect("first refresh");
+    let second = service.refresh(id).await.expect("second refresh");
+
+    let ids = |s: &SchemaSnapshot| -> Vec<SchemaObjectId> {
+        let mut v: Vec<_> = s.objects.iter().map(|o| o.id()).collect();
+        v.sort_by_key(|i| i.0);
+        v
+    };
+    assert_eq!(ids(&first), ids(&second), "ids must be reproducible");
+    assert!(!first.keywords.is_empty(), "keywords came from the server");
+    assert!(!first.fingerprints.is_empty(), "fingerprints were stored");
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE id_stability", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_incremental_refresh_splices_a_changed_column_and_a_dropped_table() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
+    // `ALTER COLUMN ... TYPE` keeps the column's OID and moves its `xmin`, so
+    // the delta is `changed`-only — this is the case that actually exercises
+    // the splice, unlike an added object (covered separately below), which
+    // always falls back to a full refresh.
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS inc_probe_changed", &[])
+            .await?;
+        conn.execute("DROP TABLE IF EXISTS inc_probe_dropped", &[])
+            .await?;
+        conn.execute("DROP TABLE IF EXISTS inc_probe_untouched", &[])
+            .await?;
+        conn.execute("CREATE TABLE inc_probe_changed (id int)", &[])
+            .await?;
+        conn.execute("CREATE TABLE inc_probe_dropped (id int)", &[])
+            .await?;
+        conn.execute("CREATE TABLE inc_probe_untouched (id int)", &[])
+            .await
+    })
+    .await
+    .expect("setup");
+
+    let service = SchemaService::new(bus, cs.clone());
+    let before = service.refresh(id).await.expect("full refresh");
+
+    let find_table_id = |s: &SchemaSnapshot, want: &str| -> Option<SchemaObjectId> {
+        s.objects.iter().find_map(|o| match o {
+            SchemaObject::Table { id, name, .. } if name == want => Some(*id),
+            _ => None,
+        })
+    };
+    let untouched_before = find_table_id(&before, "inc_probe_untouched")
+        .expect("untouched table present before incremental refresh");
+    let untouched_column_count_before = before
+        .objects
+        .iter()
+        .filter(
+            |o| matches!(o, SchemaObject::Column { parent_id, .. } if *parent_id == untouched_before),
+        )
+        .count();
+    assert!(
+        untouched_column_count_before > 0,
+        "untouched table must have its column(s) in the baseline snapshot"
+    );
+
+    // --- ALTER COLUMN ... TYPE: a changed-only delta -----------------------
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute(
+            "ALTER TABLE inc_probe_changed ALTER COLUMN id TYPE bigint",
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("alter column type");
+
+    let (after_change, path_change) = service
+        .refresh_incremental(id)
+        .await
+        .expect("incremental refresh (changed column)");
+    assert!(
+        matches!(path_change, RefreshPath::Incremental { .. }),
+        "a changed-only delta must take the incremental splice, got {path_change:?}"
+    );
+    assert_eq!(after_change.version, before.version + 1);
+
+    // Scoped to our own table's id: other tests run concurrently against the
+    // same live server and may have their own "id" columns.
+    let changed_table_id = find_table_id(&after_change, "inc_probe_changed")
+        .expect("changed table present after incremental refresh");
+    let changed_column_type = after_change.objects.iter().find_map(|o| match o {
+        SchemaObject::Column {
+            parent_id,
+            name,
+            data_type,
+            ..
+        } if *parent_id == changed_table_id && name == "id" => Some(data_type.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        changed_column_type.as_deref(),
+        Some("bigint"),
+        "incremental refresh must see the retyped column"
+    );
+
+    let untouched_after_change = find_table_id(&after_change, "inc_probe_untouched");
+    assert_eq!(
+        untouched_after_change,
+        Some(untouched_before),
+        "a table in an untouched schema must keep its identity"
+    );
+    let untouched_column_count_after = after_change
+        .objects
+        .iter()
+        .filter(
+            |o| matches!(o, SchemaObject::Column { parent_id, .. } if *parent_id == untouched_before),
+        )
+        .count();
+    assert_eq!(
+        untouched_column_count_after, untouched_column_count_before,
+        "an untouched table must keep its objects"
+    );
+
+    // --- DROP TABLE: a dropped-only delta -----------------------------------
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE inc_probe_dropped", &[]).await
+    })
+    .await
+    .expect("drop probe table");
+
+    let (after_drop, path_drop) = service
+        .refresh_incremental(id)
+        .await
+        .expect("incremental refresh (dropped table)");
+    assert!(
+        matches!(path_drop, RefreshPath::Incremental { .. }),
+        "a drop produces no added key, so it must not fall back, got {path_drop:?}"
+    );
+    assert!(
+        find_table_id(&after_drop, "inc_probe_dropped").is_none(),
+        "dropped table must be gone from the snapshot"
+    );
+    assert!(
+        find_table_id(&after_drop, "inc_probe_changed").is_some(),
+        "the changed table must still be present"
+    );
+    assert_eq!(
+        find_table_id(&after_drop, "inc_probe_untouched"),
+        Some(untouched_before),
+        "the untouched table must still keep its identity"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE inc_probe_changed", &[]).await?;
+        conn.execute("DROP TABLE inc_probe_untouched", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_incremental_refresh_falls_back_to_full_refresh_on_an_added_column() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
+    // Documents real, current behaviour: the sweep reports OIDs with no
+    // schema name attached, so an object the cache has never seen cannot be
+    // scoped to a targeted re-read and forces a full refresh instead.
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS inc_fallback", &[])
+            .await?;
+        conn.execute("CREATE TABLE inc_fallback (id int)", &[])
+            .await
+    })
+    .await
+    .expect("setup");
+
+    let service = SchemaService::new(bus, cs.clone());
+    let before = service.refresh(id).await.expect("full refresh");
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("ALTER TABLE inc_fallback ADD COLUMN label text", &[])
+            .await
+    })
+    .await
+    .expect("add column");
+
+    let (after, path) = service.refresh_incremental(id).await.expect("incremental");
+    assert_eq!(
+        path,
+        RefreshPath::FullRefresh(FullRefreshReason::UnknownObject),
+        "an added object has no schema to scope to and must fall back to a full refresh"
+    );
+    assert_eq!(after.version, before.version + 1);
+
+    // Scoped to our own table's id: other tests run concurrently against the
+    // same live server and may have their own columns named "label".
+    let fallback_table_id = after.objects.iter().find_map(|o| match o {
+        SchemaObject::Table { id, name, .. } if name == "inc_fallback" => Some(*id),
+        _ => None,
+    });
+    let has_label_column = |s: &SchemaSnapshot, parent: Option<SchemaObjectId>| {
+        let Some(parent) = parent else {
+            return false;
+        };
+        s.objects.iter().any(
+            |o| matches!(o, SchemaObject::Column { parent_id, name, .. } if *parent_id == parent && name == "label"),
+        )
+    };
+    let before_table_id = before.objects.iter().find_map(|o| match o {
+        SchemaObject::Table { id, name, .. } if name == "inc_fallback" => Some(*id),
+        _ => None,
+    });
+    assert!(
+        !has_label_column(&before, before_table_id),
+        "column did not exist yet"
+    );
+    assert!(
+        has_label_column(&after, fallback_table_id),
+        "the full-refresh fallback must still see the new column"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE inc_fallback", &[]).await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_incremental_refresh_resolves_a_renamed_view_on_a_non_public_schema() {
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
+    // A `pg_class` sweep cannot distinguish a table from a view, so a changed
+    // view's fingerprint key looks like `(Table, oid)` — `domain_kind` folds
+    // both to `Table`. Before the fix, resolving a changed key's schema only
+    // tried `SchemaObjectId::derived(conn, Table, oid)`, which never matches
+    // the view's actual cached id (derived under `View`), so the view's
+    // schema was never re-introspected and a rename was silently lost: the
+    // new snapshot stored the view's new fingerprint under its old name, so
+    // no later sweep would ever report it changed again. This puts a view on
+    // a non-`public` schema on the search path (so `snapshot_schema` must
+    // actually re-read that schema, not just fall back to `public`), renames
+    // it, and asserts the incremental splice sees the rename.
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    let schema_name = "inc_view_probe_schema";
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"), &[])
+            .await?;
+        conn.execute(&format!("CREATE SCHEMA {schema_name}"), &[])
+            .await?;
+        conn.execute(&format!("SET search_path TO {schema_name}, public"), &[])
+            .await?;
+        conn.execute(
+            &format!("CREATE VIEW {schema_name}.inc_view_before AS SELECT 1 AS n"),
+            &[],
+        )
+        .await?;
+        // Filler, so the view's rename (a single relation-level fingerprint
+        // change) stays well under `refresh_incremental`'s 40%-changed
+        // full-refresh threshold — otherwise this test would trivially pass
+        // via `FullRefreshReason::TooMuchChanged`, which sees the rename
+        // regardless of the schema-resolution bug this test exists to catch.
+        for i in 0..5 {
+            conn.execute(
+                &format!("CREATE TABLE {schema_name}.filler{i} (a int)"),
+                &[],
+            )
+            .await?;
+        }
+        Ok(())
+    })
+    .await
+    .expect("setup");
+
+    let service = SchemaService::new(bus, cs.clone());
+    let before = service.refresh(id).await.expect("full refresh");
+
+    let find_view = |s: &SchemaSnapshot, want: &str| -> Option<SchemaObjectId> {
+        s.objects.iter().find_map(|o| match o {
+            SchemaObject::View { id, name, .. } if name == want => Some(*id),
+            _ => None,
+        })
+    };
+    assert!(
+        find_view(&before, "inc_view_before").is_some(),
+        "baseline full refresh must see the view before the rename"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute(
+            &format!("ALTER VIEW {schema_name}.inc_view_before RENAME TO inc_view_after"),
+            &[],
+        )
+        .await
+    })
+    .await
+    .expect("rename view");
+
+    let (after, path) = service
+        .refresh_incremental(id)
+        .await
+        .expect("incremental refresh (renamed view)");
+    assert!(
+        matches!(path, RefreshPath::Incremental { .. }),
+        "a renamed view is a changed-only delta and must take the incremental splice, got {path:?}"
+    );
+    assert!(
+        find_view(&after, "inc_view_after").is_some(),
+        "renamed view must be present under its new name after the incremental splice"
+    );
+    assert!(
+        find_view(&after, "inc_view_before").is_none(),
+        "renamed view must be gone under its old name after the incremental splice"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("SET search_path TO public", &[]).await?;
+        conn.execute(&format!("DROP SCHEMA {schema_name} CASCADE"), &[])
+            .await
+    })
+    .await
+    .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL env var pointing to a live PostgreSQL instance"]
+async fn pg_catalog_is_readable_without_the_server() {
+    // Held for the whole test: this creates its own persistent `public`
+    // object below, so it must not race the other DDL-mutating tests either.
+    let _guard = SCHEMA_REFRESH_LIVE_TEST_LOCK.lock().await;
+    // The phase's offline criterion: introspect once, then serve the catalog
+    // from disk with a service that never talks to the database.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage: std::sync::Arc<dyn tempr_workspace::Storage> =
+        std::sync::Arc::new(tempr_workspace::FileSystemStorage::new(dir.path()));
+    storage
+        .init_workspace_dir()
+        .await
+        .expect("init workspace dir");
+
+    let (bus, cs) = setup_pg_cs();
+    let id = connect_test_pg(&cs).await;
+
+    // Its own probe table: `written.objects` must be non-empty on the merits
+    // of this test's own state, not by accident of another test's leftover
+    // table still being present in `public` when the sweep runs.
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE IF EXISTS catalog_readable_probe", &[])
+            .await?;
+        conn.execute("CREATE TABLE catalog_readable_probe (id int)", &[])
+            .await
+    })
+    .await
+    .expect("setup");
+
+    let service = SchemaService::with_cache(bus.clone(), cs.clone(), storage.clone());
+    let written = service.refresh(id).await.expect("refresh");
+    assert!(!written.objects.is_empty());
+
+    // A brand-new service over the same storage, and a connection service
+    // pointing nowhere: nothing here can reach PostgreSQL.
+    let offline_cs = ConnectionService::new(bus.clone());
+    let offline = SchemaService::with_cache(bus, offline_cs, storage);
+    let loaded = offline.load_cached(id).await.expect("cache hit");
+
+    assert_eq!(loaded.id, written.id);
+    assert_eq!(loaded.objects.len(), written.objects.len());
+    assert_eq!(loaded.keywords, written.keywords);
+    assert!(
+        offline.snapshot(id).is_some(),
+        "loading populates the in-memory map"
+    );
+
+    cs.with_metadata_connection_fn(id, |mut conn| async move {
+        conn.execute("DROP TABLE catalog_readable_probe", &[]).await
+    })
+    .await
+    .expect("cleanup");
 }
