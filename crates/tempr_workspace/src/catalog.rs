@@ -1,15 +1,16 @@
-//! The on-disk catalog cache (`.tcat`): a versioned header plus a bincode
-//! body (docs/07-storage.md → catalog cache, D27). The cache is derived data,
-//! so every decode failure is a discard, never an error the user sees.
+//! The on-disk catalog cache (`.tcat`): a versioned header plus a postcard
+//! body (docs/07-storage.md → catalog cache, D28, superseding D27's bincode
+//! choice). The cache is derived data, so every decode failure is a discard,
+//! never an error the user sees.
 //!
 //! `SchemaObject` is `#[serde(tag = "kind", ...)]` (internally tagged) for
 //! its JSON representation elsewhere in the tree. Internally-tagged enums
 //! need the deserializer to buffer arbitrary content to find the tag before
 //! it knows which variant to build — that requires `deserialize_any`, which
-//! bincode's `Deserializer` does not implement (non-self-describing formats
-//! can't support it; verified against bincode 2.0.1, which fails with
-//! `Serde(AnyNotSupported)`). `CatalogObject` below is a private mirror of
-//! `SchemaObject` with the same variants and fields in bincode's default
+//! postcard's `Deserializer` does not implement either (non-self-describing
+//! formats can't support it; the same limitation applied to bincode, which
+//! this format replaces). `CatalogObject` below is a private mirror of
+//! `SchemaObject` with the same variants and fields in postcard's default
 //! *externally tagged* representation, which decodes directly with no
 //! buffering. It exists only as this module's wire shape — `SchemaObject`
 //! itself, and its JSON format, are untouched.
@@ -25,13 +26,13 @@ use crate::error::WorkspaceError;
 
 pub const CATALOG_MAGIC: [u8; 4] = *b"TCAT";
 /// Bump on ANY layout change: older readers discard what they cannot parse.
-pub const CATALOG_FORMAT_VERSION: u16 = 1;
+pub const CATALOG_FORMAT_VERSION: u16 = 2;
 const HEADER_LEN: usize = 4 + 2 + 2 + 8;
 
-/// Bincode-shaped mirror of `SchemaSnapshot` — see the module docs. Every
+/// Postcard-shaped mirror of `SchemaSnapshot` — see the module docs. Every
 /// field but `objects` is a domain type used as-is: `Uuid`-backed ids,
 /// `DateTime<Utc>` and `SchemaFingerprintRecord` (whose `SchemaObjectKind` is
-/// a plain, un-tagged fieldless enum) all round-trip through bincode's serde
+/// a plain, un-tagged fieldless enum) all round-trip through postcard's serde
 /// bridge without issue.
 #[derive(Debug, Serialize, Deserialize)]
 struct CatalogSnapshot {
@@ -44,7 +45,7 @@ struct CatalogSnapshot {
     fingerprints: Vec<SchemaFingerprintRecord>,
 }
 
-/// Bincode-shaped mirror of `SchemaObject`, field-for-field identical, minus
+/// Postcard-shaped mirror of `SchemaObject`, field-for-field identical, minus
 /// the internal tag. See the module docs.
 #[derive(Debug, Serialize, Deserialize)]
 enum CatalogObject {
@@ -288,23 +289,18 @@ pub fn content_hash(body: &[u8]) -> u64 {
 /// pointless rewrite.
 pub fn snapshot_content_hash(snapshot: &SchemaSnapshot) -> Result<u64, WorkspaceError> {
     let objects: Vec<CatalogObject> = snapshot.objects.iter().map(CatalogObject::from).collect();
-    let body = bincode::serde::encode_to_vec(
-        (&objects, &snapshot.keywords, &snapshot.fingerprints),
-        bincode::config::standard(),
-    )
-    .map_err(|e| WorkspaceError::Corrupted {
-        reason: format!("catalog content hash encode failed: {e}"),
-    })?;
+    let body = postcard::to_allocvec(&(&objects, &snapshot.keywords, &snapshot.fingerprints))
+        .map_err(|e| WorkspaceError::Corrupted {
+            reason: format!("catalog content hash encode failed: {e}"),
+        })?;
     Ok(content_hash(&body))
 }
 
 /// Encode a snapshot into header + body.
 pub fn encode_catalog(snapshot: &SchemaSnapshot) -> Result<Vec<u8>, WorkspaceError> {
     let wire = CatalogSnapshot::from(snapshot);
-    let body = bincode::serde::encode_to_vec(&wire, bincode::config::standard()).map_err(|e| {
-        WorkspaceError::Corrupted {
-            reason: format!("catalog encode failed: {e}"),
-        }
+    let body = postcard::to_allocvec(&wire).map_err(|e| WorkspaceError::Corrupted {
+        reason: format!("catalog encode failed: {e}"),
     })?;
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.extend_from_slice(&CATALOG_MAGIC);
@@ -334,9 +330,8 @@ pub fn decode_catalog(bytes: &[u8]) -> Result<Option<SchemaSnapshot>, WorkspaceE
     if content_hash(body) != expected {
         return Ok(None);
     }
-    match bincode::serde::decode_from_slice::<CatalogSnapshot, _>(body, bincode::config::standard())
-    {
-        Ok((wire, _)) => Ok(Some(SchemaSnapshot::from(wire))),
+    match postcard::from_bytes::<CatalogSnapshot>(body) {
+        Ok(wire) => Ok(Some(SchemaSnapshot::from(wire))),
         Err(_) => Ok(None),
     }
 }
