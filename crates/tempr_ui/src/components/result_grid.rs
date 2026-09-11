@@ -172,30 +172,39 @@ impl Render for ResultGrid {
             .id("results-scroll")
             .size_full()
             .overflow_x_scroll()
+            // Without this, gpui's cross-axis fallback turns every vertical
+            // wheel tick into horizontal scroll here (this container has no
+            // vertical overflow), so the grid slides sideways instead of down.
+            .restrict_scroll_to_axis()
             .text_size(px(13.))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .h_full()
+                    // A narrow result set must still fill the viewport so the
+                    // wheel scrolls rows anywhere in the grid, not only over them.
+                    .min_w_full()
                     .w(px(self.total_width()))
                     .child(self.render_header())
-                    .child(
-                        div().flex_1().min_h_0().child(
-                            uniform_list(
-                                "result-rows",
-                                row_count,
-                                cx.processor(
-                                    |this, range: std::ops::Range<usize>, _window, _cx| {
-                                        this.last_rendered = range.clone();
-                                        range.map(|ix| this.render_row(ix)).collect::<Vec<_>>()
-                                    },
-                                ),
-                            )
-                            .track_scroll(&self.scroll_handle)
-                            .h_full(),
-                        ),
-                    ),
+                    .child(div().flex_1().min_h_0().child({
+                        let mut rows = uniform_list(
+                            "result-rows",
+                            row_count,
+                            cx.processor(|this, range: std::ops::Range<usize>, _window, _cx| {
+                                this.last_rendered = range.clone();
+                                range.map(|ix| this.render_row(ix)).collect::<Vec<_>>()
+                            }),
+                        )
+                        .track_scroll(&self.scroll_handle)
+                        .h_full();
+                        // The mirror of the container's rule: a horizontal wheel
+                        // (shift-wheel, tilt) must reach the container only, not fall
+                        // back to scrolling rows vertically. `restrict_scroll_to_axis`
+                        // is not exposed on `UniformList`, hence the style field.
+                        rows.interactivity().base_style.restrict_scroll_to_axis = Some(true);
+                        rows
+                    })),
             )
             .into_any_element()
     }

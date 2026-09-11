@@ -172,6 +172,8 @@ These rules apply to **every** view and component in the codebase:
 
 5. **Accessibility metadata on every interactive element.** Every `Button`, `Input`, `List`, and `Table` must carry `aria_label` or equivalent metadata. Tempr's accessibility story begins at the component level, not retrofitted.
 
+6. **Nested scroll containers scroll their own axis only.** gpui maps a wheel delta onto the *other* axis when an element scrolls in one axis alone (`Interactivity::paint_scroll_listener`), so a horizontal-only wrapper around a vertical `uniform_list` hijacks every vertical wheel tick and the list hijacks shift-wheel. Any element that scrolls in one axis and contains or sits inside another scrollable sets `restrict_scroll_to_axis` (on `UniformList` via `interactivity().base_style`, which does not expose the builder). `ResultGrid` is the reference: column container horizontal, rows vertical, each restricted (fixed 2026-09-11).
+
 ---
 
 ## Design Rationale
