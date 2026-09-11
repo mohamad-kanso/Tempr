@@ -8,6 +8,8 @@
 
 ## Now
 
+- [ ] **Confirm the wheel fix on GNOME Wayland** (PR #17, 2026-09-11): the fix was reproduced and verified only on Xvfb through the X11 backend (XTest cannot reach an Xwayland window here, and no `ydotool`). The original report also named the editor, which scrolled correctly under X11 — wheel over the grid and the editor, with and without shift. If the editor still fails on Wayland, instrument `gpui_linux`'s Wayland `AxisValue120`/`AxisDiscrete` handling (`crates/gpui_linux/src/linux/wayland/client.rs` in the pinned Zed checkout) next; a stuck `modifiers.shift` there would force every wheel tick onto the horizontal axis
+
 - [ ] Lazy wire streaming via `query_raw()` — `PostgresStream` currently buffers full result set via `client.query()`, then yields `batch_size` chunks. True `query_raw` streaming was attempted but fails with `Error { kind: Closed }` specifically when called through `QueryService::execute()` (works fine via raw driver or closures). Root cause undetermined — suspected `Box<dyn DriverConnection>` + async trait boundary interaction. Investigate as follow-up.
 
 - [ ] `DriverConnection::ping` (active round-trip) on top of the existing `is_closed` recycle check (09-database-engine: idle ping every 30 s, reconnect with backoff → `Reconnecting`/`Failed` states, evict a connection whose query failed with a transport error)
