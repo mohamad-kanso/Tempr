@@ -40,7 +40,7 @@ tempr/                    # Cargo workspace root
 | `tempr_db_postgres` | PostgreSQL driver — ships as a static plugin, depends only on `tempr_db` + `tempr_plugin` | [09 — Database](09-database-engine.md) |
 | `tempr_editor` | Buffer, rope data structures, syntax highlighting | [10 — Editor](10-editor.md) |
 | `tempr_ui` | GPUI components, views, layout | [11 — UI](11-gpui.md) |
-| `tempr_intel` | `CatalogCache` (immutable arena over `SchemaSnapshot`: id/identity lookups, exact ± folded relation/column lookups, contiguous `columns_of`, folded `prefix_search`), `SemanticEngine` (scopes, reference resolution, diagnostics), completion (context classification, candidate generation, ranking), release probes | [12 — Intelligence](12-sql-intelligence.md) |
+| `tempr_intel` | `CatalogCache` (immutable arena over `SchemaSnapshot`: id/identity lookups, exact ± folded relation/column lookups, contiguous `columns_of`, folded `prefix_search`), `SemanticEngine` (scopes, reference resolution, diagnostics, `analyze`/`complete`/`hover`), completion (context classification, candidate generation, ranking), hover cards (`HoverInfo`), release probes | [12 — Intelligence](12-sql-intelligence.md) |
 | `tempr_grid` | RowStore, ResultGrid, data grid rendering | [13 — Grid](13-result-grid.md) |
 
 ## Design Rationale
@@ -127,10 +127,10 @@ CI mirrors this pipeline exactly. There are no CI-only steps. If `cargo fmt --ch
 The following graph shows which crates depend on which. Arrows point from dependent to dependency (i.e. "A → B" means A imports B). The layering enforced is:
 
 - **Domain** (`tempr_domain`, `tempr_events`) — depended on by almost everything, depend on nothing internal.
-- **Services** (`tempr_workspace`, `tempr_services`, `tempr_plugin`, `tempr_db`) — depend on domain, not on each other (sibling layer).
+- **Services** (`tempr_workspace`, `tempr_services`, `tempr_plugin`, `tempr_db`) — depend on domain. `tempr_services` additionally depends on `tempr_intel` + `tempr_editor`: its `IntelligenceService` owns a private `Buffer` mirror of the view's text and the `SemanticEngine` built from it.
 - **Drivers** (`tempr_db_postgres`) — depend only on `tempr_db` + `tempr_plugin` + `tempr_domain`.
-- **Intelligence** (`tempr_intel`, `tempr_editor`, `tempr_grid`) — depend on domain, and on services only through explicit crate edges (`tempr_intel` reads the editor's `Buffer`; `tempr_grid` reads editor types).
-- **UI** (`tempr_ui`) — depends on everything below it; nothing depends on `tempr_ui`.
+- **Intelligence** (`tempr_intel`, `tempr_editor`, `tempr_grid`) — depend on domain only; `tempr_intel` and `tempr_grid` read editor types, and nothing here depends back on `tempr_services` (no cycle).
+- **UI** (`tempr_ui`) — depends on everything below it, including `tempr_intel` for the `Analysis`/`HoverInfo`/`CompletionItem` model types; nothing depends on `tempr_ui`.
 - **Binary** (`tempr`) — the root; depends on all crates, wires them together.
 
 ```mermaid
@@ -184,6 +184,8 @@ graph TD
 
     services --> domain
     services --> events
+    services --> intel
+    services --> editor
 
     workspace --> domain
     workspace --> events

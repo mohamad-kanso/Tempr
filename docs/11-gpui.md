@@ -74,7 +74,8 @@ A community alternative exists — **`gpui-component`** (longbridge/gpui-compone
 | **Input** | Single-line text field with selection, clipboard, undo. Auto-resizes to content when used in palettes. Emits `on_change` and `on_submit` callbacks. **Status (2026-09-03):** `tempr_ui::components::Input` — selection, clipboard, IME/marked text, grapheme-aware cursor; emits `InputEvent::{Changed, Submit}`; keybindings come from the command catalog (`tempr_ui::commands`, context `Input`). Undo and auto-resize are TODO. |
 | **List** | Virtualized scrollable list, wrapping `uniform_list` (fixed row height) or `list` + `ListState` when rows vary. Only renders visible rows. Supports multi-select and keyboard navigation (↑/↓/Home/End/PageUp/PageDown). Used for palette results, sidebar items. |
 | **Table** | Virtualized, columnar grid built on `uniform_list` for rows plus Tempr's own column virtualization. Shared with the result grid (§6 data flow). Columns are resizable. Cells support copy-on-select. Keyboard navigable in a 2D grid pattern. **Status (2026-09-03):** Phase 1 `tempr_ui::components::ResultGrid` — `uniform_list` row virtualization, fixed 180 px columns, horizontal scroll, `∅` for NULL, rows appended per `Batch`. Column virtualization/resize, copy, 2D keyboard nav, and the columnar `RowStore` are TODO. |
-| **Editor** | Multi-line SQL editor over `tempr_editor::Buffer`. **Status (2026-09-05):** `tempr_ui::components::EditorView` — see [10 — Editor](./10-editor.md) "EditorView" for what is implemented and what is still TODO. |
+| **Editor** | Multi-line SQL editor over `tempr_editor::Buffer`. **Status (2026-10-21):** `tempr_ui::components::EditorView` — see [10 — Editor](./10-editor.md) "EditorView". Since stage 6 the same view also renders diagnostic underlines, the hover card, and the `CompletionPopup`, and it debounces a text snapshot to `IntelligenceService` 100 ms after the last edit. |
+| **CompletionPopup** | Overlay list of ranked completion items, anchored below the caret inside `EditorView`. **Status (2026-10-21):** `tempr_ui::components::completion_popup` — pure state (`items`, `selected`) plus the four actions; the anchor point lives in `EditorView`, which renders the popup. ↑/↓ (ctrl-p/ctrl-n) move, enter/tab accept (replacing the item's `replace` range with `insert`, then notifying `IntelligenceService`), escape dismisses. The root div switches its key context from `Editor` to `Editor Completion` while the popup is open, so completion bindings exist only then and the four commands are hidden from palette search. |
 | **Palette** | Modal overlay combining `Input` + `List`. Fuzzy-search over a command or file list. Activated via a global keybinding. Returns selection to the caller. **Status (2026-09-05):** `tempr_ui::components::Palette` — `Input` + `uniform_list` over `CommandService::search`; ctrl-shift-p toggles, ↑/↓ (ctrl-p/ctrl-n) select, enter emits `PaletteEvent::Execute(id)`, escape dismisses; `MainWindow` dispatches. The palette adds `Modal` to its key context; main-window bindings use the `MainWindow && !Modal` predicate so any future overlay suspends them the same way. Focus returns to whatever was focused before it opened. Per-character match highlighting is TODO. |
 | **Dock/Panel** | Resizable sidebar/bottom panel container. Panels can be collapsed, floated, or docked to any edge. State is persisted to workspace config (§8). |
 | **Tabs** | Horizontal tab bar. Each tab has a label, optional dirty indicator, and close button. Tabs are reorderable via drag. Keyboard navigable (Ctrl+Tab, Ctrl+Shift+Tab). |
@@ -84,11 +85,15 @@ A community alternative exists — **`gpui-component`** (longbridge/gpui-compone
 
 ### Command Catalog
 
-Every user action is a GPUI action listed once in `tempr_ui::commands::core_commands()` (D23). A unit test fails the build if a command has no default keystroke — this table *is* the keyboard-only audit. Regenerate with `TEMPR_LIST_COMMANDS=1 cargo run` (effective keys after user/workspace overrides; `pal` = searchable in the palette — `-` marks commands that only make sense inside the palette or its single-line `Input`):
+Every user action is a GPUI action listed once in `tempr_ui::commands::core_commands()` (D23). A unit test fails the build if a command has no default keystroke — this table *is* the keyboard-only audit. Regenerate with `TEMPR_LIST_COMMANDS=1 cargo run` (effective keys after user/workspace overrides; `pal` = searchable in the palette — `-` marks commands that only make sense inside the palette or its single-line `Input`). Completion commands are a third case: their predicate (`Editor && Completion`) matches only while the popup's root div carries the `Editor Completion` key context, and all four are hidden from search so a closed popup can never consume enter, tab, or escape.
 
 ```
 id                                 title                          category     context                pal  keys
 main_window::Quit                  Quit                           Application  (global)               yes  ctrl-q, cmd-q
+completion::Accept                 Completion: Accept             Completion   Editor && Completion   -    enter, tab
+completion::Dismiss                Completion: Dismiss            Completion   Editor && Completion   -    escape
+completion::Next                   Completion: Next Item          Completion   Editor && Completion   -    down, ctrl-n
+completion::Prev                   Completion: Previous Item      Completion   Editor && Completion   -    up, ctrl-p
 input::Backspace                   Edit: Backspace                Edit         Input                  -    backspace
 input::Copy                        Edit: Copy                     Edit         Input                  -    ctrl-c, cmd-c
 input::Cut                         Edit: Cut                      Edit         Input                  -    ctrl-x, cmd-x
@@ -120,7 +125,9 @@ editor::MoveLineUp                 Editor: Move Line Up           Editor       E
 editor::MoveRight                  Editor: Move Right             Editor       Editor                 yes  right
 editor::MoveUp                     Editor: Move Up                Editor       Editor                 yes  up
 editor::Newline                    Editor: New Line               Editor       Editor                 yes  enter
+editor::NextDiagnostic             Editor: Next Diagnostic        Editor       Editor                 yes  f8
 editor::Paste                      Editor: Paste                  Editor       Editor                 yes  ctrl-v, cmd-v
+editor::PrevDiagnostic             Editor: Previous Diagnostic    Editor       Editor                 yes  shift-f8
 editor::Redo                       Editor: Redo                   Editor       Editor                 yes  ctrl-shift-z, ctrl-y, cmd-shift-z
 editor::SelectAll                  Editor: Select All             Editor       Editor                 yes  ctrl-a, cmd-a
 editor::SelectDown                 Editor: Select Down            Editor       Editor                 yes  shift-down
@@ -131,6 +138,8 @@ editor::SelectWordLeft             Editor: Select Word Left       Editor       E
 editor::SelectWordRight            Editor: Select Word Right      Editor       Editor                 yes  ctrl-shift-right, alt-shift-right
 editor::SelectLineEnd              Editor: Select to Line End     Editor       Editor                 yes  shift-end
 editor::SelectLineStart            Editor: Select to Line Start   Editor       Editor                 yes  shift-home
+editor::Hover                      Editor: Show Hover             Editor       Editor                 yes  ctrl-k ctrl-i
+editor::TriggerCompletion          Editor: Trigger Completion     Editor       Editor                 yes  ctrl-space
 editor::Undo                       Editor: Undo                   Editor       Editor                 yes  ctrl-z, cmd-z
 editor::WordLeft                   Editor: Word Left              Editor       Editor                 yes  ctrl-left, alt-left
 editor::WordRight                  Editor: Word Right             Editor       Editor                 yes  ctrl-right, alt-right
@@ -140,6 +149,9 @@ palette::SelectPrev                Palette: Previous Item         Palette      P
 main_window::CancelQuery           Cancel Query                   Query        MainWindow && !Modal   yes  escape
 editor::RunAll                     Run All Statements             Query        Editor                 yes  ctrl-shift-enter, cmd-shift-enter
 main_window::RunQuery              Run Query                      Query        MainWindow && !Modal   yes  ctrl-enter, cmd-enter
+schema::Refresh                    Schema: Refresh                Schema       MainWindow && !Modal   yes  ctrl-shift-r, cmd-shift-r
+schema::RefreshIncremental         Schema: Refresh (Incremental)  Schema       MainWindow && !Modal   yes  ctrl-alt-r, cmd-alt-r
+schema::RefreshAllSchemas          Schema: Refresh All Schemas    Schema       MainWindow && !Modal   yes  ctrl-alt-shift-r, cmd-alt-shift-r
 main_window::DebugScrollBenchmark  Debug: Scroll Benchmark        View         MainWindow && !Modal   yes  ctrl-shift-b, cmd-shift-b
 main_window::TogglePalette         Toggle Command Palette         View         (global)               -    ctrl-shift-p, cmd-shift-p
 ```

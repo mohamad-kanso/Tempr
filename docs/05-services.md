@@ -203,25 +203,40 @@ impl SchemaService {
 
 ### IntelligenceService
 
-`IntelligenceService` owns the `SemanticEngine` — the internal completion, diagnostics, and hover pipeline that gives Tempr its "DataGrip" half. It receives `BufferChanged` events from the editor and `SchemaRefreshed` events from the schema service, maintains an up-to-date `CatalogCache` (populated from `SchemaSnapshot`s, never from live database queries), and serves completion requests within a sub-5ms latency budget. Plugins can contribute additional completion providers via `CommandContribution` registration through the `PluginService`; `IntelligenceService` fans out requests to all registered providers and merges results.
+`IntelligenceService` owns the `SemanticEngine` — the internal completion, diagnostics, and hover pipeline that gives Tempr its "DataGrip" half. It rebuilds the immutable `CatalogCache` from `SchemaRefreshed`, keeps one mirror `Buffer` per file for background analysis, and serves completion and hover synchronously from the UI thread (no I/O, no database access). Plugins can contribute additional completion providers via `CommandContribution` registration through the `PluginService`; `IntelligenceService` fans out requests to all registered providers and merges results (Phase 4).
 
-**Owned state:** `SemanticEngine` instance, `CatalogCache` (interned table/column/alias data), registered `CompletionProvider` list (populated by `PluginService` during activation).
+**Owned state:** `SemanticEngine` instance, the analysis cache (`(source revision, Arc<Analysis>)` per file), mirror buffers for analysis, the active connection, and the engine's `CatalogCache`.
 
-**Key async methods:**
+**Key methods (shipped stage 6):**
 
 ```rust
 impl IntelligenceService {
-    pub fn complete(&self, req: &CompletionRequest) -> Vec<CompletionItem>;
-    pub fn hover(&self, buffer: &BufferSnapshot, offset: usize) -> Option<HoverInfo>;
-    pub fn diagnostics(&self, buffer: &BufferSnapshot) -> Vec<Diagnostic>;
-    pub fn definition(&self, buffer: &BufferSnapshot, offset: usize) -> Option<SchemaObjectId>;
-    pub fn register_provider(&self, provider: Arc<dyn CompletionProvider>);
+    /// Synchronous, UI thread. The view lends its buffer; the engine reads
+    /// text and its revision-keyed analysis cache.
+    pub fn complete(&self, buffer: &mut Buffer, offset: usize, explicit: bool) -> Vec<CompletionItem>;
+    pub fn hover(&self, buffer: &mut Buffer, offset: usize) -> Option<HoverInfo>;
+
+    /// Background path: mirror the snapshot, analyze, cache and publish
+    /// DiagnosticsReady. `source_revision` is the view's buffer revision.
+    pub fn analyze(&self, file: SqlFileId, source_revision: u64, text: &str);
+
+    /// Exact-revision lookup; `None` means the analysis is stale.
+    pub fn analysis(&self, file: SqlFileId, source_revision: u64) -> Option<Arc<Analysis>>;
+
+    /// Replace the catalog from a snapshot (SchemaRefreshed, cache load).
+    pub fn install_snapshot(&self, snapshot: &SchemaSnapshot);
+    pub fn set_catalog(&self, catalog: Arc<CatalogCache>);
+
+    /// Drop per-file state when a buffer closes.
+    pub fn forget(&self, file: SqlFileId);
 }
 ```
 
-**Events published:** `DiagnosticsUpdated { file: SqlFileId, count: usize }` (future: for gutter diagnostic indicators).
+**Events published:** `DiagnosticsReady { file: SqlFileId }` (the view pulls the exact revision from `analysis()`), `SchemaRefreshFailed { connection: ConnectionId, message: String }` (a refresh failed; the previous catalog stays installed).
 
-**Events consumed:** `BufferChanged { file: SqlFileId }` (triggers incremental re-analysis), `SchemaRefreshed { connection: ConnectionId, snapshot: SchemaSnapshotId }` (triggers catalog cache rebuild for that connection).
+**Events consumed:** `SchemaRefreshed { connection, snapshot }` (install that snapshot), `ConnectionStateChanged { id, Connected }` (load the cached `.tcat`, then refresh incrementally — offline catalog first, network second).
+
+The spec's `BufferSnapshot`-based sketches are superseded: `complete` and `hover` read the real `Buffer` (`&mut` for the analysis cache's lazy reparse), and diagnostics run against a service-owned mirror buffer because the view owns the real one.
 
 ---
 
@@ -447,7 +462,7 @@ graph TD
     LS -.->|LayoutChanged| Bus
 
     HS -.->|QueryFinished| Bus
-    IS -.->|BufferChanged| Bus
+    IS -.->|DiagnosticsReady, SchemaRefreshFailed| Bus
 ```
 
 Reading the diagram:

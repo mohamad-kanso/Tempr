@@ -36,7 +36,7 @@ Four files that must always reflect reality. Each fact has exactly ONE home — 
 
 ## Project Status
 
-Phase 1 (Connect & Run) — complete 2026-09-03: PostgreSQL driver with TLS, pooled services with lifecycle, GPUI window with SQL input and streaming result grid, 15 integration tests against Docker PG. Phase 2 (Editor) — complete 2026-09-07: rope buffer, tree-sitter syntax tree with statement detection, command palette, three-layer keybindings, full editing ops, `EditorView` with execute-statement-under-cursor. **See docs/PROGRESS.md for current status.**
+Phase 1 (Connect & Run) — complete 2026-09-03: PostgreSQL driver with TLS, pooled services with lifecycle, GPUI window with SQL input and streaming result grid, 15 integration tests against Docker PG. Phase 2 (Editor) — complete 2026-09-07: rope buffer, tree-sitter syntax tree with statement detection, command palette, three-layer keybindings, full editing ops, `EditorView` with execute-statement-under-cursor. Phase 3 (Intelligence) — stages 1–6 implemented on `feat/ph3-intelligence-ui` (catalog cache, incremental refresh, semantic analyzer, completion, hover, intelligence UI); interactive stage-6 boxes and the PR merge are pending. **See docs/PROGRESS.md for current status.**
 
 ## Locked Decisions
 
@@ -116,4 +116,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 — complete (2026-09-07: rope buffer + tree-sitter tree, palette + three-layer keybindings, editing ops, `EditorView`, execute-statement-under-cursor; all 8 boxes verified). Phase 3 (Intelligence) — next.
+Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 — complete (2026-09-07: rope buffer + tree-sitter tree, palette + three-layer keybindings, editing ops, `EditorView`, execute-statement-under-cursor; all 8 boxes verified). Phase 3 (Intelligence) — stage 6 implemented on `feat/ph3-intelligence-ui`; interactive boxes and PR merge pending.

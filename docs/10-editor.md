@@ -164,9 +164,11 @@ impl SyntaxTree {
 
 ### EditorView
 
-`EditorView` is a GPUI view component. It owns cursor state, scroll position, and rendering logic. It holds a reference (or handle) to the `Buffer` and subscribes to `BufferChanged` events to trigger re-renders.
+`EditorView` is a GPUI view component. It owns cursor state, scroll position, and rendering logic. It holds the `Buffer` and publishes an immutable text snapshot (`AppEvent::BufferChanged`) after edits, which the intelligence layer mirrors for background analysis.
 
-**Implementation notes (2026-09-05):** `tempr_ui::components::EditorView` owns the `Buffer` directly for now (no `BufferChanged` publisher yet — TODO) and renders a `uniform_list` of lines: gutter numbers with a current-line tint, tree-sitter highlights via `theme::highlight_color(HighlightKind)` (nested captures override enclosing ones), multi-cursor selections/cursors painted per line (a selection covering only a newline paints a strip to the right edge), IME through `EntityInputHandler` — the input handler is hosted by the primary cursor's line, or by the first visible line when that cursor is scrolled off-screen, so typing is never dropped. Mouse click places the cursor. 33 keyboard commands (key context `Editor`) drive motions (plain left/right collapse a selection to its edge; word/line/document motions move from the head), edit ops, undo/redo (selections restored), clipboard and line ops; `EditorEvent::{Changed, Run(sql), Notice}` — ctrl-enter runs the statement under the cursor (selection wins; `StatementKind::Error` is refused; cursor at end of the last statement counts as inside it), ctrl-shift-enter runs everything. Not yet: horizontal scroll/wrapping, search, adding cursors, gutter run buttons.
+**Implementation notes (2026-10-21):** the view still owns the `Buffer` — it is the only writer — and `MainWindow` publishes `BufferChanged { file }` after every `EditorEvent::Changed`. The view keeps a 100 ms debounce; when it elapses it asks `IntelligenceService` to analyze that exact snapshot revision and stores the resulting `Analysis` only if the revision still matches. Rendering adds diagnostic underline runs, the hover card, and the completion popup on top of the line/selection layer; f8 / shift-f8 jump to the next/previous diagnostic; ctrl-space, ctrl-k ctrl-i fire completion and hover through the service. See [12 — SQL Intelligence](./12-sql-intelligence.md) for the surfaces.
+
+**Implementation notes (2026-09-05):** `tempr_ui::components::EditorView` owns the `Buffer` directly (it is the sole writer; `MainWindow` publishes snapshots) and renders a `uniform_list` of lines: gutter numbers with a current-line tint, tree-sitter highlights via `theme::highlight_color(HighlightKind)` (nested captures override enclosing ones), multi-cursor selections/cursors painted per line (a selection covering only a newline paints a strip to the right edge), IME through `EntityInputHandler` — the input handler is hosted by the primary cursor's line, or by the first visible line when that cursor is scrolled off-screen, so typing is never dropped. Mouse click places the cursor. 33 keyboard commands (key context `Editor`) drive motions (plain left/right collapse a selection to its edge; word/line/document motions move from the head), edit ops, undo/redo (selections restored), clipboard and line ops; `EditorEvent::{Changed, Run(sql), Notice}` — ctrl-enter runs the statement under the cursor (selection wins; `StatementKind::Error` is refused; cursor at end of the last statement counts as inside it), ctrl-shift-enter runs everything. Not yet: horizontal scroll/wrapping, search, adding cursors, gutter run buttons.
 
 ```rust
 pub struct EditorView {
@@ -226,32 +228,31 @@ flowchart TD
     C --> F[ropey: apply edit to Rope]
     F --> G[tree-sitter: incremental reparse]
     G --> H[Update highlight cache]
-    H --> I[Publish BufferChanged event]
-
-    I --> J[IntelligenceService receives BufferChanged]
-    J --> K[Incremental semantic re-analysis]
-    K --> L[Update diagnostics]
-    K --> M[Refresh completion context]
-
-    I --> N[EditorView receives notification]
-    N --> O[Mark view as dirty]
-    O --> P[GPUI: re-render visible lines]
+    H --> I[MainWindow publishes BufferChanged file id]
+    H --> J[EditorView debounces 100 ms]
+    J --> K[IntelligenceService.analyze file revision text]
+    K --> L[Mirror snapshot into service-owned Buffer]
+    L --> M[Scope resolution + diagnostics cached by revision]
+    M --> R[DiagnosticsReady published]
+    R --> S[MainWindow updates status, view stores analysis]
+    I --> N[Mark view as dirty]
+    N --> O[GPUI: re-render visible lines]
 
     D --> Q[Update cursor positions]
-    Q --> P
+    Q --> O
 
-    E --> R[CommandService dispatches to handler]
-    R --> S[run_statement / keyword_case / snippet / etc.]
+    E --> T[CommandService dispatches to handler]
+    T --> U[run_statement / keyword_case / snippet / etc.]
 
     style A fill:#4a9eff,color:#fff
     style I fill:#e74c3c,color:#fff
-    style P fill:#2ecc71,color:#fff
+    style O fill:#2ecc71,color:#fff
 ```
 
 Key properties of this pipeline:
 
-- **The Buffer never publishes events directly.** `Buffer::edit` updates the rope, records the edit on the syntax tree (the incremental re-parse runs on the next tree read), then returns. The caller (typically the GPUI view's event handler) publishes `BufferChanged` through the `EventBus`. This keeps the `Buffer` free of event-bus dependencies and simplifies testing.
-- **The IntelligenceService receives the event asynchronously.** It may run on the main thread (for trivial re-analysis) or be deferred to a background task (for large files). The latency budget for completion remains under 5 ms regardless, because the `CatalogCache` is in-memory and the tree-sitter reparse is incremental.
+- **The Buffer never publishes events directly.** `Buffer::edit` updates the rope, records the edit on the syntax tree (the incremental re-parse runs on the next tree read), then returns. The owner (`MainWindow`) publishes `BufferChanged { file }` through the `EventBus`. This keeps the `Buffer` free of event-bus dependencies and simplifies testing.
+- **Analysis is asynchronous and snapshot-based.** The event carries only the file id, so the view makes its own debounced (100 ms idle) hand-off: it clones the text under the current `Buffer::revision` and sends it to `IntelligenceService::analyze` from a background task. The service mirrors the text into its own `Buffer` and caches the result under that revision, so no frame borrows the view's buffer. Completion and hover stay synchronous calls into the in-memory `SemanticEngine` (under 5 ms), which shares the same catalog cache.
 - **The view re-renders only if the highlight map changed.** For cursor-only movements (arrow keys), the view updates cursor positions without recomputing highlights — a fast path that avoids unnecessary work on the most frequent interaction.
 
 ---
@@ -266,11 +267,11 @@ Key properties of this pipeline:
 
 3. **Highlights recomputed.** The buffer runs the tree-sitter highlights query against the new tree and produces a `HighlightCache` — a list of `(byte_range, highlight_type)` tuples covering the visible viewport. Only visible lines are queried.
 
-4. **BufferChanged published.** The buffer's owner (view handler or editor service — never the buffer) publishes `BufferChanged { file: SqlFileId }` to the `EventBus`. This event carries no payload beyond the file ID — per the event system's payload rule ([06-event-system.md](06-event-system.md)).
+4. **BufferChanged published.** The buffer's owner (`MainWindow`, on `EditorEvent::Changed` — never the buffer) publishes `BufferChanged { file }` to the `EventBus`. This event carries no payload beyond the file ID — per the event system's payload rule ([06-event-system.md](06-event-system.md)).
 
-5. **IntelligenceService reacts.** The intelligence service receives `BufferChanged` and triggers incremental re-analysis of the buffer's semantic state: scope resolution, alias tracking, diagnostic generation. The parse tree is accessed through `Buffer::syntax()` without copying.
+5. **IntelligenceService reacts.** The view, not the event, drives analysis: 100 ms after the last edit it clones the text snapshot and calls `IntelligenceService::analyze(file, revision, &text)` from a background task. The service mirrors the snapshot into its own `Buffer`, resolves scope, and caches the `Analysis` under that revision; only an exact-revision result is handed back to the view (via `DiagnosticsReady` + `IntelligenceService::analysis`).
 
-6. **View re-renders.** `EditorView` receives the notification that its buffer changed, marks itself dirty, and GPUI calls `render()` on the next frame. The render method iterates visible lines, applies highlight captures, draws cursors and selections, and returns the element tree.
+6. **View re-renders.** `EditorView` marks itself dirty for the edit and again when the analysis arrives, and GPUI calls `render()` on the next frame. The render method iterates visible lines, applies highlight captures, draws cursors and selections (plus diagnostic underlines, the hover card, and the completion popup when active), and returns the element tree.
 
 ### Statement Execution Flow
 
