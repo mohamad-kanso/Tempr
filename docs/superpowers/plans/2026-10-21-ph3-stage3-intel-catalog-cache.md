@@ -24,6 +24,12 @@
 
 ---
 
+## Execution notes (2026-10-21, closing the stage)
+
+Tasks 1-3 executed in one feat commit: the crate is a single compile unit, so every task's failing-compile step was shared; tests per task were still written before their implementation step and each task's verification ran green before the next. Task 4's probe deviates from its step list only in the synthetic size (1 200 relations × 8 columns + 1 200 indexes + 800 functions ≈ 12 800 objects instead of the sketch's 9 500) and in searching prefix `rel` (no name starts with `u` in the synthetic set, so that early assertion would have been vacuous). The column lookups are the symmetric `column_exact`/`column_folded` pair instead of the single `column_by_folded_name`̀. Security note: `cargo deny` flagged the rustls/webpki vulnerabilities mid-stage; the patch bumps + zbus-trio ignores land in the same PR (`fix(security)` commit).
+
+---
+
 ## File Structure
 
 | File | Responsibility in this stage |
