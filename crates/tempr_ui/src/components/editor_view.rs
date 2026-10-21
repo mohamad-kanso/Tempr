@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
@@ -18,6 +19,8 @@ use gpui::{
 use tempr_domain::SqlFileId;
 use tempr_editor::edit_ops::LineDirection;
 use tempr_editor::{Buffer, Highlight, HighlightKind, Selection, StatementKind};
+use tempr_intel::{Analysis, Severity};
+use tempr_services::IntelligenceService;
 
 use crate::theme;
 
@@ -57,6 +60,10 @@ actions!(
         MoveLineUp,
         MoveLineDown,
         RunAll,
+        TriggerCompletion,
+        Hover,
+        NextDiagnostic,
+        PrevDiagnostic,
     ]
 );
 
@@ -85,6 +92,10 @@ struct LineLayout {
 
 pub struct EditorView {
     buffer: Buffer,
+    intelligence: Arc<IntelligenceService>,
+    /// Latest diagnostics for this buffer, tagged with the source revision
+    /// they describe. Stale pairs are never rendered.
+    analysis: Option<(u64, Arc<Analysis>)>,
     selections: Vec<Selection>,
     goal_column: Option<usize>,
     marked_range: Option<Range<usize>>,
@@ -103,10 +114,36 @@ pub struct EditorView {
 
 impl EventEmitter<EditorEvent> for EditorView {}
 
+/// Counts shown in the status bar after `DiagnosticsReady`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiagnosticsSummary {
+    pub errors: usize,
+    pub warnings: usize,
+}
+
+impl DiagnosticsSummary {
+    /// "2 errors · 1 warning" — the status-bar form.
+    pub fn text(&self) -> String {
+        format!(
+            "{} {} · {} {}",
+            self.errors,
+            plural(self.errors, "error", "errors"),
+            self.warnings,
+            plural(self.warnings, "warning", "warnings"),
+        )
+    }
+}
+
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
+}
+
 impl EditorView {
-    pub fn new(text: &str, cx: &mut Context<Self>) -> Self {
+    pub fn new(text: &str, intelligence: Arc<IntelligenceService>, cx: &mut Context<Self>) -> Self {
         Self {
             buffer: Buffer::new(SqlFileId::new(), text),
+            intelligence,
+            analysis: None,
             selections: vec![Selection::cursor(0)],
             goal_column: None,
             marked_range: None,
@@ -124,6 +161,53 @@ impl EditorView {
 
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
+    }
+
+    pub fn file_id(&self) -> SqlFileId {
+        self.buffer.file_id()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.buffer.revision()
+    }
+
+    pub fn intelligence(&self) -> &Arc<IntelligenceService> {
+        &self.intelligence
+    }
+
+    /// The current analysis, but only while it describes the text on screen.
+    pub fn analysis(&self) -> Option<&Arc<Analysis>> {
+        match &self.analysis {
+            Some((revision, analysis)) if *revision == self.buffer.revision() => Some(analysis),
+            _ => None,
+        }
+    }
+
+    /// Window-space caret box from the last painted line layouts. `None`
+    /// before the first frame or when the caret's line was not laid out.
+    pub fn caret_bounds(&self) -> Option<Bounds<Pixels>> {
+        let head = self.primary().head;
+        let line = self.buffer.point_for_offset(head).line;
+        let layout = self.line_layouts.get(&line)?;
+        let index = head.checked_sub(layout.start)?;
+        let x = layout.shaped.x_for_index(index);
+        Some(Bounds::new(
+            point(layout.bounds.left() + x, layout.bounds.top()),
+            size(px(2.), layout.bounds.size.height),
+        ))
+    }
+
+    pub fn diagnostics_summary(&self) -> DiagnosticsSummary {
+        let mut summary = DiagnosticsSummary::default();
+        if let Some(analysis) = self.analysis() {
+            for diagnostic in &analysis.diagnostics {
+                match diagnostic.severity {
+                    Severity::Error => summary.errors += 1,
+                    Severity::Warning => summary.warnings += 1,
+                }
+            }
+        }
+        summary
     }
 
     pub fn selections(&self) -> &[Selection] {

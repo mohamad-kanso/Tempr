@@ -6,7 +6,7 @@
 //! channel that a view drains with `cx.spawn`.
 
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
-use tempr_domain::{ConnectionId, ConnectionState, QueryOutcome, QueryRunId};
+use tempr_domain::{ConnectionId, ConnectionState, QueryOutcome, QueryRunId, SqlFileId};
 use tempr_events::{AppEvent, AppEventKind, EventBus, EventFilter, Subscription};
 
 /// UI-facing projection of the bus events a view reacts to.
@@ -27,6 +27,17 @@ pub enum UiEvent {
         run: QueryRunId,
         outcome: QueryOutcome,
     },
+    /// A background analysis finished for `file`. The view checks the
+    /// revision before trusting the result.
+    DiagnosticsReady {
+        file: SqlFileId,
+    },
+    /// A manual or automatic schema refresh failed; the previous catalog is
+    /// still installed.
+    SchemaRefreshFailed {
+        connection: ConnectionId,
+        message: String,
+    },
 }
 
 impl UiEvent {
@@ -45,6 +56,14 @@ impl UiEvent {
                 run: *run,
                 outcome: outcome.clone(),
             },
+            AppEvent::DiagnosticsReady { file } => Self::DiagnosticsReady { file: *file },
+            AppEvent::SchemaRefreshFailed {
+                connection,
+                message,
+            } => Self::SchemaRefreshFailed {
+                connection: *connection,
+                message: message.clone(),
+            },
             _ => return None,
         })
     }
@@ -59,6 +78,8 @@ pub fn bridge(bus: &EventBus) -> (Subscription, UnboundedReceiver<UiEvent>) {
         AppEventKind::QueryStarted,
         AppEventKind::RowsReceived,
         AppEventKind::QueryFinished,
+        AppEventKind::DiagnosticsReady,
+        AppEventKind::SchemaRefreshFailed,
     ]);
     let sub = bus.subscribe(filter, move |event| {
         if let Some(ui) = UiEvent::from_app(event) {
@@ -87,6 +108,26 @@ mod tests {
                 id: WorkspaceId::new()
             }),
             None
+        );
+    }
+
+    #[test]
+    fn maps_intelligence_events() {
+        let file = SqlFileId::new();
+        assert_eq!(
+            UiEvent::from_app(&AppEvent::DiagnosticsReady { file }),
+            Some(UiEvent::DiagnosticsReady { file })
+        );
+        let connection = ConnectionId::new();
+        assert_eq!(
+            UiEvent::from_app(&AppEvent::SchemaRefreshFailed {
+                connection,
+                message: "boom".to_string(),
+            }),
+            Some(UiEvent::SchemaRefreshFailed {
+                connection,
+                message: "boom".to_string(),
+            })
         );
     }
 

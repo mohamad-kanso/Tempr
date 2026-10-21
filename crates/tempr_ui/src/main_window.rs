@@ -18,7 +18,10 @@ use tempr_domain::{
     Batch, ColumnSpec, Connection, ConnectionId, ConnectionState, QueryOutcome, QueryRunId,
 };
 use tempr_events::EventBus;
-use tempr_services::{CommandService, ConnectionService, QueryService, RowSink, ServiceError};
+use tempr_services::{
+    CommandService, ConnectionService, IntelligenceService, QueryService, RowSink, SchemaService,
+    ServiceError,
+};
 
 use crate::commands;
 use crate::components::{EditorEvent, EditorView, Palette, PaletteEvent, ResultGrid};
@@ -37,6 +40,10 @@ actions!(
         Quit
     ]
 );
+
+// Schema actions live under the `schema::` id prefix (catalog contract);
+// the types are imported here because the window owns their handlers.
+actions!(schema, [Refresh, RefreshIncremental, RefreshAllSchemas]);
 
 pub const KEY_CONTEXT: &str = "MainWindow";
 /// Binding context for main-window commands: active only while no overlay
@@ -84,6 +91,8 @@ pub struct Services {
     pub connection: Arc<ConnectionService>,
     pub query: Arc<QueryService>,
     pub command: Arc<CommandService>,
+    pub schema: Arc<SchemaService>,
+    pub intelligence: Arc<IntelligenceService>,
 }
 
 /// Outcome of the tokio-side query task, as seen by the view.
@@ -119,7 +128,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let editor = cx.new(|cx| EditorView::new("", cx));
+        let editor = cx.new(|cx| EditorView::new("", services.intelligence.clone(), cx));
         let grid = cx.new(|_| ResultGrid::new());
         let command_service = services.command.clone();
         let palette = cx.new(|cx| Palette::new(command_service, window, cx));

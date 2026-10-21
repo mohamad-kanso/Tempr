@@ -13,7 +13,8 @@ use tempr_db_postgres::PostgresDriver;
 use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode};
 use tempr_events::{EventBus, EventFilter};
 use tempr_services::{
-    CommandService, ConnectionService, QueryService, SchemaService, ServiceRegistry,
+    CommandService, ConnectionService, IntelligenceService, QueryService, SchemaService,
+    ServiceRegistry,
 };
 use tempr_ui::{DevOptions, Services, gpui_compat};
 
@@ -26,7 +27,8 @@ struct AppServices {
     connection: Arc<ConnectionService>,
     query: Arc<QueryService>,
     command: Arc<CommandService>,
-    _schema: Arc<SchemaService>,
+    schema: Arc<SchemaService>,
+    intelligence: Arc<IntelligenceService>,
 }
 
 fn build_services() -> AppServices {
@@ -43,6 +45,7 @@ fn build_services() -> AppServices {
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
         ));
     let schema = SchemaService::with_cache(bus.clone(), connection.clone(), storage);
+    let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
     let command = CommandService::new(bus.clone());
 
     let pg_driver = Arc::new(PostgresDriver::new()) as Arc<dyn DatabaseDriver>;
@@ -51,6 +54,7 @@ fn build_services() -> AppServices {
     registry.register(connection.clone());
     registry.register(query.clone());
     registry.register(schema.clone());
+    registry.register(intelligence.clone());
     registry.register(command.clone());
 
     AppServices {
@@ -59,7 +63,8 @@ fn build_services() -> AppServices {
         connection,
         query,
         command,
-        _schema: schema,
+        schema,
+        intelligence,
     }
 }
 
@@ -251,6 +256,8 @@ fn main() -> Result<()> {
             connection: services.connection.clone(),
             query: services.query.clone(),
             command: services.command.clone(),
+            schema: services.schema.clone(),
+            intelligence: services.intelligence.clone(),
         };
         if let Err(e) =
             gpui_compat::open_main_window(cx, "Tempr", throttle_inactive, move |window, cx| {

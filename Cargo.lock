@@ -5962,6 +5962,7 @@ dependencies = [
  "tempr_domain",
  "tempr_editor",
  "tempr_events",
+ "tempr_intel",
  "tempr_services",
  "tokio",
  "tracing",

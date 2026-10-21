@@ -13,6 +13,7 @@ use gpui::{Action, App, KeyBinding, Keystroke, Window};
 use tempr_domain::CommandId;
 use tempr_services::{CommandContribution, CommandService};
 
+use crate::components::completion_popup as completion;
 use crate::components::editor_view as ed;
 use crate::components::input;
 use crate::components::palette;
@@ -121,6 +122,9 @@ const MW: Option<&str> = Some(main_window::KEY_CONTEXT_NOT_PALETTE);
 const IN: Option<&str> = Some(input::KEY_CONTEXT);
 const PAL: Option<&str> = Some(palette::KEY_CONTEXT);
 const ED: Option<&str> = Some(ed::KEY_CONTEXT);
+/// Completion bindings share one context that only exists while the popup is
+/// open; every command carrying it is hidden from palette search.
+const COMPL: Option<&str> = Some(completion::KEY_CONTEXT);
 
 /// Every core command. Order here is only the fallback for the palette
 /// (it sorts by category/title anyway).
@@ -143,6 +147,25 @@ pub fn core_commands() -> Vec<CommandSpec> {
             "View",
             MW,
             &["ctrl-shift-b", "cmd-shift-b"],
+        ),
+        // Schema (Phase 3 stage 6)
+        spec::<mw::Refresh>(
+            "Schema: Refresh",
+            "Schema",
+            MW,
+            &["ctrl-shift-r", "cmd-shift-r"],
+        ),
+        spec::<mw::RefreshIncremental>(
+            "Schema: Refresh (Incremental)",
+            "Schema",
+            MW,
+            &["ctrl-alt-r", "cmd-alt-r"],
+        ),
+        spec::<mw::RefreshAllSchemas>(
+            "Schema: Refresh All Schemas",
+            "Schema",
+            MW,
+            &["ctrl-alt-shift-r", "cmd-alt-shift-r"],
         ),
         // Application
         spec::<mw::Quit>("Quit", "Application", None, &["ctrl-q", "cmd-q"]),
@@ -241,6 +264,31 @@ pub fn core_commands() -> Vec<CommandSpec> {
         ),
         spec::<ed::MoveLineUp>("Editor: Move Line Up", "Editor", ED, &["alt-up"]),
         spec::<ed::MoveLineDown>("Editor: Move Line Down", "Editor", ED, &["alt-down"]),
+        // Intelligence (Phase 3 stage 6)
+        spec::<ed::TriggerCompletion>("Editor: Trigger Completion", "Editor", ED, &["ctrl-space"]),
+        spec::<ed::Hover>("Editor: Show Hover", "Editor", ED, &["ctrl-k ctrl-i"]),
+        spec::<ed::NextDiagnostic>("Editor: Next Diagnostic", "Editor", ED, &["f8"]),
+        spec::<ed::PrevDiagnostic>("Editor: Previous Diagnostic", "Editor", ED, &["shift-f8"]),
+        // Completion popup: only bound while the popup is open, never
+        // searchable (a closed popup must not consume enter/tab/escape).
+        spec::<completion::Next>(
+            "Completion: Next Item",
+            "Completion",
+            COMPL,
+            &["down", "ctrl-n"],
+        )
+        .hidden(),
+        spec::<completion::Prev>(
+            "Completion: Previous Item",
+            "Completion",
+            COMPL,
+            &["up", "ctrl-p"],
+        )
+        .hidden(),
+        spec::<completion::Accept>("Completion: Accept", "Completion", COMPL, &["enter", "tab"])
+            .hidden(),
+        spec::<completion::Dismiss>("Completion: Dismiss", "Completion", COMPL, &["escape"])
+            .hidden(),
         // Edit (single-line Input — now only the palette's query box, so
         // hidden from search: they cannot fire from the editor)
         spec::<input::Backspace>("Edit: Backspace", "Edit", IN, &["backspace"]).hidden(),
@@ -378,6 +426,52 @@ mod tests {
     fn actions_round_trip_to_their_ids() {
         for s in core_commands() {
             assert_eq!(s.action().name(), s.id.as_str());
+        }
+    }
+
+    #[test]
+    fn completion_commands_are_hidden_and_scoped_to_the_open_popup() {
+        let specs = core_commands();
+        let completion: Vec<&CommandSpec> = specs
+            .iter()
+            .filter(|s| s.id.as_str().starts_with("completion::"))
+            .collect();
+        assert_eq!(completion.len(), 4, "next, prev, accept, dismiss");
+        for s in completion {
+            assert!(s.hidden, "{} must not appear in palette search", s.id);
+            assert_eq!(
+                s.context,
+                Some("Editor Completion"),
+                "{} must only fire while the popup is open",
+                s.id
+            );
+        }
+        for s in specs
+            .iter()
+            .filter(|s| s.context == Some("Editor Completion"))
+        {
+            assert!(
+                s.id.as_str().starts_with("completion::"),
+                "{} uses the popup context but is not a completion command",
+                s.id
+            );
+        }
+    }
+
+    #[test]
+    fn intelligence_and_schema_commands_are_reachable_by_key() {
+        for id in [
+            "editor::TriggerCompletion",
+            "editor::Hover",
+            "editor::NextDiagnostic",
+            "editor::PrevDiagnostic",
+            "schema::Refresh",
+            "schema::RefreshIncremental",
+            "schema::RefreshAllSchemas",
+        ] {
+            let spec = find(&CommandId::from(id)).unwrap_or_else(|| panic!("{id} missing"));
+            assert!(!spec.hidden, "{id} must be palette-searchable");
+            assert!(!spec.default_keystrokes.is_empty(), "{id} needs a key");
         }
     }
 
