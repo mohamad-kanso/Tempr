@@ -507,6 +507,22 @@ impl CatalogCache {
             .unwrap_or_default()
     }
 
+    /// Every relation in one schema, folded compare, sorted by (name, arena
+    /// index) so schema-dot completion is deterministic. Empty for a schema
+    /// the catalog does not cover (spec §4.4: off-`search_path` schemas are
+    /// never introspected by default).
+    pub fn relations_in_schema(&self, schema: &str) -> Vec<u32> {
+        let folded = fold(schema);
+        let mut found: Vec<(Box<str>, u32)> = self
+            .relations_by_folded_name
+            .iter()
+            .filter(|((s, _), _)| *s == folded)
+            .flat_map(|((_, name), indices)| indices.iter().map(move |idx| (name.clone(), *idx)))
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, idx)| idx).collect()
+    }
+
     /// The contiguous, ordinal-ordered column slice of one relation. Empty
     /// for a relation with no introspected columns or for a function index.
     pub fn columns_of(&self, rel_idx: u32) -> &[CatalogEntry] {

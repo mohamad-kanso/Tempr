@@ -7,6 +7,7 @@ pub mod history;
 pub mod ids;
 pub mod query;
 pub mod schema;
+pub mod text;
 pub mod workspace;
 
 pub use command::{CommandId, KeybindingOverrides};
@@ -20,4 +21,5 @@ pub use query::{
     Batch, ColumnMeta, ColumnSpec, Query, QueryOutcome, QueryRun, ResultSet, Value, ValueType,
 };
 pub use schema::{SchemaFingerprintRecord, SchemaObject, SchemaObjectKind, SchemaSnapshot};
+pub use text::{FuzzyMatch, fuzzy_match};
 pub use workspace::{SqlFile, Workspace, WorkspaceSettings};

@@ -14,7 +14,8 @@ use parking_lot::RwLock;
 use tempr_domain::CommandId;
 use tempr_events::{AppEvent, EventBus};
 
-use crate::fuzzy::{FuzzyMatch, fuzzy_match};
+use tempr_domain::text::{FuzzyMatch, fuzzy_match};
+
 use crate::{Service, ServiceError};
 
 /// Registration record for one command.

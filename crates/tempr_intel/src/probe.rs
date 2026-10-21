@@ -22,6 +22,8 @@ use tempr_domain::ids::{ConnectionId, SchemaObjectId, SchemaSnapshotId};
 use tempr_domain::schema::{SchemaObject, SchemaObjectKind, SchemaSnapshot};
 
 use super::CatalogCache;
+use super::completion::CompletionRequest;
+use super::semantic::SemanticEngine;
 
 const RELATIONS: usize = 1200;
 const COLUMNS_PER_RELATION: usize = 8;
@@ -210,4 +212,75 @@ fn probe_catalog_build_hot_path_and_tcat_load() {
         ),
         tcat_times,
     );
+}
+
+/// Completion p99 on the same 10 000-object catalog (spec §8's hard budget).
+/// Warm requests: the analysis cache is valid across iterations (buffer
+/// revision unchanged), which is the steady state typing produces. The first
+/// request per buffer (reparse + analyze) is reported separately as "cold".
+#[test]
+#[ignore = "release-only timing probe"]
+fn probe_completion_latency() {
+    use tempr_domain::SqlFileId;
+    use tempr_editor::Buffer;
+
+    let snapshot = synthetic_snapshot();
+    let engine = SemanticEngine::new(std::sync::Arc::new(CatalogCache::from_snapshot(&snapshot)));
+
+    let cases = [
+        (
+            "relation prefix (200 of 1 200 relations)",
+            "select * from rel_0001",
+        ),
+        ("expression column prefix", "select col_ from rel_000999"),
+        (
+            "qualifier dot (columns of one binding)",
+            "select * from rel_000999 r where r.",
+        ),
+        (
+            "schema dot (all relations of a schema)",
+            "select * from public.",
+        ),
+        ("ctrl-space, empty relation prefix", "select * from "),
+        ("function prefix", "select func_ from "),
+    ];
+
+    for (label, sql) in cases {
+        let mut buffer = Buffer::new(SqlFileId::new(), sql);
+        let file = buffer.file_id();
+        let offset = buffer.len();
+
+        // Cold: first request analyzes the buffer.
+        let start = std::time::Instant::now();
+        let items = engine.complete(CompletionRequest {
+            file,
+            buffer: &mut buffer,
+            offset,
+            explicit: true,
+        });
+        let cold = start.elapsed();
+        assert!(!items.is_empty(), "{label}: candidates");
+
+        let mut times = Vec::with_capacity(RUNS as usize);
+        for _ in 0..RUNS {
+            let start = std::time::Instant::now();
+            let items = engine.complete(CompletionRequest {
+                file,
+                buffer: &mut buffer,
+                offset,
+                explicit: true,
+            });
+            times.push(start.elapsed());
+            assert!(!items.is_empty(), "{label}: candidates");
+        }
+        let (p50, p95, p99, max) = percentiles(times);
+        println!(
+            "{label}: cold {} · warm p50 {} · p95 {} · p99 {} · max {}",
+            ms(cold),
+            ms(p50),
+            ms(p95),
+            ms(p99),
+            ms(max)
+        );
+    }
 }

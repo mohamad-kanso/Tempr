@@ -146,6 +146,14 @@ impl SemanticEngine {
 
         let mut scopes = Vec::new();
         for region in regions(tree.root_node()) {
+            if region.kind() == "ERROR" {
+                // A bare top-level fragment is not a statement: report it and
+                // keep it out of the scope list, so `scope_chain` falls back
+                // to the statement the fragment trails (completion needs the
+                // bindings of a half-typed clause).
+                walker.push_syntax_error(region);
+                continue;
+            }
             scopes.push(walker.walk_region(region, &Vec::new()));
         }
 
