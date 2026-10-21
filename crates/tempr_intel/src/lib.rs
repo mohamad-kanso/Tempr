@@ -8,9 +8,11 @@
 #![deny(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod analysis;
 pub mod catalog;
 
 #[cfg(test)]
 mod probe;
 
+pub use analysis::{Analysis, Binding, ColumnRef, Diagnostic, DiagnosticKind, Scope, Severity};
 pub use catalog::{CatalogCache, CatalogEntry, CatalogStats};
