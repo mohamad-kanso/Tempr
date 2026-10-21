@@ -18,6 +18,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::ops::Range;
 
@@ -278,7 +279,7 @@ fn complete_with(
     offset: usize,
     explicit: bool,
 ) -> Vec<CompletionItem> {
-    let scopes = frame_chain(analysis, offset);
+    let scopes = frame_chain(analysis, buffer, offset);
     let statement_start = analysis
         .scopes
         .iter()
@@ -302,7 +303,7 @@ fn complete_with(
 
     let generator = Generator {
         catalog,
-        loaded: catalog.stats().relations > 0,
+        loaded: !catalog.is_empty(),
         scopes,
     };
     let candidates = generator.generate(&cursor);
@@ -312,9 +313,13 @@ fn complete_with(
 /// Scopes visible at the cursor, innermost first. A trailing incomplete
 /// clause leaves the statement as a top-level `ERROR` sibling (probe
 /// finding), so an empty chain falls back to the statement it trails —
-/// otherwise `select * from users u where ` would lose its bindings.
-fn frame_chain(analysis: &Analysis, offset: usize) -> Vec<&Scope> {
-    let chain = analysis.scope_chain(offset);
+/// otherwise `select * from users u where ` would lose its bindings. The
+/// fallback stops at a statement separator: an `ERROR`-only statement (say
+/// `select * frm ` after a `;`) must not borrow the previous statement's
+/// bindings.
+fn frame_chain<'a>(analysis: &'a Analysis, buffer: &Buffer, offset: usize) -> Vec<&'a Scope> {
+    let mut chain = analysis.scope_chain(offset);
+    chain.reverse();
     if !chain
         .iter()
         .all(|s| s.bindings.is_empty() && s.ctes.is_empty())
@@ -327,18 +332,37 @@ fn frame_chain(analysis: &Analysis, offset: usize) -> Vec<&Scope> {
         .rev()
         .find(|scope| scope.range.start <= offset)
     {
-        Some(scope) => vec![scope],
-        None => chain,
+        Some(scope) if !trails_a_statement(buffer, scope.range.end, offset) => vec![scope],
+        _ => chain,
     }
+}
+
+/// Does the text between the candidate scope's end and the cursor contain a
+/// statement separator? Comments and strings are not special-cased: a `;`
+/// there still means the fragment is a new statement in every realistic
+/// substitute for this test.
+fn trails_a_statement(buffer: &Buffer, end: usize, offset: usize) -> bool {
+    let end = end.min(offset).min(buffer.len());
+    buffer
+        .slice(end..offset)
+        .map_or(true, |text| text.contains(';'))
 }
 
 // === Context classification ===
 
 /// Classify the text from the statement start to the cursor.
 fn cursor_context(prefix: &str, base: usize) -> CursorContext {
-    let word_start = word_start(prefix);
+    let mut word_start = word_start(prefix);
+    // An unterminated quoted identifier: include the opening quote in the
+    // replacement range, so accepting `users` replaces `"us` instead of
+    // leaving a dangling quote. Matching uses the text after the quote.
+    let mut typed_start = word_start;
+    if let Some(quote) = open_quote_before(prefix, word_start) {
+        word_start = quote;
+        typed_start = quote + 1;
+    }
     let qualifier = qualifier_before(prefix, word_start);
-    let typed = &prefix[word_start..];
+    let typed = &prefix[typed_start..];
     let context = match &qualifier {
         Some((parts, _)) => CompletionContext::Qualifier(parts.clone()),
         None => classify(&tokenize(&prefix[..word_start])),
@@ -348,6 +372,30 @@ fn cursor_context(prefix: &str, base: usize) -> CursorContext {
         word: base + word_start..base + prefix.len(),
         prefix: typed.to_string(),
     }
+}
+
+/// Index of the `"` that opens an unterminated quoted identifier ending at
+/// `word_start`, if the cursor is inside one. Doubled (`""`) quotes are
+/// escapes and do not change the parity.
+fn open_quote_before(text: &str, word_start: usize) -> Option<usize> {
+    let prefix = &text[..word_start];
+    if !prefix.ends_with('"') {
+        return None;
+    }
+    let bytes = prefix.as_bytes();
+    let mut quotes = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            quotes += 1;
+        }
+        i += 1;
+    }
+    (quotes % 2 == 1).then_some(word_start - 1)
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -628,13 +676,13 @@ fn classify(tokens: &[Token]) -> CompletionContext {
         Token::Comma => {
             if paren_depth(tokens) > 0 {
                 CompletionContext::Expression
-            } else if matches!(
-                nearest_clause(tokens).as_deref(),
-                Some("from" | "join" | "update" | "into")
-            ) {
-                CompletionContext::Relation
             } else {
-                CompletionContext::Expression
+                match nearest_clause(tokens).as_deref() {
+                    Some("from" | "join" | "update" | "into") => CompletionContext::Relation,
+                    // `with a as (...), ` names the next CTE.
+                    Some("with") => CompletionContext::Alias,
+                    _ => CompletionContext::Expression,
+                }
             }
         }
         Token::Close => {
@@ -669,7 +717,9 @@ fn paren_depth(tokens: &[Token]) -> usize {
     depth
 }
 
-/// The last clause keyword, scanning backwards.
+/// The last clause keyword at paren depth 0, scanning backwards. Keywords
+/// inside a subquery's parentheses belong to that subquery, not to the
+/// clause the cursor is in.
 fn nearest_clause(tokens: &[Token]) -> Option<String> {
     const CLAUSES: &[&str] = &[
         "select",
@@ -698,13 +748,21 @@ fn nearest_clause(tokens: &[Token]) -> Option<String> {
         "fetch",
         "for",
     ];
-    tokens.iter().rev().find_map(|token| match token {
-        Token::Word(word) => {
-            let folded = word.to_ascii_lowercase();
-            CLAUSES.contains(&folded.as_str()).then_some(folded)
+    let mut depth = 0usize;
+    for token in tokens.iter().rev() {
+        match token {
+            Token::Close => depth += 1,
+            Token::Open => depth = depth.saturating_sub(1),
+            Token::Word(word) if depth == 0 => {
+                let folded = word.to_ascii_lowercase();
+                if CLAUSES.contains(&folded.as_str()) {
+                    return Some(folded);
+                }
+            }
+            _ => {}
         }
-        _ => None,
-    })
+    }
+    None
 }
 
 // === Candidate generation ===
@@ -892,9 +950,15 @@ impl Generator<'_> {
         let bindings: Vec<&Binding> = self.visible_bindings().collect();
         let mut counts: HashMap<String, usize> = HashMap::new();
         for binding in &bindings {
+            // One binding exposing the same output name twice (legal in a
+            // subquery) is not cross-binding ambiguity.
+            let mut own: HashSet<String> = HashSet::new();
             for column in &binding.columns {
                 if let Some((name, _)) = self.column_info(column) {
-                    *counts.entry(name.to_lowercase()).or_insert(0) += 1;
+                    let key = name.to_lowercase();
+                    if own.insert(key.clone()) {
+                        *counts.entry(key).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -942,13 +1006,7 @@ impl Generator<'_> {
                 relations.push(exact);
             }
             for index in relations {
-                self.binding_columns(
-                    &Binding {
-                        object: Some(index),
-                        ..Binding::default()
-                    },
-                    out,
-                );
+                self.catalog_columns(index, Some(last), out);
             }
             return;
         }
@@ -1000,6 +1058,34 @@ impl Generator<'_> {
                 insert: name,
                 kind: CompletionKind::Column,
                 detail: column_detail(ty.as_deref(), owner),
+                weight: WEIGHT_COLUMN,
+            });
+        }
+    }
+
+    /// Columns of a catalog relation resolved by name (`schema.relation.`),
+    /// which has no `Binding` in the analysis to read from.
+    fn catalog_columns(&self, index: u32, owner: Option<&str>, out: &mut Vec<Candidate>) {
+        for entry in self.catalog.columns_of(index) {
+            let CatalogEntry::Column {
+                name,
+                data_type,
+                nullable,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            let ty = if *nullable {
+                data_type.to_string()
+            } else {
+                format!("{data_type} not null")
+            };
+            out.push(Candidate {
+                label: name.to_string(),
+                insert: name.to_string(),
+                kind: CompletionKind::Column,
+                detail: column_detail(Some(&ty), owner),
                 weight: WEIGHT_COLUMN,
             });
         }
@@ -1187,6 +1273,7 @@ mod tests {
             "insert into ",
             "update ",
             "select * from users u, ",
+            "select * from (select 1) x, ",
         ] {
             assert_eq!(context(sql), CompletionContext::Relation, "{sql:?}");
         }
@@ -1204,6 +1291,11 @@ mod tests {
         }
 
         assert_eq!(context("select id as "), CompletionContext::Alias);
+        assert_eq!(
+            context("with c as (select 1), "),
+            CompletionContext::Alias,
+            "a top-level comma after a CTE names the next CTE"
+        );
         assert_eq!(
             context("select u."),
             CompletionContext::Qualifier(vec!["u".into()])
@@ -1263,6 +1355,15 @@ mod tests {
         );
         assert_eq!(cursor.prefix, "em");
         assert_eq!(cursor.word, 9..11);
+    }
+
+    #[test]
+    fn unterminated_quoted_identifier_includes_the_quote_in_the_replacement() {
+        let sql = "select * from \"us";
+        let cursor = cursor_context(sql, 0);
+        assert_eq!(cursor.context, CompletionContext::Relation);
+        assert_eq!(cursor.prefix, "us");
+        assert_eq!(cursor.word, 14..17);
     }
 
     // --- end-to-end completion against a synthetic catalog ---
@@ -1331,7 +1432,7 @@ mod tests {
         let first_relation = items.iter().position(|i| i.kind == CompletionKind::Table);
         let first_keyword = items.iter().position(|i| i.kind == CompletionKind::Keyword);
         assert!(
-            first_relation.is_none_or(|r| r > 0),
+            first_relation.is_some_and(|r| r > 0),
             "columns outrank relations: {:?}",
             labels(&items)
         );
@@ -1360,6 +1461,29 @@ mod tests {
         assert!(got.contains(&"orders"), "{got:?}");
         assert!(!got.contains(&"id"), "no columns after a schema dot");
         assert!(items.iter().all(|i| i.kind == CompletionKind::Table));
+    }
+
+    #[test]
+    fn schema_qualified_relation_dot_offers_its_columns() {
+        let sql = "select * from public.users.";
+        let items = complete(&engine(), sql, sql.len());
+        let mut got = labels(&items);
+        got.sort_unstable();
+        assert_eq!(got, vec!["email", "id", "name"]);
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Column));
+    }
+
+    #[test]
+    fn inner_scope_alias_shadows_the_outer_one() {
+        let sql = "select * from users u where exists (select 1 from orders u where u.";
+        let items = complete(&engine(), sql, sql.len());
+        let mut got = labels(&items);
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["id", "total", "user_id"],
+            "the inner `orders u` wins over the outer `users u`"
+        );
     }
 
     #[test]
@@ -1474,6 +1598,33 @@ mod tests {
         let mut sorted = first.clone();
         sorted.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(&b.label)));
         assert_eq!(labels(&first), labels(&sorted));
+    }
+
+    #[test]
+    fn the_cap_keeps_the_best_candidates() {
+        let candidates = (0..300)
+            .map(|i| candidate(&format!("c{i:03}"), 450))
+            .collect();
+        let ranked = rank(candidates, "", 0..0);
+        assert_eq!(ranked.len(), COMPLETION_LIMIT);
+        assert!(ranked.iter().any(|i| i.label == "c000"));
+        assert!(!ranked.iter().any(|i| i.label == "c299"));
+    }
+
+    #[test]
+    fn an_error_only_statement_does_not_borrow_the_previous_scopes() {
+        let sql = "select * from users u; select * frm ";
+        let items = complete(&engine(), sql, sql.len());
+        let got = labels(&items);
+        assert!(!got.contains(&"email"), "no columns from `users`: {got:?}");
+        assert!(!got.contains(&"u.id"), "no qualified columns: {got:?}");
+    }
+
+    #[test]
+    fn a_duplicate_output_name_in_one_binding_is_not_cross_binding_ambiguity() {
+        let sql = "select * from (select users.id as id, users.email as id from users) c where ";
+        let items = complete(&engine(), sql, sql.len());
+        assert!(labels(&items).contains(&"id"), "{:?}", labels(&items));
     }
 
     #[test]

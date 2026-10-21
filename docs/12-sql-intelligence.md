@@ -485,12 +485,12 @@ Measured budget breakdown for a typical completion request (release, synthetic 1
 
 | Case | p50 | p95 | p99 | max |
 |---|---|---|---|---|
-| Relation prefix (200 of 1 200 relations) | 0.072 ms | 0.078 ms | 0.082 ms | 0.082 ms |
-| Expression column prefix | 0.002 ms | 0.003 ms | 0.003 ms | 0.003 ms |
-| Qualifier dot (one binding's columns) | 0.007 ms | 0.008 ms | 0.009 ms | 0.009 ms |
-| Schema dot (all relations of a schema) | 1.138 ms | 1.351 ms | 1.384 ms | 1.384 ms |
-| ctrl-space, empty relation prefix | 0.003 ms | 0.004 ms | 0.004 ms | 0.004 ms |
-| Function prefix | 0.003 ms | 0.004 ms | 0.004 ms | 0.004 ms |
+| Relation prefix (200 of 1 200 relations) | 0.070 ms | 0.081 ms | 0.091 ms | 0.091 ms |
+| Expression column prefix | 0.002 ms | 0.002 ms | 0.003 ms | 0.003 ms |
+| Qualifier dot (one binding's columns) | 0.008 ms | 0.009 ms | 0.010 ms | 0.010 ms |
+| Schema dot (all relations of a schema) | 1.109 ms | 1.125 ms | 1.138 ms | 1.138 ms |
+| ctrl-space, empty relation prefix | 0.004 ms | 0.005 ms | 0.010 ms | 0.010 ms |
+| Function prefix | 0.004 ms | 0.005 ms | 0.005 ms | 0.005 ms |
 
 Cold (first request per buffer, including the parse + analysis) stayed under 1.7 ms in every case. The **< 5 ms** budget holds with margin; the schema-dot case is the heaviest because it materialises every relation of the schema before ranking.
 

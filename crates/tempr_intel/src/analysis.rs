@@ -239,8 +239,8 @@ impl Analysis {
 
     /// Scopes containing `offset`, outermost first. A child scope wins over
     /// its parent (the cursor is in the innermost region), and at one level
-    /// the latest containing sibling wins, so an offset exactly on a
-    /// statement boundary belongs to the statement that ends there.
+    /// the latest containing sibling wins, so an offset on a shared boundary
+    /// belongs to the later statement (the cursor sits after the separator).
     ///
     /// Completion (and stage 6's hover) use the last element as the cursor's
     /// own frame and the earlier ones as its correlated ancestors.
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_chain_prefers_the_statement_that_ends_on_a_boundary() {
+    fn scope_chain_prefers_the_later_statement_on_a_shared_boundary() {
         let analysis = Analysis {
             scopes: vec![
                 Scope {
@@ -480,14 +480,14 @@ mod tests {
                     ..Scope::default()
                 },
                 Scope {
-                    range: 9..17,
+                    range: 8..16,
                     ..Scope::default()
                 },
             ],
             diagnostics: vec![],
         };
 
-        assert_eq!(analysis.scope_chain(8)[0].range, 0..8);
-        assert_eq!(analysis.scope_chain(9)[0].range, 9..17);
+        assert_eq!(analysis.scope_chain(7)[0].range, 0..8);
+        assert_eq!(analysis.scope_chain(8)[0].range, 8..16);
     }
 }
