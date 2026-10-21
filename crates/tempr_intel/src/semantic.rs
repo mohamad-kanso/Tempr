@@ -28,6 +28,7 @@ use tree_sitter::Node;
 
 use crate::analysis::{Analysis, Binding, ColumnRef, Diagnostic, DiagnosticKind, Scope, Severity};
 use crate::catalog::CatalogCache;
+use crate::hover::HoverInfo;
 
 /// Beyond this many cached analyses the engine self-trims by insertion age;
 /// the stage-6 service evicts per buffer on close anyway.
@@ -128,6 +129,21 @@ impl SemanticEngine {
             },
         );
         analysis
+    }
+
+    /// The hover card for the reference under `offset` (spec §5.3). Reads the
+    /// same cached analysis completion uses; no I/O and no catalog allocation.
+    pub fn hover(&self, file: SqlFileId, buffer: &mut Buffer, offset: usize) -> Option<HoverInfo> {
+        let offset = offset.min(buffer.len());
+        let text = buffer.text().to_string();
+        let reference = crate::hover::reference_at(&text, offset)?;
+        let analysis = self.analyze(file, buffer);
+        let catalog = self.catalog();
+        let contents = crate::hover::resolve(&catalog, &analysis, offset, &reference)?;
+        Some(HoverInfo {
+            contents,
+            range: reference.range,
+        })
     }
 
     fn analyze_now(&self, buffer: &mut Buffer) -> Analysis {

@@ -13,6 +13,7 @@
 pub mod analysis;
 pub mod catalog;
 pub mod completion;
+pub mod hover;
 pub mod semantic;
 
 #[cfg(test)]
@@ -23,4 +24,5 @@ pub use catalog::{CatalogCache, CatalogEntry, CatalogStats};
 pub use completion::{
     CompletionContext, CompletionItem, CompletionKind, CompletionRequest, CursorContext,
 };
+pub use hover::HoverInfo;
 pub use semantic::SemanticEngine;

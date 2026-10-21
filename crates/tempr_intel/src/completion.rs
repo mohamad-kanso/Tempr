@@ -398,11 +398,11 @@ fn open_quote_before(text: &str, word_start: usize) -> Option<usize> {
     (quotes % 2 == 1).then_some(word_start - 1)
 }
 
-fn is_ident_start(c: char) -> bool {
+pub(crate) fn is_ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
-fn is_ident_char(c: char) -> bool {
+pub(crate) fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
@@ -422,7 +422,7 @@ fn word_start(text: &str) -> usize {
 /// The qualifier path before a dot, left to right, plus the byte offset
 /// where it begins. Whitespace around dots is tolerated (`u . id` is valid
 /// PostgreSQL); quoted parts are unquoted for matching.
-fn qualifier_before(text: &str, word_start: usize) -> Option<(Vec<String>, usize)> {
+pub(crate) fn qualifier_before(text: &str, word_start: usize) -> Option<(Vec<String>, usize)> {
     let mut cursor = word_start;
     let mut parts = Vec::new();
     loop {
@@ -448,7 +448,7 @@ fn qualifier_before(text: &str, word_start: usize) -> Option<(Vec<String>, usize
 }
 
 /// Read the identifier ending `text` (already trimmed at the right).
-fn identifier_back(text: &str) -> Option<(String, usize)> {
+pub(crate) fn identifier_back(text: &str) -> Option<(String, usize)> {
     let text = text.trim_end();
     if let Some(body) = text.strip_suffix('"') {
         // Quoted identifier: find the opening quote, honouring "" escapes.
