@@ -129,7 +129,9 @@ pub enum AppEvent {
     RowsReceived { run: QueryRunId, count: usize },
     QueryFinished { run: QueryRunId, outcome: QueryOutcome },
     SchemaRefreshed { connection: ConnectionId, snapshot: SchemaSnapshotId },
+    SchemaRefreshFailed { connection: ConnectionId, message: String },
     BufferChanged { file: SqlFileId },
+    DiagnosticsReady { file: SqlFileId },
 }
 
 /// In-process event bus. Publish is non-blocking; subscribers receive

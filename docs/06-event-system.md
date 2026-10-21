@@ -79,10 +79,14 @@ pub enum AppEvent {
 
     // Schema
     SchemaRefreshed { connection: ConnectionId, snapshot: SchemaSnapshotId },
+    SchemaRefreshFailed { connection: ConnectionId, message: String },
 
     // Editor
     BufferChanged { file: SqlFileId },
     BufferSaved { file: SqlFileId },
+
+    // Intelligence
+    DiagnosticsReady { file: SqlFileId },
 
     // Commands
     CommandExecuted { id: CommandId },
