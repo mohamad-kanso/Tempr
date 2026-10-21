@@ -9,6 +9,7 @@ members = [
     "crates/tempr_db_postgres",
     "crates/tempr_ui",
     "crates/tempr_editor",
+    "crates/tempr_intel",
 ]
 resolver = "2"
 
@@ -27,6 +28,7 @@ tempr_db          = { path = "crates/tempr_db" }
 tempr_db_postgres = { path = "crates/tempr_db_postgres" }
 tempr_ui          = { path = "crates/tempr_ui" }
 tempr_editor      = { path = "crates/tempr_editor" }
+tempr_intel       = { path = "crates/tempr_intel" }
 
 # UI — GPUI from the Zed repo. `gpui` + `gpui_platform` + `gpui_tokio` MUST share one rev (D14/D16).
 # Rev = main @ 2026-09-03 (first rev after the zlog/ztracing Apache-2.0 relicense, ac5af8b9, 2026-09-01). Apache-2.0 crates only — never `ui`/`theme`/`editor`/`markdown` (GPL).

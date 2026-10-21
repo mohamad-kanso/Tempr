@@ -5918,6 +5918,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempr_intel"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "tempr_domain",
+]
+
+[[package]]
 name = "tempr_services"
 version = "0.1.0"
 dependencies = [

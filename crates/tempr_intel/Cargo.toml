@@ -1,0 +1,16 @@
+[package]
+name              = "tempr_intel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description       = "In-memory catalog cache and SQL intelligence (docs/12-sql-intelligence.md)"
+
+[dependencies]
+tempr_domain.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+
