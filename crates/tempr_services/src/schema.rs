@@ -17,6 +17,10 @@ pub struct SchemaService {
     event_bus: Arc<EventBus>,
     connection_service: Arc<ConnectionService>,
     snapshots: RwLock<HashMap<ConnectionId, Arc<SchemaSnapshot>>>,
+    /// Scope the current snapshot was built from. Incremental refreshes sweep
+    /// the same scope: diffing an `All` snapshot against a `SearchPath` sweep
+    /// reports every out-of-path object as dropped, which is never true.
+    scopes: RwLock<HashMap<ConnectionId, SchemaScope>>,
     /// Absent when no workspace root is writable: the catalog then lives only
     /// in memory for the session, which is a degradation, never an error.
     storage: Option<Arc<dyn Storage>>,
@@ -28,6 +32,7 @@ impl SchemaService {
             event_bus,
             connection_service,
             snapshots: RwLock::new(HashMap::new()),
+            scopes: RwLock::new(HashMap::new()),
             storage: None,
         })
     }
@@ -42,6 +47,7 @@ impl SchemaService {
             event_bus,
             connection_service,
             snapshots: RwLock::new(HashMap::new()),
+            scopes: RwLock::new(HashMap::new()),
             storage: Some(storage),
         })
     }
@@ -110,14 +116,38 @@ impl SchemaService {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Arc<SchemaSnapshot>, ServiceError> {
+        self.refresh_scope(connection_id, SchemaScope::SearchPath)
+            .await
+    }
+
+    /// Refresh every non-system schema. The UI's "refresh all schemas"
+    /// command; differences from `refresh` are listed on `refresh_scope`.
+    pub async fn refresh_all_schemas(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Arc<SchemaSnapshot>, ServiceError> {
+        self.refresh_scope(connection_id, SchemaScope::All).await
+    }
+
+    /// Full introspection over an explicit scope. Entries and fingerprints
+    /// come from the same scope and the same connection moment, so the next
+    /// incremental diff compares like with like. The scope is remembered for
+    /// that connection and used by `refresh_incremental` afterwards.
+    pub async fn refresh_scope(
+        &self,
+        connection_id: ConnectionId,
+        scope: SchemaScope,
+    ) -> Result<Arc<SchemaSnapshot>, ServiceError> {
+        let entries_scope = scope.clone();
+        let fingerprint_scope = scope.clone();
         // One connection, one moment: entries, keywords and fingerprints must
         // describe the same server state or the first diff is already wrong.
         let (entries, keywords, fingerprints) = self
             .connection_service
             .with_metadata_connection_fn(connection_id, |mut conn| async move {
-                let entries = conn.snapshot_schema(SchemaScope::SearchPath).await?;
+                let entries = conn.snapshot_schema(entries_scope).await?;
                 let keywords = conn.keywords().await?;
-                let fingerprints = match conn.schema_fingerprints(SchemaScope::SearchPath).await {
+                let fingerprints = match conn.schema_fingerprints(fingerprint_scope).await {
                     Ok(f) => f,
                     // A driver without a sweep simply never refreshes
                     // incrementally; that is not a refresh failure.
@@ -158,12 +188,23 @@ impl SchemaService {
         self.snapshots
             .write()
             .insert(connection_id, snapshot.clone());
+        self.scopes.write().insert(connection_id, scope);
         self.save_cached(&snapshot).await;
         self.event_bus.publish(AppEvent::SchemaRefreshed {
             connection: connection_id,
             snapshot: snapshot.id,
         });
         Ok(snapshot)
+    }
+
+    /// The scope the current snapshot was built from (`SearchPath` before the
+    /// first successful refresh).
+    fn refresh_scope_for(&self, connection_id: ConnectionId) -> SchemaScope {
+        self.scopes
+            .read()
+            .get(&connection_id)
+            .cloned()
+            .unwrap_or(SchemaScope::SearchPath)
     }
 
     /// Map driver entries to domain objects, deriving every id from
@@ -367,16 +408,22 @@ impl SchemaService {
             Some(snapshot) => Some(snapshot),
             None => self.load_cached(connection_id).await,
         };
+        let scope = self.refresh_scope_for(connection_id);
         let Some(cached) = cached.filter(|s| !s.fingerprints.is_empty()) else {
             return self
-                .full_refresh_fallback(connection_id, FullRefreshReason::NoCachedFingerprints)
+                .full_refresh_fallback(
+                    connection_id,
+                    FullRefreshReason::NoCachedFingerprints,
+                    scope,
+                )
                 .await;
         };
 
+        let sweep_scope = scope.clone();
         let swept = match self
             .connection_service
             .with_metadata_connection_fn(connection_id, |mut conn| async move {
-                conn.schema_fingerprints(SchemaScope::SearchPath).await
+                conn.schema_fingerprints(sweep_scope).await
             })
             .await
         {
@@ -393,7 +440,11 @@ impl SchemaService {
             // for a second doomed call.
             Err(ServiceError::QueryFailed { .. }) | Err(ServiceError::NotConnected { .. }) => {
                 return self
-                    .full_refresh_fallback(connection_id, FullRefreshReason::SweepUnavailable)
+                    .full_refresh_fallback(
+                        connection_id,
+                        FullRefreshReason::SweepUnavailable,
+                        scope.clone(),
+                    )
                     .await;
             }
             Err(e) => return Err(e),
@@ -407,12 +458,20 @@ impl SchemaService {
         }
         if !delta.added.is_empty() {
             return self
-                .full_refresh_fallback(connection_id, FullRefreshReason::UnknownObject)
+                .full_refresh_fallback(
+                    connection_id,
+                    FullRefreshReason::UnknownObject,
+                    scope.clone(),
+                )
                 .await;
         }
         if delta.touched() * 5 > cached.fingerprints.len() * 2 {
             return self
-                .full_refresh_fallback(connection_id, FullRefreshReason::TooMuchChanged)
+                .full_refresh_fallback(
+                    connection_id,
+                    FullRefreshReason::TooMuchChanged,
+                    scope.clone(),
+                )
                 .await;
         }
 
@@ -454,7 +513,11 @@ impl SchemaService {
             // outright, independent of `touched_schemas`, so there is
             // nothing to re-introspect and that case is not a failure.
             return self
-                .full_refresh_fallback(connection_id, FullRefreshReason::UnresolvedSchema)
+                .full_refresh_fallback(
+                    connection_id,
+                    FullRefreshReason::UnresolvedSchema,
+                    scope.clone(),
+                )
                 .await;
         }
 
@@ -522,9 +585,10 @@ impl SchemaService {
         &self,
         connection_id: ConnectionId,
         reason: FullRefreshReason,
+        scope: SchemaScope,
     ) -> Result<(Arc<SchemaSnapshot>, RefreshPath), ServiceError> {
         tracing::debug!(connection = %connection_id, ?reason, "refresh_incremental: full refresh fallback");
-        let snapshot = self.refresh(connection_id).await?;
+        let snapshot = self.refresh_scope(connection_id, scope).await?;
         Ok((snapshot, RefreshPath::FullRefresh(reason)))
     }
 
@@ -1106,5 +1170,185 @@ mod tests {
             .filter(|o| matches!(o, SchemaObject::Column { name, .. } if name == "id"))
             .count();
         assert_eq!(column_count, 1, "column must not appear twice");
+    }
+
+    /// Records the scope of every introspection and sweep it serves, so a test
+    /// can prove the service hands the requested scope to the driver.
+    struct RecordingDriver {
+        scopes: Arc<std::sync::Mutex<Vec<SchemaScope>>>,
+    }
+
+    struct RecordingConnection {
+        scopes: Arc<std::sync::Mutex<Vec<SchemaScope>>>,
+    }
+
+    struct NoopCancelHandle;
+
+    #[async_trait::async_trait]
+    impl tempr_db::CancelHandle for NoopCancelHandle {
+        async fn cancel(&self) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl tempr_db::DatabaseDriver for RecordingDriver {
+        fn engine(&self) -> tempr_db::EngineId {
+            tempr_db::EngineId(tempr_domain::DriverKind::Postgres.engine_name().to_string())
+        }
+
+        async fn connect(
+            &self,
+            _connection: &tempr_domain::Connection,
+        ) -> Result<Box<dyn tempr_db::DriverConnection>, DriverError> {
+            Ok(Box::new(RecordingConnection {
+                scopes: self.scopes.clone(),
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl tempr_db::DriverConnection for RecordingConnection {
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[tempr_domain::Value],
+        ) -> Result<tempr_db::QueryStream, DriverError> {
+            Err(DriverError::Unsupported("execute".to_string()))
+        }
+
+        async fn cancel(&mut self) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+
+        fn cancel_handle(&self) -> Box<dyn tempr_db::CancelHandle> {
+            Box::new(NoopCancelHandle)
+        }
+
+        async fn snapshot_schema(
+            &mut self,
+            scope: SchemaScope,
+        ) -> Result<Vec<SchemaSnapshotEntry>, DriverError> {
+            self.scopes.lock().map(|mut s| s.push(scope)).ok();
+            Ok(Vec::new())
+        }
+
+        async fn schema_fingerprints(
+            &mut self,
+            scope: SchemaScope,
+        ) -> Result<Vec<SchemaFingerprint>, DriverError> {
+            self.scopes.lock().map(|mut s| s.push(scope)).ok();
+            Ok(vec![SchemaFingerprint {
+                native_id: 1,
+                kind: ObjectKind::Relation,
+                version: 1,
+            }])
+        }
+    }
+
+    async fn connected_service() -> (
+        Arc<SchemaService>,
+        ConnectionId,
+        Arc<std::sync::Mutex<Vec<SchemaScope>>>,
+    ) {
+        let bus = make_event_bus();
+        let scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connections = ConnectionService::new(bus.clone());
+        connections.register_driver(Arc::new(RecordingDriver {
+            scopes: scopes.clone(),
+        }));
+        let id = ConnectionId::new();
+        let connection = tempr_domain::Connection {
+            id,
+            name: "test".to_string(),
+            driver: tempr_domain::DriverKind::Postgres,
+            host: "localhost".to_string(),
+            port: 5432,
+            database: "test".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            secret_ref: tempr_domain::SecretRef {
+                vault_key: "test".to_string(),
+            },
+            tls: tempr_domain::TlsMode::Disable,
+        };
+        connections.connect(&connection).await.expect("connect");
+        let service = SchemaService::new(bus, connections);
+        (service, id, scopes)
+    }
+
+    fn scopes_of(scopes: &std::sync::Mutex<Vec<SchemaScope>>) -> Vec<String> {
+        let scopes = scopes.lock().unwrap_or_else(|p| p.into_inner());
+        scopes
+            .iter()
+            .map(|scope| match scope {
+                SchemaScope::SearchPath => "search_path".to_string(),
+                SchemaScope::All => "all".to_string(),
+                SchemaScope::Schema(name) => format!("schema:{name}"),
+                SchemaScope::Table { schema, table } => format!("table:{schema}.{table}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_the_search_path_and_records_it_for_the_next_sweep() {
+        let (service, id, scopes) = connected_service().await;
+
+        service.refresh(id).await.expect("refresh");
+        assert_eq!(scopes_of(&scopes), ["search_path", "search_path"]);
+
+        scopes.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let (_, path) = service.refresh_incremental(id).await.expect("incremental");
+        assert_eq!(path, RefreshPath::Unchanged);
+        assert_eq!(
+            scopes_of(&scopes),
+            ["search_path"],
+            "the sweep must diff against the scope the snapshot was built from"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_scope_and_refresh_all_schemas_reach_the_driver() {
+        let (service, id, scopes) = connected_service().await;
+
+        service
+            .refresh_scope(id, SchemaScope::All)
+            .await
+            .expect("raw scope");
+        assert_eq!(scopes_of(&scopes), ["all", "all"]);
+
+        scopes.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        service.refresh_all_schemas(id).await.expect("all");
+        assert_eq!(scopes_of(&scopes), ["all", "all"]);
+
+        scopes.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let (_, path) = service.refresh_incremental(id).await.expect("incremental");
+        assert_eq!(path, RefreshPath::Unchanged);
+        assert_eq!(
+            scopes_of(&scopes),
+            ["all"],
+            "an All snapshot must be swept with All, not SearchPath"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_connection_has_no_scope_yet() {
+        let (service, id, scopes) = connected_service().await;
+        let other = ConnectionId::new();
+        assert!(
+            service
+                .refresh_scope(other, SchemaScope::All)
+                .await
+                .is_err()
+        );
+        assert!(
+            scopes_of(&scopes).is_empty(),
+            "failed refresh records nothing"
+        );
+        assert!(service.refresh_all_schemas(id).await.is_ok());
     }
 }
