@@ -76,37 +76,36 @@ This is deliberate. Developers building plugins or contributing to Tempr already
 
 ### SemanticEngine
 
-The central type. Owned by `IntelligenceService`, constructed once per workspace, and fed buffer snapshots and catalog updates via the event system.
+The central type. Owned by `IntelligenceService` (stage 6), constructed once per workspace, and fed catalog updates via `set_catalog`. **Stage 4 shipped the `analyze` half of this API** (completion, hover and definition land with stages 5–6); the sketch below reflects what exists today:
 
 ```rust
 pub struct SemanticEngine {
-    catalog: Arc<CatalogCache>,
-    workspace_index: Arc<WorkspaceIndex>,
-    analysis_cache: RwLock<HashMap<SqlFileId, Analysis>>,
+    catalog: RwLock<Arc<CatalogCache>>,                 // parking_lot; swapped via set_catalog
+    analyses: Mutex<HashMap<SqlFileId, CachedAnalysis>>,
 }
 
 impl SemanticEngine {
-    /// Perform full semantic analysis of a buffer: resolve all scopes,
-    /// build the diagnostic set, and return the analysis result.
-    /// Incremental: only re-analyzes changed regions based on the
-    /// incremental tree-sitter tree.
-    pub fn analyze(&self, buffer: &BufferSnapshot) -> Analysis;
+    /// Full semantic analysis of a buffer: scope trees, bindings and the
+    /// diagnostics model. Cached per `SqlFileId`; the cache is validated by
+    /// `Buffer::revision` — an integer compare, cheap on the request path.
+    /// The `&mut` exists because Buffer's lazy reparse needs it (documented
+    /// deviation from the spec's `&BufferSnapshot` sketch).
+    pub fn analyze(&self, file: SqlFileId, buffer: &mut Buffer) -> Arc<Analysis>;
 
-    /// Generate completion candidates for the given request.
-    /// <5 ms budget on a 10k-object catalog (see Latency Budget below).
-    pub fn complete(&self, req: &CompletionRequest) -> Vec<CompletionItem>;
-
-    /// Return hover information (type, definition text, column metadata)
-    /// at the given byte offset. Returns None if the offset is not
-    /// on a resolvable name.
-    pub fn hover(&self, buffer: &BufferSnapshot, offset: usize) -> Option<HoverInfo>;
-
-    /// Navigate to the definition of the symbol at the given offset.
-    /// For tables/columns, returns a SchemaObjectId pointing into the
-    /// catalog. For aliases, returns the offset of the alias definition.
-    pub fn definition(&self, buffer: &BufferSnapshot, offset: usize) -> Option<SchemaObjectId>;
+    /// A refresh built a new catalog cache; the analysis cache resets.
+    pub fn set_catalog(&self, catalog: Arc<CatalogCache>);
+    pub fn catalog(&self) -> Arc<CatalogCache>;
 }
 ```
+
+Two corrections to the spec's original sketch, recorded here and in the PROGRESS decisions log:
+
+- **Cache key.** The spec claimed analysis caching validates by `EditId`. Undo recreates an earlier text state while reusing ids, so `EditId` cannot be the key. Tempr added the monotonic `Buffer::revision` (bumped by every edit, undo and redo, untouched by failed edits); revision — not `EditId` — validates the cache.
+- **Borrow shape.** `analyze` takes `&mut Buffer`, not `&BufferSnapshot`. The workspace still has no `BufferSnapshot` type; the engine consumes the editor's `Buffer` directly, per the layout doc's grouping of editor and intelligence layers.
+
+The walk is two-phase per region so clause order cannot mislead visibility: phase A collects all of the region's bindings (CTEs in declaration order, FROM/JOIN sources, `UPDATE`/`DELETE`/`INSERT` targets — `UPDATE … FROM t1` aliasing included) *without analyzing any subquery body*; phase B analyzes every subquery and CTE body after the region's frame is complete, so a `select`-list subquery still sees a `FROM` alias appearing later in the source. `set_operation` statements scope per `select` side (merging sides' bindings would invent ambiguity the server does not see). CTE bodies see only earlier CTEs; a `WITH RECURSIVE` self-reference resolves with no column knowledge and stays silent.
+
+The completion, hover and definition signatures (`complete`, `hover`, `definition`) remain as speced on `&BufferSnapshot` — they ship with stages 5–6, where the `BufferSnapshot` decision will be made for real.
 
 ### CompletionRequest
 
