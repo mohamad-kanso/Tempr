@@ -40,7 +40,7 @@ tempr/                    # Cargo workspace root
 | `tempr_db_postgres` | PostgreSQL driver — ships as a static plugin, depends only on `tempr_db` + `tempr_plugin` | [09 — Database](09-database-engine.md) |
 | `tempr_editor` | Buffer, rope data structures, syntax highlighting | [10 — Editor](10-editor.md) |
 | `tempr_ui` | GPUI components, views, layout | [11 — UI](11-gpui.md) |
-| `tempr_intel` | SemanticEngine, CatalogCache, code intelligence | [12 — Intelligence](12-sql-intelligence.md) |
+| `tempr_intel` | `CatalogCache` (immutable arena over `SchemaSnapshot`: id/identity lookups, exact ± folded relation/column lookups, contiguous `columns_of`, folded `prefix_search`), release probes; `SemanticEngine` arrives in stage 4 | [12 — Intelligence](12-sql-intelligence.md) |
 | `tempr_grid` | RowStore, ResultGrid, data grid rendering | [13 — Grid](13-result-grid.md) |
 
 ## Design Rationale

@@ -7,6 +7,12 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via gpui's linux input stack" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained — transitive via gpui (cosmic-text/fontdb, usvg)" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained — transitive via gpui (resvg/usvg)" },
+    # The z* trio (zbus_names/zvariant/zvariant_derive, RUSTSEC-2026-0370/0371/0372)
+    # merged into zbus 6; the versions in the graph are transitively pinned by the
+    # gpui rev. Not fixable from Tempr; revisit on every gpui rev bump.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained (merged into zbus 6) — transitive via gpui's Linux platform stack" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained (merged into zbus 6) — transitive via gpui's Linux platform stack" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained (merged into zbus 6) — transitive via gpui's Linux platform stack" },
 ]
 
 [licenses]
