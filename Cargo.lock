@@ -5922,8 +5922,11 @@ name = "tempr_intel"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "parking_lot",
  "tempr_domain",
+ "tempr_editor",
  "tempr_workspace",
+ "tree-sitter",
 ]
 
 [[package]]

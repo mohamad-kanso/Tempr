@@ -76,37 +76,36 @@ This is deliberate. Developers building plugins or contributing to Tempr already
 
 ### SemanticEngine
 
-The central type. Owned by `IntelligenceService`, constructed once per workspace, and fed buffer snapshots and catalog updates via the event system.
+The central type. Owned by `IntelligenceService` (stage 6), constructed once per workspace, and fed catalog updates via `set_catalog`. **Stage 4 shipped the `analyze` half of this API** (completion, hover and definition land with stages 5–6); the sketch below reflects what exists today:
 
 ```rust
 pub struct SemanticEngine {
-    catalog: Arc<CatalogCache>,
-    workspace_index: Arc<WorkspaceIndex>,
-    analysis_cache: RwLock<HashMap<SqlFileId, Analysis>>,
+    catalog: RwLock<Arc<CatalogCache>>,                 // parking_lot; swapped via set_catalog
+    analyses: Mutex<HashMap<SqlFileId, CachedAnalysis>>,
 }
 
 impl SemanticEngine {
-    /// Perform full semantic analysis of a buffer: resolve all scopes,
-    /// build the diagnostic set, and return the analysis result.
-    /// Incremental: only re-analyzes changed regions based on the
-    /// incremental tree-sitter tree.
-    pub fn analyze(&self, buffer: &BufferSnapshot) -> Analysis;
+    /// Full semantic analysis of a buffer: scope trees, bindings and the
+    /// diagnostics model. Cached per `SqlFileId`; the cache is validated by
+    /// `Buffer::revision` — an integer compare, cheap on the request path.
+    /// The `&mut` exists because Buffer's lazy reparse needs it (documented
+    /// deviation from the spec's `&BufferSnapshot` sketch).
+    pub fn analyze(&self, file: SqlFileId, buffer: &mut Buffer) -> Arc<Analysis>;
 
-    /// Generate completion candidates for the given request.
-    /// <5 ms budget on a 10k-object catalog (see Latency Budget below).
-    pub fn complete(&self, req: &CompletionRequest) -> Vec<CompletionItem>;
-
-    /// Return hover information (type, definition text, column metadata)
-    /// at the given byte offset. Returns None if the offset is not
-    /// on a resolvable name.
-    pub fn hover(&self, buffer: &BufferSnapshot, offset: usize) -> Option<HoverInfo>;
-
-    /// Navigate to the definition of the symbol at the given offset.
-    /// For tables/columns, returns a SchemaObjectId pointing into the
-    /// catalog. For aliases, returns the offset of the alias definition.
-    pub fn definition(&self, buffer: &BufferSnapshot, offset: usize) -> Option<SchemaObjectId>;
+    /// A refresh built a new catalog cache; the analysis cache resets.
+    pub fn set_catalog(&self, catalog: Arc<CatalogCache>);
+    pub fn catalog(&self) -> Arc<CatalogCache>;
 }
 ```
+
+Two corrections to the spec's original sketch, recorded here and in the PROGRESS decisions log:
+
+- **Cache key.** The spec claimed analysis caching validates by `EditId`. Undo recreates an earlier text state while reusing ids, so `EditId` cannot be the key. Tempr added `Buffer::revision` (re-assigned by every edit, undo and redo, untouched by failed edits); revision — not `EditId` — validates the cache. Revisions come from a process-wide counter, so a freshly opened `Buffer` for the same file never shares a revision with a previous instance and cannot hit its stale entry.
+- **Borrow shape.** `analyze` takes `&mut Buffer`, not `&BufferSnapshot`. The workspace still has no `BufferSnapshot` type; the engine consumes the editor's `Buffer` directly, per the layout doc's grouping of editor and intelligence layers.
+
+The walk is two-phase per region so clause order cannot mislead visibility: phase A collects all of the region's bindings (CTEs in declaration order, FROM/JOIN sources, `UPDATE`/`INSERT` targets, the `DELETE` target that the grammar keeps in the statement-level `from` sibling, `LATERAL (subquery)` and `LATERAL function(…)` aliases — `lateral_join` and `lateral_cross_join` are distinct nodes) *without analyzing any subquery body*; phase B analyzes every subquery and CTE body after the region's frame is complete, so a `select`-list subquery still sees a `FROM` alias appearing later in the source. A **region is its container node** (`statement`, `subquery`, `set_operation`), not the `select` node — the grammar keeps `select`, `from`, `where`, … as siblings, so selecting only the `select` would drop every binding and predicate. `set_operation` statements scope per `select` side and its clause siblings (merging sides' bindings would invent ambiguity the server does not see). CTE bodies see only earlier CTEs; a `WITH RECURSIVE` self-reference resolves with no column knowledge and stays silent. Column qualifiers follow PostgreSQL: an alias hides the source's own name, and a schema never answers a two-part qualifier (three-part names resolve through the catalog). FROM-subquery/lateral-subquery columns derive from the body's top select list, so derived-table references are checked like any other binding.
+
+The completion, hover and definition signatures (`complete`, `hover`, `definition`) remain as speced on `&BufferSnapshot` — they ship with stages 5–6, where the `BufferSnapshot` decision will be made for real.
 
 ### CompletionRequest
 
@@ -438,7 +437,7 @@ classDiagram
 
 ### Shipped catalog cache (`tempr_intel::CatalogCache`, Phase 3 stage 3)
 
-The catalog cache is an immutable, resolution-shaped arena built from one `SchemaSnapshot` (`CatalogCache::from_snapshot`): relations first, then functions, then columns grouped contiguously per relation in `ordinal` order, then indexes — every map holds `u32` arena indices, so "columns of this table" is a slice, not a scan. An unquoted SQL identifier folds to lower case (the `*_folded` lookups return a candidate list — coexisting `users` and quoted `"Users"` is ambiguity the *analyzer* reports, never guessed in the cache); a quoted identifier matches through the case-sensitive `*_exact` lookups. `prefix_search` runs over relation and function names via binary search on the folded `name_order`, capped with an overflow flag for the completion top-N heap. The structure is rebuilt wholesale per refresh and swapped behind an `Arc` when the `SemanticEngine` lands (stage 4); readers never see a half-updated catalog. Probe numbers live in `PROGRESS.md`'s session log: on a ~10 000-object synthetic catalog, the request-shape mix (`prefix_search` + `relation_folded` + `columns_of` + `column_folded`) costs p95 ≈ 0.002 ms — far inside the < 5 ms completion budget it shares with context classification, ranking and rendering.
+The catalog cache is an immutable, resolution-shaped arena built from one `SchemaSnapshot` (`CatalogCache::from_snapshot`): relations first, then functions, then columns grouped contiguously per relation in `ordinal` order, then indexes — every map holds `u32` arena indices, so "columns of this table" is a slice, not a scan. An unquoted SQL identifier folds to lower case (the `*_folded` lookups return a candidate list — coexisting `users` and quoted `"Users"` is ambiguity the *analyzer* reports, never guessed in the cache); a quoted identifier matches through the case-sensitive `*_exact` lookups. `prefix_search` runs over relation and function names via binary search on the folded `name_order`, capped with an overflow flag for the completion top-N heap. The structure is rebuilt wholesale per refresh and swapped behind an `Arc` when the `SemanticEngine` is told to `set_catalog`; readers never see a half-updated catalog. Probe numbers live in `PROGRESS.md`'s session log: on a ~10 000-object synthetic catalog, the request-shape mix (`prefix_search` + `relation_folded` + `columns_of` + `column_folded`) costs p95 ≈ 0.002 ms — far inside the < 5 ms completion budget it shares with context classification, ranking and rendering.
 
 ## Completion Pipeline
 

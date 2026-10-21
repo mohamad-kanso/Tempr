@@ -14,6 +14,7 @@
 //! `BufferChanged` — it is a pure model; the owning service publishes.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ropey::Rope;
 use tempr_domain::SqlFileId;
@@ -28,6 +29,17 @@ use crate::syntax::{Highlight, StatementRange, SyntaxTree};
 /// re-applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EditId(pub u64);
+
+/// Process-wide source of text revisions. Values are handed out on buffer
+/// creation and on every text mutation, so a revision identifies one text
+/// state of one buffer instance — two `Buffer`s (even over the same file,
+/// even freshly opened at "no edits") never share one. Caches keyed by
+/// `(file, revision)` therefore cannot serve an entry from another buffer.
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A (line, column) position. `column` is a **byte** offset within the line
 /// (0-based); line breaks are not part of a line's columns.
@@ -105,6 +117,12 @@ pub struct Buffer {
     syntax_dirty: bool,
     file_id: SqlFileId,
     next_edit: u64,
+    /// Process-unique text revision: assigned on creation and re-assigned on
+    /// *every* change to the buffer's text — edits, undo, redo. Unlike
+    /// `EditId` (which undo reuses), this is a reliable "which text state"
+    /// key for read-path caches such as the semantic engine's analysis
+    /// cache; values are never shared between buffer instances.
+    revision: u64,
 }
 
 impl Buffer {
@@ -116,6 +134,7 @@ impl Buffer {
             history: EditHistory::default(),
             syntax: None,
             syntax_dirty: true,
+            revision: next_revision(),
             file_id,
             next_edit: 1,
         }
@@ -144,6 +163,29 @@ impl Buffer {
     /// True when the tree is missing or edits are pending a `reparse`.
     pub fn is_syntax_dirty(&self) -> bool {
         self.syntax_dirty
+    }
+
+    /// The syntax tree, borrowable immutably, *only if* it is fresh. The
+    /// engine's walk pattern is `buffer.syntax()` first (possibly an
+    /// incremental reparse), then `fresh_syntax()` — `Node`s borrow the tree,
+    /// which lives inside the buffer, so walking must not require the `&mut`
+    /// that `syntax()` needs.
+    pub fn fresh_syntax(&self) -> Option<&SyntaxTree> {
+        if self.syntax_dirty {
+            None
+        } else {
+            self.syntax.as_ref()
+        }
+    }
+
+    /// Process-unique *text* revision: assigned when the buffer is created
+    /// and re-assigned by every edit, undo and redo; untouched by failed
+    /// edits. Values are never shared between buffer instances, so
+    /// read-path caches (the semantic engine's analysis cache) can validate
+    /// reuse with an integer compare against this; `EditId` cannot serve —
+    /// `undo` restores an earlier text state while reusing an id.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The parse tree, brought up to date first.
@@ -297,6 +339,7 @@ impl Buffer {
 
         let id = EditId(self.next_edit);
         self.next_edit += 1;
+        self.revision = next_revision();
         self.history.undo.push(Transaction {
             id,
             changes,
@@ -341,6 +384,7 @@ impl Buffer {
             self.replace_bytes(range, &change.removed);
         }
         let id = tx.id;
+        self.revision = next_revision(); // undo moved the text: caches must drop
         self.history.redo.push(tx);
         Some(id)
     }
@@ -353,6 +397,7 @@ impl Buffer {
             self.replace_bytes(range, &change.inserted);
         }
         let id = tx.id;
+        self.revision = next_revision(); // redo moved the text: caches must drop
         self.history.undo.push(tx);
         Some(id)
     }
@@ -587,6 +632,55 @@ mod tests {
         b.edit(&[(1..1, "z")]).unwrap();
         assert!(!b.can_redo());
         assert_eq!(b.text().to_string(), "xz");
+    }
+
+    #[test]
+    fn revision_moves_on_every_text_mutation_including_undo_redo() {
+        // The analysis cache validates "can I reuse this analysis" by an
+        // integer compare, so the revision must move on every change to the
+        // buffer's *text* — including state changes the edit-id machinery
+        // deliberately reuses (`undo` returns to an earlier state while
+        // minting no new EditId).
+        let mut b = buf("");
+        assert!(
+            b.revision() > 0,
+            "fresh buffer carries a process-unique revision"
+        );
+        assert_ne!(
+            b.revision(),
+            buf("").revision(),
+            "buffer instances never share a revision (analysis caches key on it)"
+        );
+
+        let first = (b.edit(&[(0..0, "a")]).is_ok(), b.revision());
+        let second = (b.edit(&[(1..1, "c")]).is_ok(), b.revision());
+        assert!(
+            second.1 > first.1,
+            "a second successful edit must move the revision"
+        );
+
+        let before_undo = b.revision();
+        let _ = b.undo();
+        assert!(
+            b.revision() > before_undo,
+            "undo changes the text: revision must move"
+        );
+
+        let before_redo = b.revision();
+        let _ = b.redo();
+        assert!(
+            b.revision() > before_redo,
+            "redo changes the text: revision must move"
+        );
+
+        // A failed edit changes nothing.
+        let before_fail = b.revision();
+        assert!(b.edit(&[(0..2048, "x")]).is_err());
+        assert_eq!(
+            b.revision(),
+            before_fail,
+            "failed edit must not move the revision"
+        );
     }
 
     #[test]
