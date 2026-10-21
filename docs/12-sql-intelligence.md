@@ -76,7 +76,7 @@ This is deliberate. Developers building plugins or contributing to Tempr already
 
 ### SemanticEngine
 
-The central type. Owned by `IntelligenceService` (stage 6), constructed once per workspace, and fed catalog updates via `set_catalog`. **Stage 4 shipped the `analyze` half of this API** (completion, hover and definition land with stages 5–6); the sketch below reflects what exists today:
+The central type. Owned by `IntelligenceService` (stage 6), constructed once per workspace, and fed catalog updates via `set_catalog`. **Stages 4–5 shipped the `analyze` and `complete` halves of this API** (hover and definition land with stage 6); the sketch below reflects what exists today:
 
 ```rust
 pub struct SemanticEngine {
@@ -92,6 +92,10 @@ impl SemanticEngine {
     /// deviation from the spec's `&BufferSnapshot` sketch).
     pub fn analyze(&self, file: SqlFileId, buffer: &mut Buffer) -> Arc<Analysis>;
 
+    /// Ranked completion candidates at the cursor (stage 5). Reads the same
+    /// cached analysis and the immutable catalog; no I/O.
+    pub fn complete(&self, req: CompletionRequest<'_>) -> Vec<CompletionItem>;
+
     /// A refresh built a new catalog cache; the analysis cache resets.
     pub fn set_catalog(&self, catalog: Arc<CatalogCache>);
     pub fn catalog(&self) -> Arc<CatalogCache>;
@@ -105,64 +109,55 @@ Two corrections to the spec's original sketch, recorded here and in the PROGRESS
 
 The walk is two-phase per region so clause order cannot mislead visibility: phase A collects all of the region's bindings (CTEs in declaration order, FROM/JOIN sources, `UPDATE`/`INSERT` targets, the `DELETE` target that the grammar keeps in the statement-level `from` sibling, `LATERAL (subquery)` and `LATERAL function(…)` aliases — `lateral_join` and `lateral_cross_join` are distinct nodes) *without analyzing any subquery body*; phase B analyzes every subquery and CTE body after the region's frame is complete, so a `select`-list subquery still sees a `FROM` alias appearing later in the source. A **region is its container node** (`statement`, `subquery`, `set_operation`), not the `select` node — the grammar keeps `select`, `from`, `where`, … as siblings, so selecting only the `select` would drop every binding and predicate. `set_operation` statements scope per `select` side and its clause siblings (merging sides' bindings would invent ambiguity the server does not see). CTE bodies see only earlier CTEs; a `WITH RECURSIVE` self-reference resolves with no column knowledge and stays silent. Column qualifiers follow PostgreSQL: an alias hides the source's own name, and a schema never answers a two-part qualifier (three-part names resolve through the catalog). FROM-subquery/lateral-subquery columns derive from the body's top select list, so derived-table references are checked like any other binding.
 
-The completion, hover and definition signatures (`complete`, `hover`, `definition`) remain as speced on `&BufferSnapshot` — they ship with stages 5–6, where the `BufferSnapshot` decision will be made for real.
+The completion, hover and definition signatures (`complete`, `hover`, `definition`) were sketched on a `&BufferSnapshot` that never materialised. Stage 5 shipped `complete` on the real `Buffer` (again `&mut`, for the analysis cache's lazy reparse) and stage 6 will do the same for `hover`/`definition`; there is no separate snapshot type.
 
 ### CompletionRequest
 
-The input to the completion pipeline. Constructed by `IntelligenceService` on every completion trigger (keystroke debounce or explicit request).
+The input to the completion pipeline. Constructed by `IntelligenceService` on every completion trigger (keystroke debounce or explicit request). **Shipped shape (stage 5):**
 
 ```rust
-pub struct CompletionRequest {
-    /// Immutable snapshot of the buffer at the time of the request.
-    pub buffer_snapshot: BufferSnapshot,
+pub struct CompletionRequest<'a> {
+    /// The buffer being completed. `&mut` because the analysis cache lazily
+    /// reparses; completion only reads text and analysis.
+    pub file: SqlFileId,
+    pub buffer: &'a mut Buffer,
 
     /// Byte offset of the cursor within the buffer.
     pub offset: usize,
 
-    /// The active database connection. Used to select the correct
-    /// catalog partition (multi-connection workspaces may have
-    /// different schemas).
-    pub connection_id: ConnectionId,
+    /// True for ctrl-space: bypasses the auto-open gating.
+    pub explicit: bool,
 }
 ```
+
+Multi-connection workspaces are stage 6's concern — the engine holds a single catalog today, and `IntelligenceService` will own one engine per live connection.
 
 ### CompletionItem
 
-A single completion candidate. Merged with plugin-provided items before ranking.
+A single ranked candidate. **Shipped shape (stage 5):**
 
 ```rust
 pub struct CompletionItem {
-    /// The text to insert.
+    /// Text shown in the popup.
     pub label: String,
-
-    /// Category for icon and grouping in the popup.
     pub kind: CompletionKind,
-
-    /// Optional detail text shown alongside the label (e.g., column type,
-    /// table comment, keyword syntax hint).
-    pub detail: Option<String>,
-
-    /// Sort priority hint. Lower = higher priority. The ranking layer
-    /// may override this based on context match and usage frequency.
-    pub sort_priority: i32,
-
-    /// Text edit range — the byte range in the buffer that this
-    /// completion replaces (handles partial-word replacement).
-    pub edit_range: Range<usize>,
+    /// Type, signature, schema or ownership hint (empty when there is none).
+    pub detail: String,
+    /// Text the editor writes. Equal to `label` today; separate so stage-6
+    /// snippets can differ without reshaping the item.
+    pub insert: String,
+    /// Byte range the item replaces (the word under the cursor).
+    pub replace: Range<usize>,
+    /// Ranking score, highest first.
+    pub score: i32,
 }
 
 pub enum CompletionKind {
-    Keyword,
-    Table,
-    Column,
-    Schema,
-    Alias,
-    Cte,
-    Function,
-    Snippet,
-    Plugin, // contributed by a CompletionProvider
+    Keyword, Table, Column, Schema, Alias, Cte, Function, Snippet, Plugin,
 }
 ```
+
+Views use `CompletionKind::Table` with `detail: "view · public"` (the canonical enum has no `View` variant). Plugin fan-out (`CompletionKind::Plugin`) arrives with the plugin API in Phase 4; stage 6 merges built-in items only.
 
 ### Analysis
 
@@ -264,36 +259,28 @@ sequenceDiagram
     participant IS as IntelligenceService
     participant SE as SemanticEngine
     participant Cat as CatalogCache
-    participant PP as Plugin Providers
     participant UI as Completion Popup
 
     User->>Editor: Keystroke (character typed)
 
     Note over Editor: Debounce window (50ms)
 
-    Editor->>IS: CompletionRequest { buffer_snapshot, offset, connection_id }
-
-    Note over IS,SE: Context classification — <0.1 ms
+    Editor->>IS: CompletionRequest { file, buffer, offset, explicit }
 
     IS->>SE: complete(req)
 
-    Note over SE: 1. Classify cursor context<br/>(keyword? table? column?)
+    Note over SE: 1. Classify cursor context<br/>(text lexer: statement start / relation / expression / alias / qualifier)
 
-    SE->>Cat: Lookup tables in scope
-    Cat-->>SE: Table list (in-memory)
+    SE->>Cat: prefix_search / relations_in_schema / keywords
+    Cat-->>SE: candidates (in-memory)
 
-    SE->>SE: 2. Generate candidates<br/>(catalog + aliases + keywords)
+    SE->>SE: 2. Generate candidates<br/>(catalog + bindings + CTEs + aliases + keywords)
 
-    Note over SE: Candidate generation — <1 ms
+    Note over SE: Candidate generation — <1 ms (measured p99 1.4 ms worst case)
 
-    SE-->>IS: Vec of CompletionItem (built-in)
+    Note over SE: 3. Rank (one score), dedupe, bound to 200
 
-    IS->>PP: Fan out to all CompletionProviders
-    PP-->>IS: Vec of CompletionItem (plugin)
-
-    Note over IS: 3. Merge + rank<br/>(context > frequency > alpha)
-
-    Note over IS: Ranking — <0.5 ms
+    SE-->>IS: Vec of CompletionItem (ranked built-ins)
 
     IS-->>Editor: Ranked Vec of CompletionItem
 
@@ -302,6 +289,8 @@ sequenceDiagram
     Editor->>UI: Show completion popup
 
     Note over User,UI: Total: <5 ms end-to-end
+
+    Note over IS: Plugin fan-out (CompletionKind::Plugin) arrives with the Phase 4 plugin API
 
     User->>Editor: Select item (Tab/Enter)
     Editor->>Editor: Apply text edit
@@ -362,7 +351,7 @@ The engine maintains a mapping of star expressions to their expanded column list
 
 ### Diagnostics
 
-The semantic analysis produces three categories of diagnostics:
+The semantic analysis produces three categories of diagnostics (v1 ships the first two; type mismatch is not implemented):
 
 | Diagnostic | Trigger | Example |
 |---|---|---|
@@ -390,21 +379,22 @@ classDiagram
     class Analysis {
         +scopes: Vec~Scope~
         +diagnostics: Vec~Diagnostic~
-        +star_expansions: HashMap
     }
 
     class CompletionRequest {
-        +buffer_snapshot: BufferSnapshot
+        +file: SqlFileId
+        +buffer: &mut Buffer
         +offset: usize
-        +connection_id: ConnectionId
+        +explicit: bool
     }
 
     class CompletionItem {
         +label: String
         +kind: CompletionKind
-        +detail: Option~String~
-        +sort_priority: i32
-        +edit_range: Range~usize~
+        +detail: String
+        +insert: String
+        +replace: Range~usize~
+        +score: i32
     }
 
     class CatalogCache {
@@ -445,39 +435,39 @@ The completion pipeline is the most latency-sensitive path in the entire system.
 
 ### Stage 1: Context Classification
 
-The engine inspects the tree-sitter node at the cursor offset to determine what kind of completion the user expects:
+**Shipped (stage 5): text, not tree nodes.** A small forward lexer reads the current statement's text (line and nested block comments, `'…''…'` strings, `$tag$…$tag$` bodies and `"quoted identifiers"` are skipped) and classification looks at the last token; a backward scan at the cursor recovers the word being replaced and any qualifier path. The tree is *not* consulted for clauses: the stage-5 probe found a trailing incomplete clause leaves the statement as a top-level `ERROR` sibling (`select * from ` → `(statement …) (ERROR (keyword_from))`), so tree shape is unreliable exactly while the user types. The stage-4 analysis still supplies the scopes (bindings, CTEs) that candidates come from.
 
-| Context | Tree-sitter pattern | Candidates |
+| Context | Text pattern | Candidates |
 |---|---|---|
-| **Keyword position** | Cursor after `SELECT`, `WHERE`, `FROM`, `JOIN`, etc. — a keyword-token node. | SQL keywords (`SELECT`, `FROM`, `WHERE`, `JOIN`, `GROUP BY`, etc.). |
-| **Table position** | Cursor after `FROM` or `JOIN` — an identifier node in a table-reference position. | Tables, views, and subqueries from the catalog. Schema-qualified suggestions if cursor is after a dot. |
-| **Column position** | Cursor in a SELECT list or WHERE clause — an identifier node that should resolve as a column. | Columns from all tables in scope, prefixed with alias when ambiguous. Qualified `alias.column` suggestions. |
-| **Alias position** | Cursor after `AS` in a table or column alias context. | No auto-suggestions (alias names are user-chosen). |
-| **Expression position** | Cursor in a general expression context. | Columns, functions, and literals from scope. |
+| **Statement start** | Nothing before the cursor, or a complete `WITH …` clause. | Statement keywords (`SELECT`, `INSERT`, `WITH`, `CREATE`, …). |
+| **Relation** | After `FROM`/`JOIN`/`UPDATE`/`INTO`/`TABLE`/`TRUNCATE`/`ONLY`, or after a comma at paren depth 0 whose nearest clause is one of those. | CTEs, tables/views, schema names. |
+| **Expression** | Any other position (`SELECT` list, predicates, arguments, after `=`, after `WHERE`/`ON`/`SET`/`VALUES`). | Columns in scope (weighted up), relations, functions, keywords, aliases. |
+| **Alias** | After `AS` or `WITH`. | None — the user names aliases and CTEs. |
+| **Qualifier** | After a dot: `u.`, `public.`, `public.users.` (whitespace tolerated). | Columns of that binding/CTE; relations of that schema; columns of a schema-qualified relation. |
+
+Auto-open follows spec decision 5: one identifier character or a qualifier dot opens the popup; `ctrl-space` (`explicit`) forces it anywhere.
 
 ### Stage 2: Candidate Generation
 
-Once context is classified, the engine generates candidates from multiple sources:
+**Shipped (stage 5):**
 
-1. **Catalog lookup** — for table and column positions, the engine reads from the in-memory `CatalogCache`. For a 10k-object catalog (500 tables × 20 columns average), this is a linear scan of the relevant partition — sub-microsecond on modern hardware.
+1. **Catalog lookup** — relations and functions come from `CatalogCache::prefix_search` (binary search over the folded `name_order`, capped at 200); a schema dot uses `relations_in_schema`. Column candidates come from the visible bindings' column lists (arena slices for real relations, derived names for CTEs/FROM-subqueries), never from a catalog-wide scan.
 
-2. **Scope resolution** — for column positions, the engine resolves which tables are in scope at the cursor's position and generates column candidates from those tables. Qualified suggestions (prefixing with `alias.`) are generated when multiple tables are in scope.
+2. **Scope resolution** — the cursor's `Analysis::scope_chain` gives the innermost frame and its correlated ancestors; a trailing `ERROR` fragment falls back to the statement it trails so a half-typed `where ` keeps its bindings. Bare columns are offered when their folded name is unique across visible bindings; a repeated name is offered qualified (`alias.col`) instead.
 
-3. **Keyword list** — a static, hardcoded list of SQL keywords and their frequency ranks. No I/O required.
+3. **Keyword list** — the server's `pg_get_keywords()` list (cached with the snapshot, uppercased for display) when a catalog is loaded; the static fallback list otherwise (spec §7: no catalog → keywords only). Statement starts use the static statement-keyword set because the server list is unordered and includes non-statement words.
 
-4. **Workspace index** — for table positions in cross-file contexts, the engine may query the workspace symbol index to suggest tables defined in other `.sql` files.
+4. **Workspace index** — not shipped (no file-open flow yet); the generator is a single seam so it can be added as another candidate source.
 
 ### Stage 3: Ranking
 
-Candidates from all sources are merged and ranked by a three-tier comparator:
+**Shipped (stage 5)** — one integer, exactly as spec §5.2 describes:
 
-1. **Context match** (highest priority) — candidates that match the classified context are ranked above all others. A column candidate in a column position beats a keyword candidate.
+`score = context_weight * 1000 + match_quality * 4 - label.chars().count()`
 
-2. **Usage frequency** — candidates that the user has selected before (tracked in query history) are boosted. This is a persistent signal: frequently-used tables and columns rise to the top over time.
+Context weights: column 500, qualified column 480, CTE 470, relation 450, statement keyword 400, function 300, relation-in-expression 250, schema 200, alias 150, keyword 100. Match quality: exact prefix 400 > folded prefix 300 > `fuzzy_match` score (the palette matcher, now `tempr_domain::text`); ties break on the shorter label and then alphabetically, so output is deterministic. Duplicates are deduped by `(label, kind)` keeping the highest score, and a bounded 200-item heap keeps only the best candidates.
 
-3. **Alphabetical** — when context match and usage frequency are equal, candidates are sorted alphabetically.
-
-Plugin-provided `CompletionItem`s are merged into the same list before ranking, with `CompletionKind::Plugin` items competing on equal footing with built-in items.
+**Not shipped:** usage-frequency boosting from query history (docs below describe it as the second tier; it lands with the Phase 4 history panel). Cross-file workspace symbols are likewise future work.
 
 ---
 
@@ -487,20 +477,22 @@ The <5 ms completion budget is a **hard requirement**, not a soft target. It is 
 
 | Constraint | How it helps |
 |---|---|
-| **In-memory interned catalog** | `CatalogCache` is held entirely in memory as interned string tables. Column and table name lookups are pointer comparisons, not heap allocations or string comparisons. A 10k-object catalog occupies ~2 MB of contiguous memory. |
-| **No I/O on the request path** | The completion pipeline never performs disk reads, network calls, or subprocess invocations. All data sources (catalog, workspace index, keyword list) are pre-loaded and held in memory. Schema refresh happens asynchronously in the background; completion reads a consistent snapshot. |
-| **Incremental analysis** | The semantic analyzer only re-analyzes regions of the buffer that changed since the last analysis. For a single-keystroke edit, this typically means one tree-sitter node and its immediate parent — not the entire file. |
+| **In-memory catalog arena** | `CatalogCache` is an immutable `Vec<CatalogEntry>` with `u32` indices in every map; columns of a relation are a contiguous slice and prefix search is a binary search over a folded name order. No string comparison against the server, no re-sorting per request. |
+| **No I/O on the request path** | The completion pipeline never performs disk reads, network calls, or subprocess invocations. All data sources (catalog, keyword list, analysis) are pre-loaded and held in memory. Schema refresh happens asynchronously in the background; completion reads a consistent `Arc` snapshot. |
+| **Cached analysis** | `analyze` runs once per `Buffer::revision` and is cached per `SqlFileId`; a completion request after the first keystroke is an integer compare plus candidate generation. (Whole-buffer re-analysis per edit, not incremental regions — the revision cache is what keeps the request path cheap.) |
 
-Measured budget breakdown for a typical completion request:
+Measured budget breakdown for a typical completion request (release, synthetic 10 000-object catalog — 1 200 relations × 8 columns, 1 200 indexes, 800 functions; stage-5 probe, 40 warm runs per case):
 
-| Stage | Budget | Notes |
-|---|---|---|
-| Context classification | <0.1 ms | Single tree-sitter node inspection. |
-| Candidate generation | <1.0 ms | Catalog scan + scope resolution + keyword list. |
-| Ranking | <0.5 ms | Sort ~200 candidates by three-tier comparator. |
-| Plugin fan-out | <2.0 ms | All registered `CompletionProvider`s called synchronously. |
-| Item construction | <0.5 ms | `CompletionItem` allocation and edit-range computation. |
-| **Total** | **<5.0 ms** | Measured on a 10k-object catalog, single-cursor, on the GPUI main thread. |
+| Case | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| Relation prefix (200 of 1 200 relations) | 0.072 ms | 0.078 ms | 0.082 ms | 0.082 ms |
+| Expression column prefix | 0.002 ms | 0.003 ms | 0.003 ms | 0.003 ms |
+| Qualifier dot (one binding's columns) | 0.007 ms | 0.008 ms | 0.009 ms | 0.009 ms |
+| Schema dot (all relations of a schema) | 1.138 ms | 1.351 ms | 1.384 ms | 1.384 ms |
+| ctrl-space, empty relation prefix | 0.003 ms | 0.004 ms | 0.004 ms | 0.004 ms |
+| Function prefix | 0.003 ms | 0.004 ms | 0.004 ms | 0.004 ms |
+
+Cold (first request per buffer, including the parse + analysis) stayed under 1.7 ms in every case. The **< 5 ms** budget holds with margin; the schema-dot case is the heaviest because it materialises every relation of the schema before ranking.
 
 If profiling reveals that any stage consistently exceeds its budget, the engine must be optimized — the budget is not negotiable.
 
@@ -516,11 +508,11 @@ When the user types a character, the following sequence occurs:
 
 2. **BufferChanged** is published to the `EventBus`.
 
-3. **IntelligenceService** receives the event and calls `SemanticEngine::analyze` with the new `BufferSnapshot`.
+3. **IntelligenceService** receives the event and calls `SemanticEngine::analyze` with the real `Buffer` (stage 4 shipped `&mut Buffer`, not a snapshot).
 
-4. **SemanticEngine** compares the new tree against the cached previous tree (stored in `analysis_cache`). It identifies which scope nodes were added, removed, or modified, and re-analyzes only those scopes. Unchanged scopes are reused from the cache.
+4. **SemanticEngine** compares `Buffer::revision` against the analysis cached for that `SqlFileId`; any change invalidates it and the engine re-analyzes the whole buffer. (The spec's per-scope incremental re-analysis is not shipped: the revision compare plus cached `Arc<Analysis>` is what keeps the request path cheap, and whole-buffer analysis is ~1 ms at 10 MB.)
 
-5. **Diagnostics** for the changed regions are recomputed. Diagnostics for unchanged regions remain valid (they were computed in a previous pass and cached).
+5. **Diagnostics** for the whole buffer are recomputed as part of that pass; none are carried over from the previous `Analysis`.
 
 6. **The updated `Analysis`** is stored in the cache and made available to `complete`, `hover`, and `definition` calls.
 
@@ -530,7 +522,7 @@ When a `SchemaRefreshed` event arrives:
 
 1. **CatalogCache** is rebuilt from the new `SchemaSnapshot`. This is a background operation — completion requests during the rebuild continue using the old catalog (stale but consistent).
 
-2. **SemanticEngine** receives notification that the catalog changed. It invalidates any cached catalog-dependent analysis (specifically, type inference results that depend on column types from the catalog).
+2. **SemanticEngine** receives notification that the catalog changed (`set_catalog`). It swaps the `Arc<CatalogCache>` and clears every cached `Analysis` — all resolution results are catalog-dependent.
 
 3. **Next completion request** uses the new catalog. The transition is seamless — the user sees no flicker or interruption.
 
