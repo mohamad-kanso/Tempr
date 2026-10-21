@@ -167,8 +167,25 @@ impl Binding {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Scope {
     pub range: Range<usize>,
+    /// CTEs registered by this region's `WITH` clause, in declaration
+    /// order. A CTE shadows a catalog relation of the same folded name when
+    /// used as a qualifier and is not referenced by bare-column resolution
+    /// unless its columns are themselves bound into `bindings` from its
+    /// body's `FROM`.
+    pub ctes: Vec<Binding>,
     pub bindings: Vec<Binding>,
     pub children: Vec<Scope>,
+}
+
+impl Scope {
+    /// Find a source by qualifier across this scope's CTEs (shadowing first)
+    /// and bindings.
+    pub fn qualifier_binding(&self, qualifier: &str) -> Option<&Binding> {
+        self.ctes
+            .iter()
+            .chain(self.bindings.iter())
+            .find(|b| b.matches_qualifier(qualifier))
+    }
 }
 
 impl Scope {

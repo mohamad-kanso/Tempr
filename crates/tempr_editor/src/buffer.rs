@@ -152,6 +152,19 @@ impl Buffer {
         self.syntax_dirty
     }
 
+    /// The syntax tree, borrowable immutably, *only if* it is fresh. The
+    /// engine's walk pattern is `buffer.syntax()` first (possibly an
+    /// incremental reparse), then `fresh_syntax()` — `Node`s borrow the tree,
+    /// which lives inside the buffer, so walking must not require the `&mut`
+    /// that `syntax()` needs.
+    pub fn fresh_syntax(&self) -> Option<&SyntaxTree> {
+        if self.syntax_dirty {
+            None
+        } else {
+            self.syntax.as_ref()
+        }
+    }
+
     /// Monotonic *text* revision: bumped by every edit, undo and redo, and
     /// untouched by failed edits. Read-path caches (the semantic engine's
     /// analysis cache) validate reuse with an integer compare against this;

@@ -10,9 +10,11 @@
 
 pub mod analysis;
 pub mod catalog;
+pub mod semantic;
 
 #[cfg(test)]
 mod probe;
 
 pub use analysis::{Analysis, Binding, ColumnRef, Diagnostic, DiagnosticKind, Scope, Severity};
 pub use catalog::{CatalogCache, CatalogEntry, CatalogStats};
+pub use semantic::SemanticEngine;
