@@ -1,6 +1,8 @@
-//! Small in-house fuzzy matcher for the command palette (docs/11-gpui.md
-//! → Palette). Case-insensitive subsequence match with a score that favours
-//! consecutive runs and word starts; no external dependency.
+//! Shared text matching: the in-house fuzzy matcher used by the command
+//! palette (docs/11-gpui.md → Palette) and by completion ranking
+//! (docs/12-sql-intelligence.md → Completion Pipeline). Case-insensitive
+//! subsequence match with a score that favours consecutive runs and word
+//! starts; no external dependency.
 
 /// A successful match: higher `score` is better; `indices` are the byte
 /// offsets of the matched characters in the candidate (for highlighting).
