@@ -237,6 +237,16 @@ impl Analysis {
         ordered.first().copied()
     }
 
+    /// The last diagnostic starting strictly before `from`; errors before
+    /// warnings at the same start (navigation moves backwards, so "strictly"
+    /// keeps `shift-f8` from returning the diagnostic the cursor is on).
+    pub fn previous_diagnostic(&self, from: usize) -> Option<&Diagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.range.start < from)
+            .max_by_key(|d| (d.range.start, std::cmp::Reverse(d.kind.sort_key())))
+    }
+
     /// Scopes containing `offset`, outermost first. A child scope wins over
     /// its parent (the cursor is in the innermost region), and at one level
     /// the latest containing sibling wins, so an offset on a shared boundary
@@ -408,6 +418,42 @@ mod tests {
         let next = analysis.next_diagnostic(0).expect("diagnostics exist");
         assert_eq!(next.message, "unknown", "error beats earlier warning");
         assert_eq!(next.kind, DiagnosticKind::UnknownColumn);
+    }
+
+    #[test]
+    fn previous_diagnostic_is_strictly_before_and_orders_severity() {
+        let analysis = Analysis {
+            scopes: vec![],
+            diagnostics: vec![
+                Diagnostic::new(DiagnosticKind::AmbiguousColumn, 2..4, "warning".into()),
+                Diagnostic::new(DiagnosticKind::UnknownColumn, 2..4, "error".into()),
+                Diagnostic::new(DiagnosticKind::UnknownColumn, 10..12, "later".into()),
+            ],
+        };
+        assert_eq!(
+            analysis
+                .previous_diagnostic(10)
+                .expect("earlier diagnostics")
+                .message,
+            "error",
+            "at the same start the error is the earlier stop"
+        );
+        assert_eq!(
+            analysis
+                .previous_diagnostic(11)
+                .expect("earlier diagnostics")
+                .message,
+            "later",
+            "a diagnostic that starts before the cursor is still a candidate"
+        );
+        assert!(
+            analysis.previous_diagnostic(2).is_none(),
+            "nothing starts before the first diagnostic"
+        );
+        assert!(
+            analysis.previous_diagnostic(10_000).is_some(),
+            "the last diagnostic is the previous one from EOF"
+        );
     }
 
     #[test]

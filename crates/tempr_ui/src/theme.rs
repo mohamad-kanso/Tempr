@@ -11,6 +11,7 @@ pub const TEXT_DIM: u32 = 0x6c7086;
 pub const ACCENT: u32 = 0x89b4fa;
 pub const SELECTION: u32 = 0x89b4fa;
 pub const ERROR: u32 = 0xf38ba8;
+pub const WARNING: u32 = 0xf9e2af;
 pub const SUCCESS: u32 = 0xa6e3a1;
 
 // Syntax highlight colors keyed by tree-sitter capture name (queries/highlights.scm).

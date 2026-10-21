@@ -124,7 +124,7 @@ const PAL: Option<&str> = Some(palette::KEY_CONTEXT);
 const ED: Option<&str> = Some(ed::KEY_CONTEXT);
 /// Completion bindings share one context that only exists while the popup is
 /// open; every command carrying it is hidden from palette search.
-const COMPL: Option<&str> = Some(completion::KEY_CONTEXT);
+const COMPL: Option<&str> = Some(completion::BINDING_CONTEXT);
 
 /// Every core command. Order here is only the fallback for the palette
 /// (it sorts by category/title anyway).
@@ -441,14 +441,14 @@ mod tests {
             assert!(s.hidden, "{} must not appear in palette search", s.id);
             assert_eq!(
                 s.context,
-                Some("Editor Completion"),
+                Some(completion::BINDING_CONTEXT),
                 "{} must only fire while the popup is open",
                 s.id
             );
         }
         for s in specs
             .iter()
-            .filter(|s| s.context == Some("Editor Completion"))
+            .filter(|s| s.context == Some(completion::BINDING_CONTEXT))
         {
             assert!(
                 s.id.as_str().starts_with("completion::"),

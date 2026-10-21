@@ -17,10 +17,10 @@ use gpui::{
 use tempr_domain::{
     Batch, ColumnSpec, Connection, ConnectionId, ConnectionState, QueryOutcome, QueryRunId,
 };
-use tempr_events::EventBus;
+use tempr_events::{AppEvent, EventBus};
 use tempr_services::{
-    CommandService, ConnectionService, IntelligenceService, QueryService, RowSink, SchemaService,
-    ServiceError,
+    CommandService, ConnectionService, IntelligenceService, QueryService, RefreshPath, RowSink,
+    SchemaService, ServiceError,
 };
 
 use crate::commands;
@@ -150,7 +150,10 @@ impl MainWindow {
             |this, _editor, event, window, cx| match event {
                 EditorEvent::Run(sql) => this.run_sql(sql.clone(), window, cx),
                 EditorEvent::Notice(text) => this.set_status(text.clone(), true, cx),
-                EditorEvent::Changed => {}
+                EditorEvent::Changed => {
+                    let file = this.editor.read(cx).file_id();
+                    this.services.bus.publish(AppEvent::BufferChanged { file });
+                }
             },
         );
 
@@ -281,6 +284,89 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.start_bench(window, cx);
+    }
+
+    // ── schema refresh ───────────────────────────────────────────────────
+
+    fn refresh_schema_action(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_schema(false, false, cx);
+    }
+
+    fn refresh_incremental_action(
+        &mut self,
+        _: &RefreshIncremental,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_schema(false, true, cx);
+    }
+
+    fn refresh_all_action(
+        &mut self,
+        _: &RefreshAllSchemas,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_schema(true, false, cx);
+    }
+
+    /// Run the refresh on tokio and report counts (or the error) in the
+    /// status bar. The catalog swap itself happens in the intelligence
+    /// service when `SchemaRefreshed` arrives.
+    fn refresh_schema(&mut self, all: bool, incremental: bool, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection_id() else {
+            self.set_status("No connection configured (DATABASE_URL).", true, cx);
+            return;
+        };
+        self.set_status(
+            if incremental {
+                "Checking schema…"
+            } else {
+                "Refreshing schema…"
+            },
+            false,
+            cx,
+        );
+        let schema = self.services.schema.clone();
+        let task = gpui_compat::spawn_tokio(cx, async move {
+            if incremental {
+                schema
+                    .refresh_incremental(connection)
+                    .await
+                    .map(|(snapshot, path)| (snapshot, Some(path)))
+            } else if all {
+                schema
+                    .refresh_all_schemas(connection)
+                    .await
+                    .map(|snapshot| (snapshot, None))
+            } else {
+                schema
+                    .refresh(connection)
+                    .await
+                    .map(|snapshot| (snapshot, None))
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            this.update(cx, |this, cx| match outcome {
+                Ok(Ok((snapshot, path))) => {
+                    let text = match path {
+                        Some(RefreshPath::Unchanged) => "Schema unchanged".to_string(),
+                        Some(RefreshPath::Incremental { schemas, touched }) => {
+                            format!("Schema refreshed — {touched} changes across {schemas} schemas")
+                        }
+                        Some(RefreshPath::FullRefresh(_)) | None => {
+                            format!("Schema refreshed — {} objects", snapshot.objects.len())
+                        }
+                    };
+                    this.set_status(text, false, cx);
+                }
+                Ok(Err(e)) => this.set_status(format!("Schema refresh failed: {e}"), true, cx),
+                Err(join) => this.set_status(format!("Schema task failed: {join}"), true, cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_palette_action(
@@ -455,6 +541,18 @@ impl MainWindow {
                 let rows = self.grid.read(cx).row_count();
                 self.set_status(format!("Running… {rows} {}", row_word(rows)), false, cx);
             }
+            UiEvent::DiagnosticsReady { file } if file == self.editor.read(cx).file_id() => {
+                self.editor
+                    .update(cx, |editor, cx| editor.on_diagnostics(cx));
+                let summary = self.editor.read(cx).diagnostics_summary();
+                self.set_status(format!("Diagnostics: {}", summary.text()), false, cx);
+            }
+            UiEvent::SchemaRefreshFailed {
+                connection,
+                message,
+            } if Some(connection) == self.connection_id() => {
+                self.set_status(format!("Schema refresh failed: {message}"), true, cx);
+            }
             // QueryStarted/QueryFinished: the outcome task owns final status.
             _ => {}
         }
@@ -558,6 +656,9 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::cancel_query_action))
             .on_action(cx.listener(Self::bench_action))
             .on_action(cx.listener(Self::toggle_palette_action))
+            .on_action(cx.listener(Self::refresh_schema_action))
+            .on_action(cx.listener(Self::refresh_incremental_action))
+            .on_action(cx.listener(Self::refresh_all_action))
             .relative()
             .flex()
             .flex_col()
