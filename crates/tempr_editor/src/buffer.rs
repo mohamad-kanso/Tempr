@@ -105,6 +105,11 @@ pub struct Buffer {
     syntax_dirty: bool,
     file_id: SqlFileId,
     next_edit: u64,
+    /// Monotonic counter bumped on *every* change to the buffer's text —
+    /// edits, undo, redo. Unlike `EditId` (which undo reuses), this is a
+    /// reliable "text changed" key for read-path caches such as the
+    /// semantic engine's analysis cache.
+    revision: u64,
 }
 
 impl Buffer {
@@ -116,6 +121,7 @@ impl Buffer {
             history: EditHistory::default(),
             syntax: None,
             syntax_dirty: true,
+            revision: 0,
             file_id,
             next_edit: 1,
         }
@@ -144,6 +150,15 @@ impl Buffer {
     /// True when the tree is missing or edits are pending a `reparse`.
     pub fn is_syntax_dirty(&self) -> bool {
         self.syntax_dirty
+    }
+
+    /// Monotonic *text* revision: bumped by every edit, undo and redo, and
+    /// untouched by failed edits. Read-path caches (the semantic engine's
+    /// analysis cache) validate reuse with an integer compare against this;
+    /// `EditId` cannot serve — `undo` restores an earlier text state while
+    /// reusing an id.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The parse tree, brought up to date first.
@@ -297,6 +312,7 @@ impl Buffer {
 
         let id = EditId(self.next_edit);
         self.next_edit += 1;
+        self.revision += 1;
         self.history.undo.push(Transaction {
             id,
             changes,
@@ -341,6 +357,7 @@ impl Buffer {
             self.replace_bytes(range, &change.removed);
         }
         let id = tx.id;
+        self.revision += 1; // undo moved the text: analysis caches must drop
         self.history.redo.push(tx);
         Some(id)
     }
@@ -353,6 +370,7 @@ impl Buffer {
             self.replace_bytes(range, &change.inserted);
         }
         let id = tx.id;
+        self.revision += 1; // redo moved the text: analysis caches must drop
         self.history.undo.push(tx);
         Some(id)
     }
@@ -587,6 +605,47 @@ mod tests {
         b.edit(&[(1..1, "z")]).unwrap();
         assert!(!b.can_redo());
         assert_eq!(b.text().to_string(), "xz");
+    }
+
+    #[test]
+    fn revision_moves_on_every_text_mutation_including_undo_redo() {
+        // The analysis cache validates "can I reuse this analysis" by an
+        // integer compare, so the revision must move on every change to the
+        // buffer's *text* — including state changes the edit-id machinery
+        // deliberately reuses (`undo` returns to an earlier state while
+        // minting no new EditId).
+        let mut b = buf("");
+        assert_eq!(b.revision(), 0, "fresh buffer");
+
+        let first = (b.edit(&[(0..0, "a")]).is_ok(), b.revision());
+        let second = (b.edit(&[(1..1, "c")]).is_ok(), b.revision());
+        assert!(
+            second.1 > first.1,
+            "a second successful edit must move the revision"
+        );
+
+        let before_undo = b.revision();
+        let _ = b.undo();
+        assert!(
+            b.revision() > before_undo,
+            "undo changes the text: revision must move"
+        );
+
+        let before_redo = b.revision();
+        let _ = b.redo();
+        assert!(
+            b.revision() > before_redo,
+            "redo changes the text: revision must move"
+        );
+
+        // A failed edit changes nothing.
+        let before_fail = b.revision();
+        assert!(b.edit(&[(0..2048, "x")]).is_err());
+        assert_eq!(
+            b.revision(),
+            before_fail,
+            "failed edit must not move the revision"
+        );
     }
 
     #[test]
