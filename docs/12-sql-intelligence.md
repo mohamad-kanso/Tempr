@@ -409,9 +409,17 @@ classDiagram
     }
 
     class CatalogCache {
-        +tables(connection_id) Vec~Table~
-        +columns(table_id) Vec~Column~
-        +schemas() Vec~Schema~
+        +from_snapshot(snapshot) CatalogCache
+        +relation_exact(schema, name) Option~u32~
+        +relation_folded(schema, name) Vec~u32~
+        +columns_of(rel_idx) &~CatalogEntry~
+        +column_exact(rel_idx, name) Option~u32~
+        +column_folded(rel_idx, name) Vec~u32~
+        +prefix_search(prefix, cap) (Vec~u32~, bool)
+        +by_id(object_id) Option~u32~
+        +keywords() &[String]
+        +schemas() &[Box~str~]
+        +stats() &~CatalogStats~
     }
 
     class WorkspaceIndex {
@@ -427,6 +435,10 @@ classDiagram
 ```
 
 ---
+
+### Shipped catalog cache (`tempr_intel::CatalogCache`, Phase 3 stage 3)
+
+The catalog cache is an immutable, resolution-shaped arena built from one `SchemaSnapshot` (`CatalogCache::from_snapshot`): relations first, then functions, then columns grouped contiguously per relation in `ordinal` order, then indexes — every map holds `u32` arena indices, so "columns of this table" is a slice, not a scan. An unquoted SQL identifier folds to lower case (the `*_folded` lookups return a candidate list — coexisting `users` and quoted `"Users"` is ambiguity the *analyzer* reports, never guessed in the cache); a quoted identifier matches through the case-sensitive `*_exact` lookups. `prefix_search` runs over relation and function names via binary search on the folded `name_order`, capped with an overflow flag for the completion top-N heap. The structure is rebuilt wholesale per refresh and swapped behind an `Arc` when the `SemanticEngine` lands (stage 4); readers never see a half-updated catalog. Probe numbers live in `PROGRESS.md`'s session log: on a ~10 000-object synthetic catalog, the request-shape mix (`prefix_search` + `relation_folded` + `columns_of` + `column_folded`) costs p95 ≈ 0.002 ms — far inside the < 5 ms completion budget it shares with context classification, ranking and rendering.
 
 ## Completion Pipeline
 

@@ -10,4 +10,7 @@
 
 pub mod catalog;
 
+#[cfg(test)]
+mod probe;
+
 pub use catalog::{CatalogCache, CatalogEntry, CatalogStats};
