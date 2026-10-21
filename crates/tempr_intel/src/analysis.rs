@@ -126,13 +126,21 @@ pub struct Binding {
 }
 
 impl Binding {
-    /// Does this binding answer a qualifier? Aliases, the source's own name
-    /// and — for schema-qualified use — the schema all fold for the compare
-    /// (unquoted SQL identifiers are case-insensitive).
+    /// Does this binding answer a column qualifier? PostgreSQL rules: an
+    /// alias *replaces* the source's own name (`FROM users u` makes `users`
+    /// unresolvable), and a schema is never a column qualifier — schema
+    /// qualification is handled by the three-part path against the catalog.
+    /// Both names fold for the compare (unquoted SQL identifiers are
+    /// case-insensitive).
     pub fn matches_qualifier(&self, qualifier: &str) -> bool {
         let folded = qualifier.to_lowercase();
-        let hit = |s: Option<&Box<str>>| s.is_some_and(|s| s.to_lowercase() == folded);
-        hit(self.alias.as_ref()) || hit(self.name.as_ref()) || hit(self.schema.as_ref())
+        match &self.alias {
+            Some(alias) => alias.to_lowercase() == folded,
+            None => self
+                .name
+                .as_ref()
+                .is_some_and(|name| name.to_lowercase() == folded),
+        }
     }
 
     /// Positions of columns whose folded names match `name`. Catalog entries
@@ -214,7 +222,7 @@ impl Analysis {
     pub fn diagnostics_in(&self, query: Range<usize>) -> Vec<&Diagnostic> {
         self.diagnostics
             .iter()
-            .filter(|d| d.range.start < query.end && query.start < d.range.end.max(query.end))
+            .filter(|d| d.range.start < query.end && query.start < d.range.end)
             .collect()
     }
 
@@ -297,12 +305,30 @@ mod tests {
     }
 
     #[test]
-    fn qualifier_matches_alias_name_or_schema_folded() {
-        let bind = binding("U", &["id"]); // stored as whatever the query wrote
+    fn qualifier_matches_only_the_alias_when_one_is_stated() {
         // Unquoted SQL folds case-insensitively.
-        assert!(bind.matches_qualifier("u"));
-        assert!(bind.matches_qualifier("U"));
-        assert!(!bind.matches_qualifier("o"));
+        let aliased = binding("U", &["id"]);
+        assert!(aliased.matches_qualifier("u"));
+        assert!(aliased.matches_qualifier("U"));
+        assert!(!aliased.matches_qualifier("o"));
+
+        // An alias hides the source's own name and a schema is never a
+        // column qualifier (PostgreSQL: `select users.id from users u`
+        // errors, and so does `select public.name from users`).
+        let mut hidden = binding("u", &["id"]);
+        hidden.name = Some("users".into());
+        hidden.schema = Some("public".into());
+        assert!(hidden.matches_qualifier("u"));
+        assert!(!hidden.matches_qualifier("users"));
+        assert!(!hidden.matches_qualifier("public"));
+
+        // Without an alias the source name answers, still never the schema.
+        let bare = Binding {
+            name: Some("users".into()),
+            ..Binding::default()
+        };
+        assert!(bare.matches_qualifier("USERS"));
+        assert!(!bare.matches_qualifier("public"));
     }
 
     #[test]
@@ -373,5 +399,24 @@ mod tests {
         let hits = analysis.diagnostics_in(11..60);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].message, "one");
+    }
+
+    #[test]
+    fn diagnostics_in_excludes_ranges_outside_the_query() {
+        let analysis = Analysis {
+            scopes: vec![],
+            diagnostics: vec![
+                // Entirely before the query: used to be returned because the
+                // filter compared against `max(diagnostic.end, query.end)`.
+                Diagnostic::new(DiagnosticKind::UnknownColumn, 0..5, "before".into()),
+                // Ending exactly at the query start: not overlapping.
+                Diagnostic::new(DiagnosticKind::UnknownColumn, 10..15, "touching".into()),
+                Diagnostic::new(DiagnosticKind::UnknownColumn, 16..20, "inside".into()),
+                Diagnostic::new(DiagnosticKind::UnknownColumn, 30..35, "after".into()),
+            ],
+        };
+        let hits = analysis.diagnostics_in(15..30);
+        assert_eq!(hits.len(), 1, "{:?}", hits);
+        assert_eq!(hits[0].message, "inside");
     }
 }

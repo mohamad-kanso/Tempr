@@ -32,6 +32,8 @@
 - [ ] Pinned `tree-sitter-sequel` 0.3 grammar gaps produce `ERROR` fragments the analyzer must tiptoe around (stage 4 grammar findings): `delete … using`, `insert … on conflict (…)`, `limit $N offset $N` with parameters, and `select distinct on (…)`. Bump the grammar (or upstream-patch) when a version exposes these without ERROR nodes — until then the engine reports straight syntax diagnostics for those fragments and suppresses semantic ones there
 - [ ] Star expansion (`select *` / `select t.*`) deferred to stage 5 (first consumer: completion/hover); stage 4's bindings already carry the column lists to expand against. Grammar note: `u.*` parses to `all_fields` with *no* qualifier child — slice the raw text by byte range instead of trusting children
 - [ ] Folded-ambiguity park: a folded relation match that is not unique (e.g. `users` beside a quoted `"Users"` in the same schema) resolves to nothing and stays silent — no `Resolution` kind fits the diagnostics model, and the spec defines no ambiguous-relation diagnostic; add one if real schemas ever hit it
+- [ ] LATERAL function items (`cross join lateral generate_series(…) g`) bind their alias but carry no column knowledge until stage 5 derives columns from function signatures — until then `g.x` stays silent rather than erroring
+- [ ] FROM-subquery bodies currently inherit the enclosing region's bindings as if they were correlated; PostgreSQL only allows that for `LATERAL` items (a plain `from (select zz from t) x` must not see `x.zz` from the parent). Conservative silence today — tighten the frame chain for non-lateral FROM subqueries in stage 5 when completion consumes the scopes
 
 ## Next
 
@@ -55,7 +57,6 @@
 - [ ] Editing ops follow-ups: indent/outdent, join lines, transpose, select word/line, add cursor above/below, word motions across line breaks for `prev_word_boundary` when the previous line is empty
 - [ ] `EditHistory` bounds: cap depth and coalesce typing bursts (today every keystroke stores its removed/inserted text forever; a select-all + paste on a 10 MB file retains full copies)
 - [ ] Phase 3: Completion provider (context-aware, < 5 ms, 10,000 objects)
-- [ ] Phase 3: Semantic analyzer (column ref resolution, ambiguity detection)
 - [ ] Phase 3: Real-time diagnostics (syntax via tree-sitter + semantic via analyzer)
 - [ ] Phase 3: Hover type information
 - [ ] Phase 4: Plugin API stabilization (versioned, documented)

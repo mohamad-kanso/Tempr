@@ -14,6 +14,7 @@
 //! `BufferChanged` — it is a pure model; the owning service publishes.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ropey::Rope;
 use tempr_domain::SqlFileId;
@@ -28,6 +29,17 @@ use crate::syntax::{Highlight, StatementRange, SyntaxTree};
 /// re-applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EditId(pub u64);
+
+/// Process-wide source of text revisions. Values are handed out on buffer
+/// creation and on every text mutation, so a revision identifies one text
+/// state of one buffer instance — two `Buffer`s (even over the same file,
+/// even freshly opened at "no edits") never share one. Caches keyed by
+/// `(file, revision)` therefore cannot serve an entry from another buffer.
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A (line, column) position. `column` is a **byte** offset within the line
 /// (0-based); line breaks are not part of a line's columns.
@@ -105,10 +117,11 @@ pub struct Buffer {
     syntax_dirty: bool,
     file_id: SqlFileId,
     next_edit: u64,
-    /// Monotonic counter bumped on *every* change to the buffer's text —
-    /// edits, undo, redo. Unlike `EditId` (which undo reuses), this is a
-    /// reliable "text changed" key for read-path caches such as the
-    /// semantic engine's analysis cache.
+    /// Process-unique text revision: assigned on creation and re-assigned on
+    /// *every* change to the buffer's text — edits, undo, redo. Unlike
+    /// `EditId` (which undo reuses), this is a reliable "which text state"
+    /// key for read-path caches such as the semantic engine's analysis
+    /// cache; values are never shared between buffer instances.
     revision: u64,
 }
 
@@ -121,7 +134,7 @@ impl Buffer {
             history: EditHistory::default(),
             syntax: None,
             syntax_dirty: true,
-            revision: 0,
+            revision: next_revision(),
             file_id,
             next_edit: 1,
         }
@@ -165,11 +178,12 @@ impl Buffer {
         }
     }
 
-    /// Monotonic *text* revision: bumped by every edit, undo and redo, and
-    /// untouched by failed edits. Read-path caches (the semantic engine's
-    /// analysis cache) validate reuse with an integer compare against this;
-    /// `EditId` cannot serve — `undo` restores an earlier text state while
-    /// reusing an id.
+    /// Process-unique *text* revision: assigned when the buffer is created
+    /// and re-assigned by every edit, undo and redo; untouched by failed
+    /// edits. Values are never shared between buffer instances, so
+    /// read-path caches (the semantic engine's analysis cache) can validate
+    /// reuse with an integer compare against this; `EditId` cannot serve —
+    /// `undo` restores an earlier text state while reusing an id.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -325,7 +339,7 @@ impl Buffer {
 
         let id = EditId(self.next_edit);
         self.next_edit += 1;
-        self.revision += 1;
+        self.revision = next_revision();
         self.history.undo.push(Transaction {
             id,
             changes,
@@ -370,7 +384,7 @@ impl Buffer {
             self.replace_bytes(range, &change.removed);
         }
         let id = tx.id;
-        self.revision += 1; // undo moved the text: analysis caches must drop
+        self.revision = next_revision(); // undo moved the text: caches must drop
         self.history.redo.push(tx);
         Some(id)
     }
@@ -383,7 +397,7 @@ impl Buffer {
             self.replace_bytes(range, &change.inserted);
         }
         let id = tx.id;
-        self.revision += 1; // redo moved the text: analysis caches must drop
+        self.revision = next_revision(); // redo moved the text: caches must drop
         self.history.undo.push(tx);
         Some(id)
     }
@@ -628,7 +642,15 @@ mod tests {
         // deliberately reuses (`undo` returns to an earlier state while
         // minting no new EditId).
         let mut b = buf("");
-        assert_eq!(b.revision(), 0, "fresh buffer");
+        assert!(
+            b.revision() > 0,
+            "fresh buffer carries a process-unique revision"
+        );
+        assert_ne!(
+            b.revision(),
+            buf("").revision(),
+            "buffer instances never share a revision (analysis caches key on it)"
+        );
 
         let first = (b.edit(&[(0..0, "a")]).is_ok(), b.revision());
         let second = (b.edit(&[(1..1, "c")]).is_ok(), b.revision());

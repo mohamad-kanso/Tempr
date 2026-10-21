@@ -186,51 +186,117 @@ impl<'a> Walker<'a> {
 
     // === Region analysis ===
 
-    /// Analyze one region (statement / subquery body / CTE body). `outer`
-    /// holds the enclosing frames, nearest first.
+    /// Analyze one region. A region is a *container* of clause siblings, not
+    /// the `select` node: a `statement`/`subquery` holds `select`, `from`,
+    /// `where`, … as siblings, so walking only the `select` would lose every
+    /// binding and predicate (the grammar shape the stage-4 probe recorded).
+    /// `outer` holds the enclosing frames, nearest first.
     fn walk_region(&mut self, region: Node<'a>, outer: &Frames) -> Scope {
-        let region = unwrap_subquery(region);
+        if region.kind() == "ERROR" {
+            // A root-level fragment that is nothing but an error.
+            self.diags.push(Diagnostic::new(
+                DiagnosticKind::SyntaxError,
+                region.byte_range(),
+                "syntax error".into(),
+            ));
+            return Scope {
+                range: region.byte_range(),
+                ..Scope::default()
+            };
+        }
 
-        // ---- Phase A: CTEs in declaration order, then the region's
-        // relations, with no subquery body analyzed yet.
-        let is_setop = !direct(region, "set_operation").is_empty();
+        // CTEs in declaration order. For a subquery carrying its own `WITH`
+        // the `cte` nodes are direct children of the `subquery` node.
         let mut ctes: Vec<Binding> = Vec::new();
         for cte in direct(region, "cte") {
             ctes.push(self.cte_binding(cte, &ctes));
         }
-        let mut bindings = Vec::new();
-        if !is_setop {
-            // A set-operation statement binds nothing itself: each `select`
-            // side is its own scope below, and merging both sides' bindings
-            // would invent ambiguity the server does not see.
-            self.phase_a(region, &ctes, outer, &mut bindings);
-        }
-        let frame = Frame { ctes, bindings };
 
-        // ---- Phase B: subquery and CTE bodies, now that the frame is whole.
+        let nested_setops = direct(region, "set_operation");
+        if region.kind() == "set_operation" || !nested_setops.is_empty() {
+            return self.walk_set_operation(region, ctes, outer, nested_setops);
+        }
+
+        let parts = kids(region);
+        self.walk_parts(parts, region.byte_range(), ctes, Some(region), outer)
+    }
+
+    /// A set-operation region: the statement itself binds nothing; each
+    /// `select` side and its clause siblings form their own scope. Merging
+    /// the sides' bindings would invent ambiguity the server does not see.
+    fn walk_set_operation(
+        &mut self,
+        region: Node<'a>,
+        ctes: Vec<Binding>,
+        outer: &Frames,
+        ops: Vec<Node<'a>>,
+    ) -> Scope {
+        let frame = Frame {
+            ctes,
+            bindings: Vec::new(),
+        };
         let mut full: Frames = vec![frame.clone()];
         full.extend(outer.iter().cloned());
         let mut children = Vec::new();
+        // CTE bodies of the statement (only earlier CTEs visible inside).
         self.cte_body_scopes(region, &frame, &full, &mut children);
-        if is_setop {
-            // Grammar shape (probe): `set_operation` holds both `select`
-            // sides; `order_by`/`limit` hang off the last side's `from`.
-            let sides = direct(region, "select").into_iter().chain(
-                direct(region, "set_operation")
-                    .into_iter()
-                    .flat_map(|op| direct(op, "select")),
-            );
-            for side in sides {
-                children.push(self.walk_region(side, &full));
-            }
+        let ops = if region.kind() == "set_operation" {
+            vec![region]
         } else {
-            self.collect_subqueries(region, &full, &mut children);
-            // ---- Resolution for this region's own references only.
-            self.resolve_region_fields(region, &frame, &full);
+            ops
+        };
+        for op in ops {
+            for side in set_operation_sides(op) {
+                let range = parts_range(&side);
+                children.push(self.walk_parts(side, range, Vec::new(), None, &full));
+            }
         }
-
         Scope {
             range: region.byte_range(),
+            ctes: frame.ctes.clone(),
+            bindings: Vec::new(),
+            children,
+        }
+    }
+
+    /// Analyze one region body from its top-level clause nodes (`select`,
+    /// `from`, `where`, …). `cte_owner` is the node whose direct `cte`
+    /// children need their bodies analyzed; side scopes pass `None`.
+    fn walk_parts(
+        &mut self,
+        parts: Vec<Node<'a>>,
+        range: Range<usize>,
+        ctes: Vec<Binding>,
+        cte_owner: Option<Node<'a>>,
+        outer: &Frames,
+    ) -> Scope {
+        // ---- Phase A: CTEs are already bound; collect relations without
+        // analyzing subquery bodies.
+        let mut bindings = Vec::new();
+        for part in &parts {
+            self.phase_a(*part, &ctes, outer, &mut bindings);
+        }
+        let frame = Frame { ctes, bindings };
+
+        // ---- Phase B: subquery and CTE bodies over the complete frame.
+        let mut full: Frames = vec![frame.clone()];
+        full.extend(outer.iter().cloned());
+        let mut children = Vec::new();
+        if let Some(owner) = cte_owner {
+            self.cte_body_scopes(owner, &frame, &full, &mut children);
+        }
+        for part in &parts {
+            if part.kind() == "set_operation" {
+                // A parenthesized set-operation side: its own scopes.
+                children.push(self.walk_region(*part, &full));
+            } else {
+                self.collect_subqueries(*part, &full, &mut children);
+            }
+        }
+        self.resolve_parts(&parts, &frame, &full);
+
+        Scope {
+            range,
             ctes: frame.ctes.clone(),
             bindings: frame.bindings.clone(),
             children,
@@ -263,14 +329,13 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Analyze every `subquery` body in the region's subtree (source order,
-    /// each exactly once; found subqueries are not descended into).
+    /// Analyze every `subquery` body in the parts' subtrees (source order,
+    /// each exactly once; found subqueries are not descended into here — the
+    /// body owns its own walk).
     fn collect_subqueries(&mut self, node: Node<'a>, full: &Frames, out: &mut Vec<Scope>) {
         match node.kind() {
             "subquery" => {
-                let inner = unwrap_subquery(node);
-                let sub = self.walk_region(inner, full);
-                out.push(sub);
+                out.push(self.walk_region(node, full));
                 return;
             }
             "ERROR" | "cte" => return, // CTE bodies handled in `walk_region`
@@ -295,13 +360,24 @@ impl<'a> Walker<'a> {
     ) {
         match node.kind() {
             "field" | "literal" | "parameter" | "all_fields" | "invocation" | "case"
-            | "subquery" | "cte" | "ERROR" => {}
+            | "subquery" | "cte" | "ERROR" | "set_operation" => {}
             k if k.starts_with("keyword_") => {}
             "relation" => self.relation_item(node, ctes, outer, bindings),
-            "lateral_join" => self.lateral_item(node, bindings),
-            "delete" | "insert" => {
+            "lateral_join" | "lateral_cross_join" => self.lateral_item(node, bindings),
+            "from" => {
+                // `DELETE FROM t` keeps the target in the statement-level
+                // `from` sibling, not under `delete` (grammar shape).
+                if is_delete_target_clause(node) {
+                    self.dml_from(node, ctes, outer, bindings);
+                }
+                for child in kids(node) {
+                    self.phase_a(child, ctes, outer, bindings);
+                }
+            }
+            "insert" => {
                 self.dml_target(node, ctes, outer, bindings);
-                // Keep descending: an `UPDATE`-style `FROM` may join others.
+                // Keep descending: the `INSERT … SELECT … FROM` source may
+                // bind more relations.
                 for child in kids(node) {
                     self.phase_a(child, ctes, outer, bindings);
                 }
@@ -337,7 +413,7 @@ impl<'a> Walker<'a> {
         if let Some(sub) = subquery {
             // FROM-subquery: columns derive from its select list; its body
             // analysis is phase B's job.
-            let columns = self.select_list_columns(unwrap_subquery(sub));
+            let columns = self.select_list_columns(sub);
             bindings.push(Binding {
                 alias: alias.map(|(a, _)| a.into()),
                 name: None,
@@ -405,29 +481,35 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// A `LATERAL (subquery) alias` join. The alias is the direct trailing
-    /// `identifier` child of the `lateral_join` node (the subquery's own
-    /// identifiers are not direct children).
+    /// A `LATERAL` join item: `(subquery)` or a function/invocation such as
+    /// `generate_series(…)`. The alias is the direct trailing `identifier`
+    /// child of the lateral node (the item's own identifiers are nested).
+    /// Function items carry no column knowledge yet — stage 5's problem —
+    /// but their alias must still bind so `g.x` does not report a missing
+    /// relation.
     fn lateral_item(&mut self, node: Node<'a>, bindings: &mut Vec<Binding>) {
-        let subquery = direct(node, "subquery").first().copied();
-        if let Some(sub) = subquery {
-            let alias = direct(node, "identifier")
-                .first()
-                .map(|c| self.text(c.byte_range()));
-            let columns = self.select_list_columns(unwrap_subquery(sub));
-            bindings.push(Binding {
-                alias: alias.map(Into::into),
-                name: None,
-                schema: None,
-                object: None,
-                columns,
-                range: node.byte_range(),
-            });
+        let alias = direct(node, "identifier")
+            .first()
+            .map(|c| self.text(c.byte_range()));
+        let columns = direct(node, "subquery")
+            .first()
+            .map(|sub| self.select_list_columns(*sub))
+            .unwrap_or_default();
+        if alias.is_none() && columns.is_empty() {
+            return;
         }
+        bindings.push(Binding {
+            alias: alias.map(Into::into),
+            name: None,
+            schema: None,
+            object: None,
+            columns,
+            range: node.byte_range(),
+        });
     }
 
-    /// `DELETE FROM t …` / `INSERT INTO t …` targets carry a bare
-    /// `object_reference` instead of a `relation` node.
+    /// `INSERT INTO t …` keeps its target as a direct `object_reference`
+    /// child of the `insert` node.
     fn dml_target(
         &mut self,
         node: Node<'a>,
@@ -441,6 +523,35 @@ impl<'a> Walker<'a> {
         else {
             return;
         };
+        self.bind_target(target, None, ctes, outer, bindings);
+    }
+
+    /// `DELETE FROM t …` keeps its target in the statement-level `from`
+    /// sibling: the `delete` node itself holds only `keyword_delete`.
+    fn dml_from(
+        &mut self,
+        from: Node<'a>,
+        ctes: &[Binding],
+        outer: &Frames,
+        bindings: &mut Vec<Binding>,
+    ) {
+        let Some(target) = direct(from, "object_reference").first().copied() else {
+            return;
+        };
+        let alias = direct(from, "identifier")
+            .first()
+            .map(|c| self.text(c.byte_range()));
+        self.bind_target(target, alias, ctes, outer, bindings);
+    }
+
+    fn bind_target(
+        &mut self,
+        target: Node<'a>,
+        alias: Option<String>,
+        ctes: &[Binding],
+        outer: &Frames,
+        bindings: &mut Vec<Binding>,
+    ) {
         let parts = self.identifier_parts(target);
         if parts.is_empty() {
             return;
@@ -449,7 +560,7 @@ impl<'a> Walker<'a> {
         let range = object_span(&parts);
         match self.resolve_relation(&names, ctes, outer) {
             Resolution::Cte(cte) => bindings.push(Binding {
-                alias: None,
+                alias: alias.map(Into::into),
                 name: cte.name.clone(),
                 schema: None,
                 object: None,
@@ -457,7 +568,7 @@ impl<'a> Walker<'a> {
                 range,
             }),
             Resolution::Catalog { idx } => bindings.push(Binding {
-                alias: None,
+                alias: alias.map(Into::into),
                 name: Some(
                     self.catalog
                         .object(idx)
@@ -490,29 +601,45 @@ impl<'a> Walker<'a> {
 
     // === Resolution ===
 
-    /// Resolve this region's own column references: walk the subtree, skip
-    /// deferred territory (`subquery`, `cte`), and lift `ERROR` fragments
-    /// into syntax diagnostics (suppressing everything nested there).
-    fn resolve_region_fields(&mut self, region: Node<'a>, frame: &Frame, full: &Frames) {
-        let mut stack = vec![region];
-        while let Some(node) = stack.pop() {
-            match node.kind() {
-                "field" => self.resolve_field(node, frame, full),
-                "subquery" | "cte" => continue, // deferred territory
+    /// Resolve one region's own column references: walk each top-level clause
+    /// part, skip deferred territory (`subquery`, `cte`, a nested
+    /// set-operation side), and lift `ERROR` fragments into syntax
+    /// diagnostics (suppressing everything nested there).
+    fn resolve_parts(&mut self, parts: &[Node<'a>], frame: &Frame, full: &Frames) {
+        for part in parts {
+            match part.kind() {
+                "set_operation" => continue, // owns its sides' scopes
+                "subquery" | "cte" => continue,
                 "ERROR" => {
-                    self.diags.push(Diagnostic::new(
-                        DiagnosticKind::SyntaxError,
-                        node.byte_range(),
-                        "syntax error".into(),
-                    ));
+                    self.push_syntax_error(*part);
                     continue;
                 }
                 _ => {}
             }
-            for child in kids(node) {
-                stack.push(child);
+            let mut stack = vec![*part];
+            while let Some(node) = stack.pop() {
+                match node.kind() {
+                    "field" => self.resolve_field(node, frame, full),
+                    "subquery" | "cte" => continue, // deferred territory
+                    "ERROR" => {
+                        self.push_syntax_error(node);
+                        continue;
+                    }
+                    _ => {}
+                }
+                for child in kids(node) {
+                    stack.push(child);
+                }
             }
         }
+    }
+
+    fn push_syntax_error(&mut self, node: Node<'a>) {
+        self.diags.push(Diagnostic::new(
+            DiagnosticKind::SyntaxError,
+            node.byte_range(),
+            "syntax error".into(),
+        ));
     }
 
     fn resolve_field(&mut self, node: Node<'a>, frame: &Frame, full: &Frames) {
@@ -561,47 +688,53 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Bare reference: scan every frame's relation bindings (own first, then
-    /// the enclosing frames nearest first). CTEs are not candidates: their
-    /// columns participate only when the CTE is genuinely `FROM`-bound.
+    /// Bare reference: resolve level by level, innermost first. The nearest
+    /// scope that has *any* match decides — PostgreSQL only falls back to an
+    /// enclosing query when the inner scope's sources do not provide the
+    /// name, and ambiguity is only ever among sources of one level (so a
+    /// correlated `id` inside a subquery whose own `FROM` has `id` does not
+    /// clash with the outer table). CTEs are not candidates: their columns
+    /// participate only when the CTE is genuinely `FROM`-bound.
     fn resolve_bare(&mut self, name: &str, range: Range<usize>, frame: &Frame, full: &Frames) {
-        let mut hits: Vec<String> = Vec::new();
         let mut any_columns = false;
-        for binding in std::iter::once(frame)
-            .chain(full[1..].iter())
-            .flat_map(|f| f.bindings.iter())
-        {
-            if binding.columns.is_empty() {
-                continue;
+        for source in std::iter::once(frame).chain(full[1..].iter()) {
+            let mut hits: Vec<String> = Vec::new();
+            for binding in &source.bindings {
+                if binding.columns.is_empty() {
+                    continue;
+                }
+                any_columns = true;
+                let label = binding
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| binding.name.clone().unwrap_or_default())
+                    .into_string();
+                if !binding.column_hits(name, self.catalog).is_empty() {
+                    hits.push(label);
+                }
             }
-            any_columns = true;
-            let label = binding
-                .alias
-                .clone()
-                .unwrap_or_else(|| binding.name.clone().unwrap_or_default())
-                .into_string();
-            if !binding.column_hits(name, self.catalog).is_empty() {
-                hits.push(label);
+            match hits.len() {
+                0 => continue, // not at this level: try the enclosing scope
+                1 => return,   // the nearest scope decides
+                _ => {
+                    hits.sort();
+                    hits.dedup();
+                    self.diags.push(Diagnostic {
+                        kind: DiagnosticKind::AmbiguousColumn,
+                        severity: Severity::Warning,
+                        range,
+                        message: format!("ambiguous column `{name}` (matches {})", hits.join(", ")),
+                    });
+                    return;
+                }
             }
         }
-        match hits.len() {
-            0 if any_columns => self.diags.push(Diagnostic::new(
+        if any_columns {
+            self.diags.push(Diagnostic::new(
                 DiagnosticKind::UnknownColumn,
                 range,
                 format!("unknown column `{name}`"),
-            )),
-            0 => {} // nothing to verify against: silence
-            1 => {}
-            _ => {
-                hits.sort();
-                hits.dedup();
-                self.diags.push(Diagnostic {
-                    kind: DiagnosticKind::AmbiguousColumn,
-                    severity: Severity::Warning,
-                    range,
-                    message: format!("ambiguous column `{name}` (matches {})", hits.join(", ")),
-                });
-            }
+            ));
         }
     }
 
@@ -860,13 +993,16 @@ fn direct<'n>(node: Node<'n>, kind: &str) -> Vec<Node<'n>> {
 }
 
 /// The top `select` of a region: its direct child, descending through
-/// statement/set-operation wrappers; CTE bodies and `ERROR` fragments are
-/// not candidates.
+/// statement/set-operation/subquery wrappers; CTE bodies and `ERROR`
+/// fragments are not candidates.
 fn find_select<'n>(region: Node<'n>) -> Option<Node<'n>> {
+    if region.kind() == "select" {
+        return Some(region);
+    }
     for child in kids(region) {
         match child.kind() {
             "select" => return Some(child),
-            "statement" | "set_operation" => {
+            "statement" | "set_operation" | "subquery" => {
                 if let Some(inner) = find_select(child) {
                     return Some(inner);
                 }
@@ -877,19 +1013,41 @@ fn find_select<'n>(region: Node<'n>) -> Option<Node<'n>> {
     None
 }
 
-/// A `subquery` region unwraps its first non-parenthesis child (recursively,
-/// for nested subquery forms).
-fn unwrap_subquery(node: Node<'_>) -> Node<'_> {
-    if node.kind() != "subquery" {
-        return node;
+/// Split a `set_operation` into its sides: each `select` (or nested
+/// `set_operation`) starts a side, and the clause nodes that follow it
+/// (`from`, `where`, `order_by`, …) belong to that side. Separators
+/// (`keyword_union` family) and the parentheses of a parenthesized side are
+/// dropped.
+fn set_operation_sides(op: Node<'_>) -> Vec<Vec<Node<'_>>> {
+    let mut sides: Vec<Vec<Node<'_>>> = Vec::new();
+    for child in kids(op) {
+        match child.kind() {
+            "select" | "set_operation" => sides.push(vec![child]),
+            // UNION / INTERSECT / EXCEPT, ALL/DISTINCT, and parens.
+            k if k.starts_with("keyword_") || k == "(" || k == ")" => {}
+            _ => {
+                if let Some(side) = sides.last_mut() {
+                    side.push(child);
+                }
+            }
+        }
     }
-    match kids(node)
-        .into_iter()
-        .find(|c| !matches!(c.kind(), "(" | ")" | "," | "keyword_as"))
-    {
-        Some(inner) => unwrap_subquery(inner),
-        None => node,
+    sides
+}
+
+/// Byte span covered by a region's top-level parts.
+fn parts_range(parts: &[Node<'_>]) -> Range<usize> {
+    match (parts.first(), parts.last()) {
+        (Some(first), Some(last)) => first.byte_range().start..last.byte_range().end,
+        _ => 0..0,
     }
+}
+
+/// Is this `from` node the target clause of a `DELETE`? The grammar keeps
+/// `delete` (keyword only) and its `from` as *siblings* under `statement`.
+fn is_delete_target_clause(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| kids(parent).iter().any(|c| c.kind() == "delete"))
 }
 
 /// The parenthesized `statement` body of a `cte` node.
@@ -1211,12 +1369,171 @@ mod tests {
             "insert into users (id) values (1); delete from users;",
         );
         assert!(analysis.diagnostics.is_empty(), "{:?}", kinds(&analysis));
-        let scope = analysis
-            .scopes
+        assert_eq!(analysis.scopes.len(), 2);
+        for scope in &analysis.scopes {
+            // Insert's target is a direct child of `insert`; delete's lives
+            // in the statement-level `from` sibling.
+            assert_eq!(
+                scope.bindings.first().and_then(|b| b.name.as_deref()),
+                Some("users"),
+                "both DML targets bind"
+            );
+        }
+    }
+
+    #[test]
+    fn subquery_bodies_bind_their_own_from_clause() {
+        // Qualified reference through the subquery's own alias.
+        let analysis = analyze(
+            &loaded(),
+            &loaded(),
+            "select 1 from users u where exists (select o.user_id from orders o where o.id = u.id);",
+        );
+        assert!(analysis.diagnostics.is_empty(), "{:?}", kinds(&analysis));
+
+        // A bad column is reported against the subquery's alias, not as an
+        // unknown relation from the outer scope.
+        let analysis = analyze(
+            &loaded(),
+            &loaded(),
+            "select 1 from users u where exists (select o.zz from orders o where o.id = u.id);",
+        );
+        assert_eq!(
+            kinds(&analysis),
+            vec![(
+                DiagnosticKind::UnknownColumn,
+                "column `zz` not found in `o`".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn subquery_bare_columns_prefer_the_inner_scope() {
+        // `id` exists at both levels: the subquery's own `orders` wins, so no
+        // cross-level ambiguity warning (PostgreSQL resolves innermost first
+        // and only falls back to the outer query for correlated references).
+        let analysis = analyze(
+            &loaded(),
+            &loaded(),
+            "select id from users u where id in (select id from orders o);",
+        );
+        assert!(analysis.diagnostics.is_empty(), "{:?}", kinds(&analysis));
+
+        // Present at neither level: exactly one unknown-column error.
+        let analysis = analyze(
+            &loaded(),
+            &loaded(),
+            "select (select zzz from orders o) from users u;",
+        );
+        assert_eq!(
+            kinds(&analysis),
+            vec![(DiagnosticKind::UnknownColumn, "unknown column `zzz`".into())]
+        );
+    }
+
+    #[test]
+    fn set_operation_sides_bind_and_resolve_their_own_sources() {
+        let analysis = analyze(
+            &loaded(),
+            &loaded(),
+            "select zz from users union select id from admins;",
+        );
+        assert_eq!(
+            kinds(&analysis),
+            vec![(DiagnosticKind::UnknownColumn, "unknown column `zz`".into())]
+        );
+        assert_eq!(analysis.scopes[0].children.len(), 2);
+        for side in &analysis.scopes[0].children {
+            assert!(
+                !side.bindings.is_empty(),
+                "each set-operation side binds its own FROM"
+            );
+        }
+    }
+
+    #[test]
+    fn from_subquery_alias_columns_are_checked() {
+        let analysis = analyze(
+            &loaded(),
+            &loaded(),
+            "select t.zz from (select id from users) t;",
+        );
+        assert_eq!(
+            kinds(&analysis),
+            vec![(
+                DiagnosticKind::UnknownColumn,
+                "column `zz` not found in `t`".into()
+            )]
+        );
+        let derived = analysis.scopes[0]
+            .bindings
             .iter()
-            .find(|s| !s.bindings.is_empty())
-            .expect("insert scope");
-        assert_eq!(scope.bindings[0].name.as_deref(), Some("users"));
+            .find(|b| b.alias.as_deref() == Some("t"))
+            .expect("derived-table binding");
+        assert_eq!(derived.columns.len(), 1, "derived columns feed stage 5");
+    }
+
+    #[test]
+    fn lateral_subqueries_and_function_items_bind_their_alias() {
+        let analysis = analyze(
+            &loaded(),
+            &loaded(),
+            "select g.zz from users u join lateral (select id from orders) g on true;",
+        );
+        assert_eq!(
+            kinds(&analysis),
+            vec![(
+                DiagnosticKind::UnknownColumn,
+                "column `zz` not found in `g`".into()
+            )]
+        );
+
+        // `cross join lateral` is a distinct grammar node and a function item
+        // has no column knowledge yet — but its alias must resolve instead of
+        // being reported as a missing relation.
+        let analysis = analyze(
+            &loaded(),
+            &loaded(),
+            "select g.x from users u cross join lateral generate_series(1, 3) g;",
+        );
+        assert!(analysis.diagnostics.is_empty(), "{:?}", kinds(&analysis));
+    }
+
+    #[test]
+    fn alias_hides_the_relation_name_and_schemas_are_not_qualifiers() {
+        let analysis = analyze(&loaded(), &loaded(), "select users.id from users u;");
+        assert_eq!(
+            kinds(&analysis),
+            vec![(
+                DiagnosticKind::UnknownRelation,
+                "unknown relation or alias `users`".into()
+            )]
+        );
+
+        let analysis = analyze(&loaded(), &loaded(), "select public.name from users;");
+        assert_eq!(
+            kinds(&analysis),
+            vec![(
+                DiagnosticKind::UnknownRelation,
+                "unknown relation or alias `public`".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn reopened_buffer_never_hits_another_buffers_cached_analysis() {
+        let engine = SemanticEngine::new(loaded());
+        let file = SqlFileId::new();
+        let mut first = Buffer::new(file, "select zz from users;");
+        let stale = engine.analyze(file, &mut first);
+        assert_eq!(stale.diagnostics.len(), 1);
+
+        // A new Buffer for the same file has its own revision, so it must not
+        // reuse the previous instance's entry.
+        let mut reopened = Buffer::new(file, "select name from users;");
+        let fresh = engine.analyze(file, &mut reopened);
+        assert!(!Arc::ptr_eq(&stale, &fresh));
+        assert!(fresh.diagnostics.is_empty(), "{:?}", kinds(&fresh));
     }
 
     #[test]
