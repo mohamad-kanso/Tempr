@@ -13,4 +13,5 @@ workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+tempr_workspace.workspace = true
 
