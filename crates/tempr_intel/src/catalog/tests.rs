@@ -249,6 +249,34 @@ fn quoted_relations_match_exactly_and_unquoted_fold() {
 }
 
 #[test]
+fn relations_in_schema_lists_only_that_schema_folded_and_sorted() {
+    let snap = simple_snapshot();
+    let cache = CatalogCache::from_snapshot(&snap);
+
+    let names: Vec<&str> = cache
+        .relations_in_schema("PUBLIC")
+        .iter()
+        .filter_map(|idx| cache.object(*idx).map(|e| e.name()))
+        .collect();
+    assert_eq!(names.len(), 3, "every relation in the schema: {names:?}");
+    for expected in ["Users", "users", "user_views"] {
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
+    }
+    let folded: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    let mut sorted = folded.clone();
+    sorted.sort();
+    assert_eq!(folded, sorted, "folded-name order is deterministic");
+
+    assert!(
+        cache.relations_in_schema("private").is_empty(),
+        "schemas the catalog does not cover stay empty"
+    );
+}
+
+#[test]
 fn columns_are_a_contiguous_ordinal_ordered_slice() {
     let snap = simple_snapshot();
     let cache = CatalogCache::from_snapshot(&snap);

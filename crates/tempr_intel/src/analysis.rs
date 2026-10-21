@@ -236,6 +236,29 @@ impl Analysis {
         ordered.sort_by_key(|d| (d.range.start, d.kind.sort_key()));
         ordered.first().copied()
     }
+
+    /// Scopes containing `offset`, outermost first. A child scope wins over
+    /// its parent (the cursor is in the innermost region), and at one level
+    /// the latest containing sibling wins, so an offset exactly on a
+    /// statement boundary belongs to the statement that ends there.
+    ///
+    /// Completion (and stage 6's hover) use the last element as the cursor's
+    /// own frame and the earlier ones as its correlated ancestors.
+    pub fn scope_chain(&self, offset: usize) -> Vec<&Scope> {
+        fn descend<'a>(scopes: &'a [Scope], offset: usize, out: &mut Vec<&'a Scope>) {
+            for scope in scopes.iter().rev() {
+                if scope.range.start <= offset && offset <= scope.range.end {
+                    out.push(scope);
+                    descend(&scope.children, offset, out);
+                    return;
+                }
+            }
+        }
+
+        let mut chain = Vec::new();
+        descend(&self.scopes, offset, &mut chain);
+        chain
+    }
 }
 
 #[cfg(test)]
@@ -418,5 +441,53 @@ mod tests {
         let hits = analysis.diagnostics_in(15..30);
         assert_eq!(hits.len(), 1, "{:?}", hits);
         assert_eq!(hits[0].message, "inside");
+    }
+
+    #[test]
+    fn scope_chain_walks_into_the_innermost_child() {
+        let analysis = Analysis {
+            scopes: vec![Scope {
+                range: 0..60,
+                children: vec![Scope {
+                    range: 20..40,
+                    children: vec![Scope {
+                        range: 25..30,
+                        ..Scope::default()
+                    }],
+                    ..Scope::default()
+                }],
+                ..Scope::default()
+            }],
+            diagnostics: vec![],
+        };
+
+        let chain = analysis.scope_chain(27);
+        assert_eq!(
+            chain.iter().map(|s| s.range.clone()).collect::<Vec<_>>(),
+            vec![0..60, 20..40, 25..30],
+            "outermost first, innermost last"
+        );
+        assert_eq!(analysis.scope_chain(50).len(), 1, "parent only");
+        assert_eq!(analysis.scope_chain(70).len(), 0, "outside every scope");
+    }
+
+    #[test]
+    fn scope_chain_prefers_the_statement_that_ends_on_a_boundary() {
+        let analysis = Analysis {
+            scopes: vec![
+                Scope {
+                    range: 0..8,
+                    ..Scope::default()
+                },
+                Scope {
+                    range: 9..17,
+                    ..Scope::default()
+                },
+            ],
+            diagnostics: vec![],
+        };
+
+        assert_eq!(analysis.scope_chain(8)[0].range, 0..8);
+        assert_eq!(analysis.scope_chain(9)[0].range, 9..17);
     }
 }
