@@ -31,6 +31,10 @@ unicode-segmentation.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 # Snapshot fixtures for the schema-aware view tests.
 chrono.workspace = true
+# A minimal in-test driver so `MainWindow` can connect and stream rows without
+# a database (no test-support driver ships in production).
+tempr_db.workspace    = true
+async-trait.workspace = true
 
 [lints]
 workspace = true

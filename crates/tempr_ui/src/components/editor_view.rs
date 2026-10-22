@@ -1551,8 +1551,8 @@ mod tests {
 mod view_tests {
     use chrono::Utc;
     use gpui::{
-        AnyWindowHandle, AppContext as _, Context, Entity, IntoElement, Keystroke, Render,
-        TestAppContext, Window, div, prelude::*,
+        AnyWindowHandle, AppContext as _, Context, Entity, IntoElement, Keystroke, Modifiers,
+        Render, TestAppContext, VisualTestContext, Window, div, prelude::*,
     };
     use tempr_domain::{
         ConnectionId, SchemaObject, SchemaObjectId, SchemaSnapshot, SchemaSnapshotId,
@@ -1795,6 +1795,78 @@ mod view_tests {
         assert_eq!(
             card, diagnostic.message,
             "the card carries the diagnostic message"
+        );
+    }
+
+    /// The prepaint path builds one `TextRun` per styled byte. Nothing was
+    /// drawn, so the syntax pass is empty and the diagnostics pass alone
+    /// decides the underline geometry.
+    #[gpui::test]
+    fn the_error_underline_covers_only_the_unknown_column(cx: &mut TestAppContext) {
+        let text = "select zz from users";
+        let (editor, _window) = setup(cx, text);
+        let (file, revision) =
+            editor.read_with(cx, |editor, _| (editor.file_id(), editor.revision()));
+        editor
+            .read_with(cx, |editor, _| editor.intelligence().clone())
+            .analyze(file, revision, text);
+        assert!(editor.update(cx, |editor, cx| editor.on_diagnostics(cx)));
+
+        let runs = editor.read_with(cx, |editor, _| {
+            editor.runs_for_line(0, text, gpui::Font::default())
+        });
+        let mut underlined = Vec::new();
+        let mut offset = 0;
+        for run in runs {
+            if let Some(style) = run.underline {
+                underlined.push((offset..offset + run.len, style));
+            }
+            offset += run.len;
+        }
+        assert_eq!(underlined.len(), 1, "one run carries the underline");
+        let (range, style) = &underlined[0];
+        assert_eq!(range, &(7..9), "only `zz` is underlined");
+        assert_eq!(
+            style.color,
+            Some(gpui::rgb(crate::theme::ERROR).into()),
+            "errors use the error color"
+        );
+        assert!(!style.wavy, "errors are solid");
+    }
+
+    /// Clicking maps the painted line geometry back to a byte offset: the
+    /// caret sits in the middle of `id`, the click lands on the caret box
+    /// saved for offset 9, and the selection must move there.
+    #[gpui::test]
+    fn a_click_selects_the_offset_under_the_pointer(cx: &mut TestAppContext) {
+        let (editor, window) = setup(cx, "select id from users");
+        let focus = editor.read_with(cx, |editor, cx| editor.focus_handle(cx));
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        for _ in 0..9 {
+            press(cx, window, "right");
+        }
+        let caret = editor.read_with(cx, |editor, _| editor.caret_bounds().expect("caret box"));
+        press(cx, window, "ctrl-home");
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.primary().head),
+            0,
+            "setup: the click must do the moving"
+        );
+
+        VisualTestContext::from_window(window, cx).simulate_click(
+            gpui::point(caret.left() + gpui::px(1.), caret.center().y),
+            Modifiers::default(),
+        );
+
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.primary().head),
+            9,
+            "the click lands after `id`"
         );
     }
 }
