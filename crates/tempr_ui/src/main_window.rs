@@ -754,3 +754,120 @@ mod tests {
         assert_eq!(row_word(2), "rows");
     }
 }
+
+#[cfg(test)]
+mod view_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{AnyWindowHandle, AppContext as _, Keystroke, TestAppContext};
+    use tempr_events::EventBus;
+
+    use super::*;
+
+    fn draw(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn press(cx: &mut TestAppContext, window: AnyWindowHandle, keystroke: &str) {
+        let keystroke = Keystroke::parse(keystroke).expect("valid keystroke");
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        })
+        .unwrap();
+    }
+
+    /// The binding layers meet here: a window command (`RunQuery`) runs on the
+    /// focused editor, `ctrl-shift-p` opens the palette, and while the palette
+    /// is open its `Modal` context suspends the window-level binding
+    /// (`MainWindow && !Modal`) so its keys belong to the overlay.
+    #[gpui::test]
+    fn the_palette_suspends_window_bindings_and_returns_focus_to_the_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let bus = Arc::new(EventBus::new());
+        let connection = ConnectionService::new(bus.clone());
+        let query = QueryService::new(bus.clone(), connection.clone());
+        let schema = SchemaService::new(bus.clone(), connection.clone());
+        let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
+        let command = CommandService::new(bus.clone());
+        cx.update(|cx| commands::install(cx, &command));
+        let services = Services {
+            bus,
+            connection,
+            query,
+            command,
+            schema,
+            intelligence,
+        };
+        let root = cx.add_window(|window, cx| {
+            MainWindow::new(services, None, DevOptions::default(), window, cx)
+        });
+        let window = *root;
+        let editor = cx.read(|cx| root.read(cx).expect("root").editor.clone());
+        let editor_focus = cx.read(|cx| editor.read(cx).focus_handle(cx));
+        let palette_open = |cx: &mut TestAppContext| {
+            cx.read(|cx| root.read(cx).expect("root").palette.read(cx).is_open())
+        };
+
+        let notices = Rc::new(RefCell::new(0));
+        let sink = notices.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&editor, move |_, event: &EditorEvent, _| {
+                if matches!(event, EditorEvent::Notice(_)) {
+                    *sink.borrow_mut() += 1;
+                }
+            })
+        });
+
+        draw(cx, window);
+        assert_eq!(
+            cx.update_window(window, |_, window, cx| window.focused(cx))
+                .unwrap(),
+            Some(editor_focus.clone()),
+            "the editor owns focus when the window opens"
+        );
+
+        // Closed: ctrl-enter reaches `RunQuery`; the empty editor answers
+        // with a Notice.
+        press(cx, window, "ctrl-enter");
+        assert_eq!(
+            *notices.borrow(),
+            1,
+            "ctrl-enter must run the window command"
+        );
+
+        // Open: the palette takes focus and adds `Modal`.
+        press(cx, window, "ctrl-shift-p");
+        draw(cx, window);
+        assert!(palette_open(cx), "ctrl-shift-p must open the palette");
+
+        // While the palette is modal the same keystroke must not reach the
+        // editor. Enter belongs to the palette now, not to the window.
+        press(cx, window, "ctrl-enter");
+        assert_eq!(
+            *notices.borrow(),
+            1,
+            "the palette's Modal context must suspend window-level bindings"
+        );
+
+        // Escape closes it, restores focus and the binding works again.
+        press(cx, window, "escape");
+        assert!(!palette_open(cx), "escape must close the palette");
+        assert_eq!(
+            cx.update_window(window, |_, window, cx| window.focused(cx))
+                .unwrap(),
+            Some(editor_focus),
+            "the palette must hand focus back to the editor"
+        );
+        press(cx, window, "ctrl-enter");
+        assert_eq!(
+            *notices.borrow(),
+            2,
+            "closing the palette must re-enable the window binding"
+        );
+    }
+}

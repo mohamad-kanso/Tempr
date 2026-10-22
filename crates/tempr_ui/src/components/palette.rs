@@ -267,3 +267,242 @@ impl Render for Palette {
             .into_any_element()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{
+        AnyWindowHandle, AppContext as _, Context, Entity, FocusHandle, IntoElement, Keystroke,
+        Render, TestAppContext, Window, div, prelude::*, px,
+    };
+    use tempr_events::EventBus;
+
+    use super::*;
+    use crate::commands;
+
+    struct Harness {
+        palette: Entity<Palette>,
+        /// Focus target that owns focus before the palette opens.
+        focus: FocusHandle,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .track_focus(&self.focus)
+                .child(self.palette.clone())
+        }
+    }
+
+    struct Fixture {
+        palette: Entity<Palette>,
+        focus: FocusHandle,
+        window: AnyWindowHandle,
+    }
+
+    fn setup(cx: &mut TestAppContext) -> Fixture {
+        let service = CommandService::new(Arc::new(EventBus::new()));
+        cx.update(|cx| commands::install(cx, &service));
+        let root = cx.add_window(|window, cx| {
+            let palette = cx.new(|cx| Palette::new(service, window, cx));
+            let focus = cx.focus_handle();
+            Harness { palette, focus }
+        });
+        let (palette, focus) = cx.read(|cx| {
+            let root = root.read(cx).expect("window root");
+            (root.palette.clone(), root.focus.clone())
+        });
+        Fixture {
+            palette,
+            focus,
+            window: root.into(),
+        }
+    }
+
+    impl Fixture {
+        /// Focus the element that owned focus before the palette and open it,
+        /// drawing the frame that installs the palette's input handler.
+        fn open(&self, cx: &mut TestAppContext) {
+            cx.update_window(self.window, |_, window, cx| {
+                window.focus(&self.focus, cx);
+                self.palette
+                    .update(cx, |palette, cx| palette.open(window, cx));
+            })
+            .unwrap();
+            self.draw(cx);
+        }
+
+        fn draw(&self, cx: &mut TestAppContext) {
+            cx.update_window(self.window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn press(&self, cx: &mut TestAppContext, keystroke: &str) {
+            let keystroke = Keystroke::parse(keystroke).expect("valid keystroke");
+            cx.update_window(self.window, |_, window, cx| {
+                window.dispatch_keystroke(keystroke, cx);
+            })
+            .unwrap();
+        }
+
+        fn type_str(&self, cx: &mut TestAppContext, text: &str) {
+            for ch in text.chars() {
+                self.press(cx, &ch.to_string());
+            }
+        }
+
+        fn selected(&self, cx: &TestAppContext) -> usize {
+            self.palette
+                .read_with(cx, |palette, _| palette.selected_index())
+        }
+
+        fn scroll_offset(&self, cx: &TestAppContext) -> gpui::Point<gpui::Pixels> {
+            self.palette.read_with(cx, |palette, _| {
+                palette.scroll_handle.0.borrow().base_handle.offset()
+            })
+        }
+
+        fn focused(&self, cx: &mut TestAppContext) -> Option<FocusHandle> {
+            cx.update_window(self.window, |_, window, cx| window.focused(cx))
+                .unwrap()
+        }
+    }
+
+    fn subscribe(
+        fixture: &Fixture,
+        cx: &mut TestAppContext,
+    ) -> (Rc<RefCell<Vec<PaletteEvent>>>, Subscription) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let subscription = cx.update(|cx| {
+            cx.subscribe(&fixture.palette, move |_, event: &PaletteEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+        });
+        (events, subscription)
+    }
+
+    #[gpui::test]
+    fn typed_query_filters_the_list_and_enter_executes_the_selection(cx: &mut TestAppContext) {
+        let fixture = setup(cx);
+        let (events, _subscription) = subscribe(&fixture, cx);
+        fixture.open(cx);
+
+        assert!(
+            fixture
+                .palette
+                .read_with(cx, |palette, _| palette.is_open()),
+            "open() must show the palette"
+        );
+        assert!(
+            !fixture
+                .palette
+                .read_with(cx, |palette, _| palette.matches().is_empty()),
+            "open() must search the catalog"
+        );
+
+        fixture.type_str(cx, "quit");
+        let hits = fixture.palette.read_with(cx, |palette, _| {
+            palette
+                .matches()
+                .iter()
+                .map(|hit| hit.meta.id.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            hits,
+            vec!["main_window::Quit".to_string()],
+            "typing must filter the list, not just highlight"
+        );
+
+        fixture.press(cx, "enter");
+
+        assert_eq!(
+            *events.borrow(),
+            vec![PaletteEvent::Execute("main_window::Quit".into())],
+            "enter must emit the selected command"
+        );
+        assert!(
+            !fixture
+                .palette
+                .read_with(cx, |palette, _| palette.is_open()),
+            "confirming must close the palette"
+        );
+        assert_eq!(
+            fixture.focused(cx),
+            Some(fixture.focus.clone()),
+            "closing must hand focus back so the command dispatches where the user was"
+        );
+    }
+
+    #[gpui::test]
+    fn escape_dismisses_without_executing(cx: &mut TestAppContext) {
+        let fixture = setup(cx);
+        let (events, _subscription) = subscribe(&fixture, cx);
+        fixture.open(cx);
+
+        fixture.press(cx, "escape");
+
+        assert_eq!(*events.borrow(), vec![PaletteEvent::Dismissed]);
+        assert!(
+            !fixture
+                .palette
+                .read_with(cx, |palette, _| palette.is_open())
+        );
+        assert_eq!(
+            fixture.focused(cx),
+            Some(fixture.focus.clone()),
+            "dismissing must restore focus too"
+        );
+    }
+
+    /// The list is taller than the viewport at `MAX_VISIBLE_ROWS`; selection
+    /// moving past the last visible row must scroll the list (PR #13 fixed the
+    /// rows staying put) while movement inside the viewport must not jump.
+    #[gpui::test]
+    fn arrow_keys_keep_the_selected_row_inside_the_viewport(cx: &mut TestAppContext) {
+        let fixture = setup(cx);
+        fixture.open(cx);
+
+        for _ in 0..3 {
+            fixture.press(cx, "down");
+        }
+        fixture.draw(cx);
+        assert_eq!(fixture.selected(cx), 3);
+        assert_eq!(
+            fixture.scroll_offset(cx).y,
+            px(0.),
+            "selection inside the first viewport must not scroll"
+        );
+
+        let target = MAX_VISIBLE_ROWS + 4;
+        for _ in 3..target {
+            fixture.press(cx, "down");
+        }
+        fixture.draw(cx);
+        let selected = fixture.selected(cx);
+        assert_eq!(selected, target);
+        let offset = fixture.scroll_offset(cx);
+        assert!(
+            offset.y <= px(-ROW_HEIGHT * (selected + 1 - MAX_VISIBLE_ROWS) as f32),
+            "the selected row must be scrolled into the viewport, got {offset:?}"
+        );
+
+        // Wrapping all the way back to the top scrolls the list home.
+        for _ in 0..selected {
+            fixture.press(cx, "up");
+        }
+        fixture.draw(cx);
+        assert_eq!(fixture.selected(cx), 0);
+        assert_eq!(
+            fixture.scroll_offset(cx).y,
+            px(0.),
+            "selecting the first row must scroll back to the top"
+        );
+    }
+}
