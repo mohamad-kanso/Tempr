@@ -168,8 +168,8 @@ pub struct CompletionItem {
     pub kind: CompletionKind,
     /// Type, signature, schema or ownership hint (empty when there is none).
     pub detail: String,
-    /// Text the editor writes. Equal to `label` today; separate so stage-6
-    /// snippets can differ without reshaping the item.
+    /// Text the editor writes. Usually `label`, but a name PostgreSQL would
+    /// fold differently (e.g. `createdAt`) arrives quoted (`"createdAt"`).
     pub insert: String,
     /// Byte range the item replaces (the word under the cursor).
     pub replace: Range<usize>,
@@ -342,6 +342,8 @@ The semantic analyzer walks the tree-sitter AST to build a scope chain. Each sco
 
 ### Name Resolution
 
+The walk compares names with any surrounding double quotes removed (`"createdAt"` denotes `createdAt`, and `""` inside is one literal quote). The comparisons below still fold case, so quoted case sensitivity is not enforced yet (parked in docs/TODO.md).
+
 The engine resolves names in three steps:
 
 1. **Unqualified name** (e.g., `column_name`): Walk up the scope chain looking for a table or alias that contains a column with this name. If exactly one match is found, the reference is resolved. If zero matches are found, emit `DiagnosticCode::UnknownColumn`. If multiple matches are found, emit `DiagnosticCode::AmbiguousReference`.
@@ -472,6 +474,8 @@ The completion pipeline is the most latency-sensitive path in the entire system.
 | **Qualifier** | After a dot: `u.`, `public.`, `public.users.` (whitespace tolerated). | Columns of that binding/CTE; relations of that schema; columns of a schema-qualified relation. |
 
 Auto-open follows spec decision 5: one identifier character or a qualifier dot opens the popup; `ctrl-space` (`explicit`) forces it anywhere.
+
+Identifier candidates are inserted the way PostgreSQL will read them back: a name outside the unquoted `[a-z_][a-z0-9_$]*` shape (or a reserved word) gets double quotes, so accepting `createdAt` writes `"createdAt"` rather than the folded `createdat` that names a different column. The analyzer strips those quotes before resolving a reference; quoted-context case sensitivity is parked in docs/TODO.md.
 
 ### Stage 2: Candidate Generation
 

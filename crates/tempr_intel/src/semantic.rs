@@ -293,7 +293,7 @@ impl<'a> Walker<'a> {
         collect_identifier_ranges(node, &mut ranges);
         ranges
             .into_iter()
-            .map(|r| (self.text(r.clone()), r))
+            .map(|r| (unquote_identifier(&self.text(r.clone())), r))
             .collect()
     }
 
@@ -1081,6 +1081,16 @@ impl<'a> Walker<'a> {
 }
 
 // === Free functions ===
+
+/// The name a quoted identifier denotes (`"createdAt"` → `createdAt`);
+/// doubled quotes inside are one literal quote.
+fn unquote_identifier(raw: &str) -> String {
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1].replace("\"\"", "\"")
+    } else {
+        raw.to_string()
+    }
+}
 
 /// Top-level statement regions: root children beyond bare separators.
 fn regions(root: Node<'_>) -> Vec<Node<'_>> {
