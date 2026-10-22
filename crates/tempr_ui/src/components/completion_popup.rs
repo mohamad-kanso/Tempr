@@ -1,14 +1,10 @@
 //! Completion popup: GPUI actions, the popup's key context and its state
 //! (docs/11-gpui.md → Component Library Catalog, spec §7).
 //!
-//! The popup is rendered by `EditorView` next to the caret; this module owns
-//! the action types and the row model so the binding catalog and the view
-//! share one definition.
-//!
-//! Every action is bound under [`KEY_CONTEXT`]. That context exists only
-//! while the popup is open — the bindings are `.hidden()` in the command
-//! catalog, so a closed popup can never fire `completion::Accept` by key or
-//! from palette search.
+//! Every action is bound under [`KEY_CONTEXT`], which exists only while the
+//! popup is open; the bindings are `.hidden()` in the command catalog, so a
+//! closed popup can never fire `completion::Accept` by key or from palette
+//! search.
 
 use gpui::actions;
 use tempr_intel::{CompletionItem, CompletionKind};
@@ -17,9 +13,8 @@ use std::ops::Range;
 
 actions!(completion, [Next, Prev, Accept, Dismiss]);
 
-/// Key context wearing the popup: `Editor` with `Completion` open. The
-/// editor keeps this context while the popup is visible, so editor bindings
-/// still fire (typing, motion) and completion bindings outrank them.
+/// Key context while the popup is open: `Editor` plus `Completion`, so editor
+/// bindings still fire and completion bindings outrank them.
 pub const KEY_CONTEXT: &str = "Editor Completion";
 /// Predicate for the catalog: both identifiers live on the focused editor
 /// node while the popup is open. Every command carrying this is hidden from
@@ -27,17 +22,13 @@ pub const KEY_CONTEXT: &str = "Editor Completion";
 pub const BINDING_CONTEXT: &str = "Editor && Completion";
 
 /// The replacement a chosen item performs: its `replace` range and the caret
-/// offset after the inserted text. Pure so the arithmetic is testable
-/// without a buffer.
+/// offset after the inserted text.
 pub fn accept_edit(item: &CompletionItem) -> (Range<usize>, usize) {
     let cursor = item.replace.start + item.insert.len();
     (item.replace.clone(), cursor)
 }
 
-/// The popup's visible rows are `items`, with `selected` as the highlighted
-/// index. Kept separate from `CompletionItem` so re-filtering after a
-/// keystroke can preserve (or clamp) the selection without touching the
-/// engine's ranking.
+/// The popup's rows and the highlighted index into them.
 #[derive(Debug, Default)]
 pub struct CompletionPopup {
     pub items: Vec<CompletionItem>,
@@ -68,9 +59,7 @@ impl CompletionPopup {
     }
 
     /// Keep the current item selected after a re-filter when it is still
-    /// present; otherwise fall back to the first row. Labels alone are not
-    /// unique (a column and a keyword may share one), so identity includes
-    /// the kind.
+    /// present; otherwise select the first row.
     pub fn refilter(&mut self, items: Vec<CompletionItem>) {
         let previous = self
             .selected_item()
@@ -85,7 +74,6 @@ impl CompletionPopup {
             .unwrap_or(0);
     }
 
-    /// The label to show for a kind, in the width the popup reserves.
     pub fn kind_label(kind: CompletionKind) -> &'static str {
         match kind {
             CompletionKind::Keyword => "kw",
@@ -159,7 +147,7 @@ mod tests {
         let mut keyword = item("id");
         keyword.kind = CompletionKind::Keyword;
         let mut popup = CompletionPopup::new(vec![item("id"), keyword.clone()]);
-        popup.move_selection(1); // the keyword row at index 1
+        popup.move_selection(1);
         let mut column = item("id");
         column.kind = CompletionKind::Column;
         popup.refilter(vec![column, keyword]);

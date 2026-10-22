@@ -43,8 +43,6 @@ actions!(
     ]
 );
 
-// Schema actions live under the `schema::` id prefix (catalog contract);
-// the types are imported here because the window owns their handlers.
 actions!(schema, [Refresh, RefreshIncremental, RefreshAllSchemas]);
 
 pub const KEY_CONTEXT: &str = "MainWindow";
@@ -110,8 +108,6 @@ pub struct MainWindow {
     palette: Entity<Palette>,
     status: String,
     status_is_error: bool,
-    /// Latest diagnostics counts, rendered as their own status-bar segment
-    /// so query/schema messages can never erase them.
     diagnostics: Option<DiagnosticsSummary>,
     /// The run in flight, allocated by the view before the task starts so
     /// `CancelQuery` can target it immediately. Cleared only by the task's
@@ -157,6 +153,8 @@ impl MainWindow {
                 EditorEvent::Notice(text) => this.set_status(text.clone(), true, cx),
                 EditorEvent::Changed => {
                     let file = this.editor.read(cx).file_id();
+                    this.diagnostics = None;
+                    cx.notify();
                     this.services.bus.publish(AppEvent::BufferChanged { file });
                 }
             },
@@ -292,8 +290,6 @@ impl MainWindow {
         self.start_bench(window, cx);
     }
 
-    // ── schema refresh ───────────────────────────────────────────────────
-
     fn refresh_schema_action(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_schema(false, false, cx);
     }
@@ -316,9 +312,6 @@ impl MainWindow {
         self.refresh_schema(true, false, cx);
     }
 
-    /// Run the refresh on tokio and report counts (or the error) in the
-    /// status bar. The catalog swap itself happens in the intelligence
-    /// service when `SchemaRefreshed` arrives.
     fn refresh_schema(&mut self, all: bool, incremental: bool, cx: &mut Context<Self>) {
         let Some(connection) = self.connection_id() else {
             self.set_status("No connection configured (DATABASE_URL).", true, cx);

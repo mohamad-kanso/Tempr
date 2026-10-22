@@ -1,22 +1,13 @@
-//! `IntelligenceService` — owns the `SemanticEngine` and sits between the
-//! event bus, the schema service and the UI (docs/05-services.md, spec §6).
+//! `IntelligenceService` owns the `SemanticEngine` and sits between the event
+//! bus, the schema service and the UI (docs/05-services.md, spec §6).
 //!
-//! Two request paths, split by ownership:
-//!
-//! - **Completion and hover** are synchronous calls from the UI thread. The
-//!   view passes its `Buffer`; the service delegates to the engine. No I/O,
-//!   no locks beyond the engine's catalog `Arc` clone.
-//! - **Diagnostics** need a buffer, but the buffer belongs to the view. The
-//!   view sends an immutable text snapshot after its idle debounce; this
-//!   service keeps one mirror `Buffer` per file (updated with a minimal
-//!   edit, so tree-sitter stays incremental), analyzes it, caches the
-//!   `(source revision, Arc<Analysis>)` pair and publishes `DiagnosticsReady`.
+//! Completion and hover are synchronous calls on the UI thread. Diagnostics
+//! take an immutable text snapshot after the view's idle debounce; the service
+//! keeps one mirror `Buffer` per file, caches the analysis by source revision
+//! and publishes `DiagnosticsReady`.
 //!
 //! Catalog lifecycle is event-driven: `SchemaRefreshed` rebuilds the
-//! immutable `CatalogCache`; a connection reaching `Connected` loads the
-//! `.tcat` cache first (the offline path) and then asks for an incremental
-//! refresh. A failed refresh is reported on the bus and leaves the previous
-//! catalog in place.
+//! `CatalogCache`, and a failed refresh leaves the previous catalog in place.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +15,7 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
-use tempr_domain::{ConnectionId, ConnectionState, SchemaSnapshot, SqlFileId};
+use tempr_domain::{ConnectionId, ConnectionState, SchemaSnapshot, SchemaSnapshotId, SqlFileId};
 use tempr_editor::Buffer;
 use tempr_events::{AppEvent, AppEventKind, EventBus, EventFilter, Subscription};
 use tempr_intel::{
@@ -35,7 +26,6 @@ use tokio::runtime::Handle;
 use crate::schema::SchemaService;
 use crate::{Service, ServiceError};
 
-/// Diagnostics produced for one text revision of one file.
 struct StoredAnalysis {
     source_revision: u64,
     analysis: Arc<Analysis>,
@@ -45,17 +35,14 @@ pub struct IntelligenceService {
     event_bus: Arc<EventBus>,
     schema: Arc<SchemaService>,
     engine: Arc<SemanticEngine>,
-    /// Mirror buffers for background analysis, keyed by file.
     mirrors: Mutex<HashMap<SqlFileId, Buffer>>,
     analyses: RwLock<HashMap<SqlFileId, StoredAnalysis>>,
     /// Bumped on every catalog swap. An analysis started before the swap
     /// may reference arena indices into the old catalog, so it is never
     /// stored or published.
     catalog_generation: AtomicU64,
+    installed_snapshot: Mutex<Option<SchemaSnapshotId>>,
     active_connection: RwLock<Option<ConnectionId>>,
-    /// Set by `Service::start`; event handlers use it to spawn the async
-    /// cache/refresh work. Falls back to `Handle::try_current()` for events
-    /// published from an already-running tokio thread.
     handle: Mutex<Option<Handle>>,
     subscriptions: Mutex<Vec<Subscription>>,
 }
@@ -69,6 +56,7 @@ impl IntelligenceService {
             mirrors: Mutex::new(HashMap::new()),
             analyses: RwLock::new(HashMap::new()),
             catalog_generation: AtomicU64::new(0),
+            installed_snapshot: Mutex::new(None),
             active_connection: RwLock::new(None),
             handle: Mutex::new(None),
             subscriptions: Mutex::new(Vec::new()),
@@ -132,8 +120,6 @@ impl IntelligenceService {
         }
     }
 
-    /// Offline-first bootstrap for one connection: try the persisted catalog
-    /// before touching the network, then ask for an incremental refresh.
     async fn on_connected(&self, connection: ConnectionId) {
         if let Some(snapshot) = self.schema.load_cached(connection).await {
             self.install_snapshot(&snapshot);
@@ -153,15 +139,20 @@ impl IntelligenceService {
         }
     }
 
-    /// Replace the catalog from a snapshot. The analysis cache in the engine
-    /// resets (it may hold arena indices into the old cache).
     pub fn install_snapshot(&self, snapshot: &SchemaSnapshot) {
+        let mut installed = self.installed_snapshot.lock();
+        if installed.as_ref() == Some(&snapshot.id) {
+            // The connection bootstrap and its `SchemaRefreshed` event both
+            // carry this snapshot; keep the analyses built against it.
+            return;
+        }
         let catalog = Arc::new(CatalogCache::from_snapshot(snapshot));
         self.replace_catalog(catalog);
+        *installed = Some(snapshot.id);
     }
 
-    /// Install a catalog directly (tests, and a future workspace index).
     pub fn set_catalog(&self, catalog: Arc<CatalogCache>) {
+        *self.installed_snapshot.lock() = None;
         self.replace_catalog(catalog);
     }
 
@@ -198,10 +189,9 @@ impl IntelligenceService {
     }
 
     /// Analyze an immutable text snapshot on a background task and publish
-    /// `DiagnosticsReady`. The revision recorded is the *source* buffer's
-    /// revision, not the mirror's. Tasks are spawned out of order, so a
-    /// result older than the stored one, or one started before a catalog
-    /// swap, is dropped instead of published.
+    /// `DiagnosticsReady`. The revision recorded is the *source* buffer's,
+    /// not the mirror's; results older than the stored one, or started before
+    /// a catalog swap, are dropped instead of published.
     pub fn analyze(&self, file: SqlFileId, source_revision: u64, text: &str) {
         if let Some(stored) = self.analyses.read().get(&file)
             && stored.source_revision >= source_revision
@@ -215,8 +205,6 @@ impl IntelligenceService {
                 .entry(file)
                 .or_insert_with(|| Buffer::new(file, text));
             if let Err(e) = replace_text(buffer, text) {
-                // A failed minimal edit would leave the mirror analyzing the
-                // wrong text; rebuild it from the snapshot instead.
                 tracing::warn!(error = %e, "intelligence: mirror edit failed; rebuilding");
                 *buffer = Buffer::new(file, text);
             }
@@ -261,7 +249,6 @@ impl IntelligenceService {
             .map(|stored| stored.analysis.clone())
     }
 
-    /// Drop per-file state when a buffer closes.
     pub fn forget(&self, file: SqlFileId) {
         self.mirrors.lock().remove(&file);
         self.analyses.write().remove(&file);
@@ -454,8 +441,6 @@ mod tests {
             1
         );
 
-        // A slower task for revision 3 lands after revision 4. It must not
-        // replace the newer analysis, and the mirror must still hold rev 4.
         service.analyze(file, 3, "select id from users");
         assert!(service.analysis(file, 3).is_none(), "stale result stored");
         assert_eq!(
@@ -481,6 +466,23 @@ mod tests {
     }
 
     #[test]
+    fn reinstalling_the_same_snapshot_keeps_analyses() {
+        let (service, _) = service();
+        let cached = snapshot();
+        service.install_snapshot(&cached);
+        let file = SqlFileId::new();
+        service.analyze(file, 9, "select id from users");
+        service.install_snapshot(&cached);
+        assert!(
+            service.analysis(file, 9).is_some(),
+            "the same snapshot must be installed idempotently"
+        );
+
+        service.install_snapshot(&snapshot());
+        assert!(service.analysis(file, 9).is_none());
+    }
+
+    #[test]
     fn installation_rebuilds_the_catalog() {
         let (service, bus) = service();
         let schema = snapshot();
@@ -488,8 +490,6 @@ mod tests {
             connection: schema.connection_id,
             snapshot: schema.id,
         };
-        // The event carries ids only; without the snapshot in `SchemaService`
-        // the service keeps its current catalog.
         bus.publish(event);
         let mut buffer = Buffer::new(SqlFileId::new(), "select id from users");
         assert_eq!(

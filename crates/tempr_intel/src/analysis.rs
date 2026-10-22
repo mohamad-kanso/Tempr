@@ -237,9 +237,8 @@ impl Analysis {
         ordered.first().copied()
     }
 
-    /// The last diagnostic starting strictly before `from`; errors before
-    /// warnings at the same start (navigation moves backwards, so "strictly"
-    /// keeps `shift-f8` from returning the diagnostic the cursor is on).
+    /// The last diagnostic starting strictly before `from`; at the same start,
+    /// errors sort before warnings.
     pub fn previous_diagnostic(&self, from: usize) -> Option<&Diagnostic> {
         self.diagnostics
             .iter()

@@ -122,8 +122,6 @@ const MW: Option<&str> = Some(main_window::KEY_CONTEXT_NOT_PALETTE);
 const IN: Option<&str> = Some(input::KEY_CONTEXT);
 const PAL: Option<&str> = Some(palette::KEY_CONTEXT);
 const ED: Option<&str> = Some(ed::KEY_CONTEXT);
-/// Completion bindings share one context that only exists while the popup is
-/// open; every command carrying it is hidden from palette search.
 const COMPL: Option<&str> = Some(completion::BINDING_CONTEXT);
 
 /// Every core command. Order here is only the fallback for the palette
@@ -148,7 +146,6 @@ pub fn core_commands() -> Vec<CommandSpec> {
             MW,
             &["ctrl-shift-b", "cmd-shift-b"],
         ),
-        // Schema (Phase 3 stage 6)
         spec::<mw::Refresh>(
             "Schema: Refresh",
             "Schema",
@@ -264,13 +261,10 @@ pub fn core_commands() -> Vec<CommandSpec> {
         ),
         spec::<ed::MoveLineUp>("Editor: Move Line Up", "Editor", ED, &["alt-up"]),
         spec::<ed::MoveLineDown>("Editor: Move Line Down", "Editor", ED, &["alt-down"]),
-        // Intelligence (Phase 3 stage 6)
         spec::<ed::TriggerCompletion>("Editor: Trigger Completion", "Editor", ED, &["ctrl-space"]),
         spec::<ed::Hover>("Editor: Show Hover", "Editor", ED, &["ctrl-k ctrl-i"]),
         spec::<ed::NextDiagnostic>("Editor: Next Diagnostic", "Editor", ED, &["f8"]),
         spec::<ed::PrevDiagnostic>("Editor: Previous Diagnostic", "Editor", ED, &["shift-f8"]),
-        // Completion popup: only bound while the popup is open, never
-        // searchable (a closed popup must not consume enter/tab/escape).
         spec::<completion::Next>(
             "Completion: Next Item",
             "Completion",
@@ -460,11 +454,6 @@ mod tests {
 
     #[test]
     fn completion_bindings_come_after_editor_and_window_bindings() {
-        // GPUI resolves a keystroke to the last matching binding, so the
-        // popup's enter/tab/escape/down/up must be registered after every
-        // binding they could shadow (the editor's, and the main window's
-        // `CancelQuery` on escape). A reordering of `core_commands` would
-        // silently break accept.
         let specs = core_commands();
         let mut shared = 0;
         for (completion_index, completion) in

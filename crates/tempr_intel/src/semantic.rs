@@ -41,8 +41,6 @@ pub struct SemanticEngine {
 
 struct CachedAnalysis {
     revision: u64,
-    /// The catalog the analysis was built against; arena indices are only
-    /// valid while this exact `Arc` is installed.
     catalog: Arc<CatalogCache>,
     analysis: Arc<Analysis>,
 }
@@ -111,10 +109,8 @@ impl SemanticEngine {
         self.analyzed(file, buffer.revision(), buffer).0
     }
 
-    /// Analyze a buffer on behalf of a *source* revision. The service's
-    /// mirror buffer has its own revision counter, so diagnostics are keyed
-    /// by the source editor's revision; hover and completion then hit the
-    /// analysis already produced for the text on screen.
+    /// Analyze `buffer` under the editor's revision, not the buffer's own:
+    /// the service's mirror buffer has its own revision counter.
     pub fn analyze_at(
         &self,
         file: SqlFileId,
@@ -162,13 +158,36 @@ impl SemanticEngine {
         (analysis, catalog)
     }
 
+    /// Analysis for one offset, skipping statements that cannot contain it.
+    /// Completion and hover run after every edit, so the full walk would
+    /// scale with file size on the UI thread; a cached full analysis is still
+    /// preferred, and its scopes are identical for the requested offset
+    /// because `scope_chain` only descends into containing regions.
+    pub(crate) fn analyzed_at(
+        &self,
+        file: SqlFileId,
+        revision: u64,
+        offset: usize,
+        buffer: &mut Buffer,
+    ) -> (Arc<Analysis>, Arc<CatalogCache>) {
+        let catalog = self.catalog();
+        if let Some(cached) = self.analyses.lock().get(&file)
+            && cached.revision == revision
+            && Arc::ptr_eq(&cached.catalog, &catalog)
+        {
+            return (cached.analysis.clone(), catalog);
+        }
+        let analysis = Arc::new(self.analyze_region_now(buffer, &catalog, offset));
+        (analysis, catalog)
+    }
+
     /// The hover card for the reference under `offset` (spec §5.3). Reads the
-    /// same cached analysis completion uses; no I/O and no catalog allocation.
+    /// cached analysis completion uses; no I/O and no catalog allocation.
     pub fn hover(&self, file: SqlFileId, buffer: &mut Buffer, offset: usize) -> Option<HoverInfo> {
         let offset = offset.min(buffer.len());
         let text = buffer.text().to_string();
         let reference = crate::hover::reference_at(&text, offset)?;
-        let (analysis, catalog) = self.analyzed(file, buffer.revision(), buffer);
+        let (analysis, catalog) = self.analyzed_at(file, buffer.revision(), offset, buffer);
         let contents = crate::hover::resolve(&catalog, &analysis, offset, &reference)?;
         Some(HoverInfo {
             contents,
@@ -209,6 +228,47 @@ impl SemanticEngine {
         Analysis {
             scopes,
             diagnostics,
+        }
+    }
+
+    fn analyze_region_now(
+        &self,
+        buffer: &mut Buffer,
+        catalog: &Arc<CatalogCache>,
+        offset: usize,
+    ) -> Analysis {
+        buffer.syntax();
+        let fresh = buffer.fresh_syntax();
+        let Some(tree) = fresh else {
+            return Analysis::default();
+        };
+        let mut walker = Walker {
+            buffer,
+            catalog: catalog.as_ref(),
+            loaded: catalog.stats().relations > 0,
+            diags: Vec::new(),
+        };
+        let regions: Vec<_> = regions(tree.root_node())
+            .into_iter()
+            .filter(|region| region.kind() != "ERROR")
+            .collect();
+        // Completion falls back to the statement an incomplete trailing
+        // clause leaves behind, so that statement must be present even when
+        // the cursor sits outside its byte range.
+        let fallback = regions
+            .iter()
+            .rposition(|region| region.start_byte() <= offset);
+        let mut scopes = Vec::new();
+        for (index, region) in regions.iter().enumerate() {
+            let range = region.byte_range();
+            let contains = range.start <= offset && offset <= range.end;
+            if contains || fallback == Some(index) {
+                scopes.push(walker.walk_region(*region, &Vec::new()));
+            }
+        }
+        Analysis {
+            scopes,
+            diagnostics: Vec::new(),
         }
     }
 }
@@ -1620,6 +1680,28 @@ mod tests {
         let third = engine.analyze(file, &mut buffer);
         assert!(!Arc::ptr_eq(&first, &third), "edit → fresh analysis");
         assert_eq!(third.diagnostics.len(), first.diagnostics.len());
+    }
+
+    #[test]
+    fn region_analysis_matches_the_full_scope_chain() {
+        let engine = SemanticEngine::new(loaded());
+        let file = SqlFileId::new();
+        let sql = "select id from users;\nselect name from users u where u.id = 1";
+        let mut buffer = Buffer::new(file, sql);
+        let offset = sql.find("name").expect("needle") + "name".len();
+
+        let region = engine
+            .analyzed_at(file, buffer.revision(), offset, &mut buffer)
+            .0;
+        let full = engine.analyze(file, &mut buffer);
+
+        assert_eq!(
+            region.scope_chain(offset),
+            full.scope_chain(offset),
+            "the hot path must see the same scopes as diagnostics"
+        );
+        assert_eq!(region.scopes.len(), 1, "unrelated statements are skipped");
+        assert_eq!(full.scopes.len(), 2);
     }
 
     #[test]

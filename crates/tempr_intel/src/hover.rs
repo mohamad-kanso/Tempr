@@ -1,11 +1,7 @@
-//! Hover resolution (spec §5.3): find the symbol under an offset, resolve it
-//! through the cached `Analysis` and the immutable `CatalogCache`, and format
-//! a small plain-text card. Hover is synchronous, keyed by the primary
-//! cursor, and never queries the database — it reads exactly the scope and
-//! catalog data completion already uses.
+//! Hover resolution (spec §5.3). Hover is synchronous and never queries the
+//! database.
 //!
-//! Contents are plain text with `\n` separators; the UI renders them as
-//! lines. Markdown can replace this once the theme system ships.
+//! Contents are plain text with `\n` separators; the UI renders them as lines.
 
 use std::ops::Range;
 
@@ -13,7 +9,6 @@ use crate::analysis::{Analysis, Binding, ColumnRef};
 use crate::catalog::{CatalogCache, CatalogEntry};
 use crate::completion::{is_ident_char, qualifier_before};
 
-/// The hover card for one symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoverInfo {
     /// Plain-text card contents (`\n`-separated lines).
@@ -23,8 +18,6 @@ pub struct HoverInfo {
     pub range: Range<usize>,
 }
 
-/// One reference at the cursor: the dotted path before the word, the word
-/// itself, and the full byte range (path included).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reference {
     pub range: Range<usize>,
@@ -33,7 +26,7 @@ pub(crate) struct Reference {
 }
 
 /// The reference under `offset`, if any. The cursor may sit inside the word
-/// or immediately after it (the common case after moving right).
+/// or immediately after it.
 pub(crate) fn reference_at(text: &str, offset: usize) -> Option<Reference> {
     let offset = offset.min(text.len());
     if !text.is_char_boundary(offset) {
@@ -49,7 +42,6 @@ pub(crate) fn reference_at(text: &str, offset: usize) -> Option<Reference> {
     })
 }
 
-/// The identifier containing `offset`, or ending exactly at it.
 fn word_at(text: &str, offset: usize) -> Option<(Range<usize>, String)> {
     if text.is_empty() {
         return None;
@@ -73,7 +65,6 @@ fn word_at(text: &str, offset: usize) -> Option<(Range<usize>, String)> {
         return (!inner.is_empty()).then_some((start..end + 1, inner));
     }
 
-    // A cursor inside a word expands left as well as right.
     let mut start = start;
     while let Some((i, c)) = text[..start].char_indices().next_back() {
         if is_ident_char(c) {
@@ -97,7 +88,6 @@ fn word_at(text: &str, offset: usize) -> Option<(Range<usize>, String)> {
     Some((start..end, text[start..end].to_string()))
 }
 
-/// Opening quote of the quoted identifier whose closing quote is at `close`.
 fn opening_quote(text: &str, close: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut i = close;
@@ -115,7 +105,6 @@ fn opening_quote(text: &str, close: usize) -> Option<usize> {
     None
 }
 
-/// Byte index of the closing quote for the identifier opened at `open`.
 fn closing_quote(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut i = open + 1;
@@ -144,8 +133,8 @@ pub(crate) fn resolve(
     match reference.path.as_slice() {
         [] => resolve_bare(catalog, analysis, offset, word),
         [qualifier] => resolve_qualified(catalog, analysis, offset, qualifier, word),
-        // A database prefix (`db.schema.rel.col`) precedes the schema and
-        // relation; only the last two path segments qualify the relation.
+        // PostgreSQL's `db.schema.rel.col` form puts the database first; only
+        // the last two segments qualify the relation.
         [.., schema, relation] => resolve_schema_relation(catalog, schema, relation, word),
     }
 }
@@ -197,9 +186,6 @@ fn resolve_bare(
         .flat_map(|scope| scope.bindings.iter())
         .find(|b| b.matches_qualifier(word))
     {
-        // A FROM source with a catalog relation resolves to the richer
-        // relation card (rows, view definition); an alias or a CTE keeps the
-        // binding card.
         if let Some(index) = binding.object
             && binding.alias.is_none()
             && let Some(card) = relation_card(catalog, index)
@@ -262,7 +248,6 @@ fn resolve_qualified(
         };
     }
 
-    // `public.users` with the schema spelled out.
     let relations = catalog.relation_folded(qualifier, word);
     match relations.as_slice() {
         [idx] => return relation_card(catalog, *idx),
@@ -280,8 +265,6 @@ fn resolve_qualified(
         }
     }
 
-    // `users.id` where `users` is not in this statement's FROM but exists in
-    // the catalog: still a useful card for a half-typed query.
     let relations = relations_folded(catalog, qualifier);
     match relations.as_slice() {
         [idx] => {
@@ -800,7 +783,6 @@ mod tests {
             "recent",
             catalog(),
         );
-        // `recent` is a CTE binding in the statement, not a catalog relation.
         let hover = hover.expect("hover");
         assert!(hover.contents.contains("`recent`"), "{}", hover.contents);
     }

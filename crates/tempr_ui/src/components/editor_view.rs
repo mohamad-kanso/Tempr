@@ -75,15 +75,11 @@ pub const LINE_HEIGHT: f32 = 22.0;
 pub const FONT_SIZE: f32 = 14.0;
 const GUTTER_WIDTH: f32 = 56.0;
 const TAB: &str = "  ";
-/// Completion rows shown before the popup scrolls.
 const POPUP_ROWS: usize = 12;
 const POPUP_ROW_HEIGHT: f32 = 20.0;
 const POPUP_WIDTH: f32 = 420.0;
-/// Idle time before a text snapshot is analyzed off the UI thread.
 const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(100);
 
-/// A hover or diagnostic message card, anchored where the caret was when it
-/// opened. Any edit or motion closes it.
 struct HoverCard {
     text: String,
     anchor: Option<Point<Pixels>>,
@@ -109,8 +105,6 @@ struct LineLayout {
 pub struct EditorView {
     buffer: Buffer,
     intelligence: Arc<IntelligenceService>,
-    /// Latest diagnostics for this buffer, tagged with the source revision
-    /// they describe. Stale pairs are never rendered.
     analysis: Option<(u64, Arc<Analysis>)>,
     selections: Vec<Selection>,
     goal_column: Option<usize>,
@@ -126,18 +120,14 @@ pub struct EditorView {
     visible_lines: Range<usize>,
     /// Highlights for the lines rendered this frame.
     visible_highlights: Vec<Highlight>,
-    /// Open completion popup, or `None` when closed.
     completion: Option<CompletionPopup>,
-    /// Window-space caret point captured when the popup opened.
     completion_anchor: Option<Point<Pixels>>,
     completion_scroll: UniformListScrollHandle,
-    /// Hover/diagnostic card, or `None`.
     hover: Option<HoverCard>,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
 
-/// Counts shown in the status bar after `DiagnosticsReady`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiagnosticsSummary {
     pub errors: usize,
@@ -289,7 +279,6 @@ impl EditorView {
         } else {
             tempr_editor::selection::normalize(&sels)
         };
-        // Any motion closes a card: it was describing the old caret.
         self.hover = None;
         let line = self.buffer.point_for_offset(self.primary().head).line;
         // `visible_lines` is last frame's range: good enough to pick a side.
@@ -366,6 +355,29 @@ impl EditorView {
             &[Selection],
         ) -> Result<tempr_editor::EditOutcome, tempr_editor::EditError>,
     ) {
+        self.apply_with(cx, true, op);
+    }
+
+    fn apply_structural(
+        &mut self,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(
+            &mut Buffer,
+            &[Selection],
+        ) -> Result<tempr_editor::EditOutcome, tempr_editor::EditError>,
+    ) {
+        self.apply_with(cx, false, op);
+    }
+
+    fn apply_with(
+        &mut self,
+        cx: &mut Context<Self>,
+        auto_complete: bool,
+        op: impl FnOnce(
+            &mut Buffer,
+            &[Selection],
+        ) -> Result<tempr_editor::EditOutcome, tempr_editor::EditError>,
+    ) {
         let sels = self.selections.clone();
         match op(&mut self.buffer, &sels) {
             Ok(outcome) => {
@@ -374,7 +386,7 @@ impl EditorView {
                 self.set_selections(outcome.selections, cx);
                 if changed {
                     cx.emit(EditorEvent::Changed);
-                    self.after_edit(cx);
+                    self.after_edit(auto_complete, cx);
                 }
             }
             Err(e) => cx.emit(EditorEvent::Notice(format!("edit rejected: {e}"))),
@@ -386,18 +398,13 @@ impl EditorView {
         self.apply(cx, |b, s| b.insert_at(s, &text));
     }
 
-    // ── intelligence ─────────────────────────────────────────────────────
-
-    /// Debounce: wait for 100 ms of idle, then hand an immutable snapshot to
-    /// the service only if the buffer has not moved on. The view owns the
-    /// buffer, so analysis can never borrow it across frames.
     fn schedule_analysis(&self, cx: &mut Context<Self>) {
         let revision = self.buffer.revision();
         let file = self.buffer.file_id();
         let intelligence = self.intelligence.clone();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(ANALYSIS_DEBOUNCE).await;
-            let spawned = this.update(cx, |view, cx| {
+            let _ = this.update(cx, |view, cx| {
                 if view.buffer.revision() != revision {
                     return;
                 }
@@ -408,16 +415,12 @@ impl EditorView {
                 })
                 .detach();
             });
-            if spawned.is_err() {
-                // The view is gone; there is nothing left to analyze.
-            }
         })
         .detach();
     }
 
-    /// Store the analysis the service produced, but only for the revision on
-    /// screen. Called by the owner after `UiEvent::DiagnosticsReady`.
-    /// Returns whether the analysis was current.
+    /// Store the analysis for the revision on screen after
+    /// `UiEvent::DiagnosticsReady`; returns whether it was current.
     pub fn on_diagnostics(&mut self, cx: &mut Context<Self>) -> bool {
         let revision = self.buffer.revision();
         if let Some(analysis) = self.intelligence.analysis(self.buffer.file_id(), revision) {
@@ -438,11 +441,9 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Anything a keystroke changed: close stale cards, keep the popup in
-    /// sync with the new word, and schedule the idle analysis.
-    fn after_edit(&mut self, cx: &mut Context<Self>) {
+    fn after_edit(&mut self, auto_complete: bool, cx: &mut Context<Self>) {
         self.hover = None;
-        if !self.should_auto_complete() {
+        if !auto_complete || !self.should_auto_complete() {
             self.close_completion();
         } else if self.completion.is_some() {
             self.refilter_completion();
@@ -453,8 +454,6 @@ impl EditorView {
         cx.notify();
     }
 
-    /// True when the caret follows text that can be completed: an identifier
-    /// character (including a quoted one) or a qualifier dot.
     fn should_auto_complete(&self) -> bool {
         let head = self.primary().head;
         if head == 0 {
@@ -519,8 +518,6 @@ impl EditorView {
         self.completion_anchor = None;
     }
 
-    /// Resolve at the primary cursor: symbol hover first, then the diagnostic
-    /// under the cursor. Neither existing is a status notice, not a card.
     fn show_hover(&mut self, cx: &mut Context<Self>) {
         let head = self.primary().head;
         let hover = self.intelligence.hover(&mut self.buffer, head);
@@ -561,6 +558,7 @@ impl EditorView {
             cx.emit(EditorEvent::Notice("No diagnostics.".into()));
             return;
         };
+        self.close_completion();
         self.set_selections(vec![Selection::cursor(target.0)], cx);
         // The new line has not been laid out yet (it may have just been
         // scrolled into view), so anchor the card after the frame paints.
@@ -676,7 +674,7 @@ impl EditorView {
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         self.copy(&Copy, window, cx);
         if self.selections.iter().any(|s| !s.is_empty()) {
-            self.apply(cx, |b, s| b.insert_at(s, ""));
+            self.apply_structural(cx, |b, s| b.insert_at(s, ""));
         }
     }
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
@@ -685,16 +683,16 @@ impl EditorView {
         }
     }
     fn delete_line(&mut self, _: &DeleteLine, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply(cx, |b, s| b.delete_lines(s));
+        self.apply_structural(cx, |b, s| b.delete_lines(s));
     }
     fn duplicate_line(&mut self, _: &DuplicateLine, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply(cx, |b, s| b.duplicate_lines(s));
+        self.apply_structural(cx, |b, s| b.duplicate_lines(s));
     }
     fn move_line_up(&mut self, _: &MoveLineUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply(cx, |b, s| b.move_lines(s, LineDirection::Up));
+        self.apply_structural(cx, |b, s| b.move_lines(s, LineDirection::Up));
     }
     fn move_line_down(&mut self, _: &MoveLineDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply(cx, |b, s| b.move_lines(s, LineDirection::Down));
+        self.apply_structural(cx, |b, s| b.move_lines(s, LineDirection::Down));
     }
     fn run_all(&mut self, _: &RunAll, _: &mut Window, cx: &mut Context<Self>) {
         self.close_completion();
@@ -872,8 +870,6 @@ impl EditorView {
             kinds[a..b].fill(Some(h.kind));
         }
 
-        // Diagnostics underline the bytes they cover: errors solid, warnings
-        // wavy. An error wins when both cover the same byte.
         let mut underlines: Vec<Option<(u32, bool)>> = vec![None; text.len()];
         if let Some(analysis) = self.analysis() {
             for diagnostic in analysis.diagnostics_in(line_start..line_end) {
@@ -913,7 +909,6 @@ impl EditorView {
         runs
     }
 
-    /// The completion popup, positioned at the caret captured when it opened.
     fn render_completion_popup(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (anchor, rows) = {
             let popup = self.completion.as_ref()?;
@@ -993,7 +988,6 @@ impl EditorView {
             .into_any_element()
     }
 
-    /// The hover/diagnostic card, anchored where the caret was when it opened.
     fn render_hover_card(&self) -> Option<AnyElement> {
         let card = self.hover.as_ref()?;
         let anchor = card.anchor?;
@@ -1124,7 +1118,7 @@ impl EntityInputHandler for EditorView {
                         self.set_selections(outcome.selections, cx);
                         if changed {
                             cx.emit(EditorEvent::Changed);
-                            self.after_edit(cx);
+                            self.after_edit(true, cx);
                         }
                     }
                     Err(e) => cx.emit(EditorEvent::Notice(format!("edit rejected: {e}"))),
@@ -1440,14 +1434,10 @@ impl gpui::Element for LineElement {
     }
 }
 
-/// Next/previous diagnostic for `f8`/`shift-f8`, wrapping at the ends.
-/// Forward is strictly after the cursor; backward is strictly before, so
-/// pressing the same key twice moves instead of re-selecting.
 fn diagnostic_target(analysis: &Analysis, from: usize, forward: bool) -> Option<(usize, String)> {
     let from = if forward {
         from
     } else {
-        // The diagnostic under the cursor is not "previous"; move past it.
         analysis
             .diagnostics
             .iter()

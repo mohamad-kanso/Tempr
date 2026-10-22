@@ -71,7 +71,6 @@ pub enum AppEvent {
         file: SqlFileId,
     },
 
-    // Intelligence
     /// Background analysis for `file` finished; the UI reads the fresh
     /// diagnostics from `IntelligenceService` (payload stays an id).
     DiagnosticsReady {

@@ -11,7 +11,7 @@ use tracing_subscriber::FmtSubscriber;
 use tempr_db::DatabaseDriver;
 use tempr_db_postgres::PostgresDriver;
 use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode};
-use tempr_events::{EventBus, EventFilter};
+use tempr_events::{AppEventKind, EventBus, EventFilter};
 use tempr_services::{
     CommandService, ConnectionService, IntelligenceService, QueryService, SchemaService,
     ServiceRegistry,
@@ -218,9 +218,12 @@ fn main() -> Result<()> {
         anyhow::bail!("TEMPR_BENCH_SCROLL=1 requires TEMPR_STARTUP_SQL and DATABASE_URL");
     }
     let throttle_inactive = !dev.bench_scroll_then_exit;
-    let _event_log = services.bus.subscribe(EventFilter::All, |event| {
-        info!(event = ?event.kind(), "event");
-    });
+    let _event_log =
+        services
+            .bus
+            .subscribe(EventFilter::Not(AppEventKind::BufferChanged), |event| {
+                info!(event = ?event.kind(), "event");
+            });
 
     gpui_compat::run_app(move |cx| {
         tempr_ui::commands::install(cx, &services.command);

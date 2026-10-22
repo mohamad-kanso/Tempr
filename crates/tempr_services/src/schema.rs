@@ -116,14 +116,13 @@ impl SchemaService {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Arc<SchemaSnapshot>, ServiceError> {
-        // Keep the scope invariant: a full refresh after an `All` snapshot
-        // must not silently shrink the catalog to the search path.
+        // Reuse the snapshot's scope: an `All` catalog must not shrink to the
+        // search path on a plain refresh.
         let scope = self.refresh_scope_for(connection_id);
         self.refresh_scope(connection_id, scope).await
     }
 
-    /// Refresh every non-system schema. The UI's "refresh all schemas"
-    /// command; differences from `refresh` are listed on `refresh_scope`.
+    /// Refresh every non-system schema.
     pub async fn refresh_all_schemas(
         &self,
         connection_id: ConnectionId,
@@ -131,10 +130,8 @@ impl SchemaService {
         self.refresh_scope(connection_id, SchemaScope::All).await
     }
 
-    /// Full introspection over an explicit scope. Entries and fingerprints
-    /// come from the same scope and the same connection moment, so the next
-    /// incremental diff compares like with like. The scope is remembered for
-    /// that connection and used by `refresh_incremental` afterwards.
+    /// Full introspection over an explicit scope, remembered for the
+    /// connection and used by `refresh_incremental` afterwards.
     pub async fn refresh_scope(
         &self,
         connection_id: ConnectionId,
@@ -199,11 +196,9 @@ impl SchemaService {
         Ok(snapshot)
     }
 
-    /// The scope the current snapshot was built from. A snapshot already in
-    /// memory means a scope existed at some point but was lost (a restart
-    /// that reused a cached catalog); sweeping `SearchPath` against an `All`
-    /// snapshot would report every out-of-path object as dropped, so fall
-    /// back to the conservative `All` sweep instead.
+    /// A snapshot with no remembered scope (a restart that reused the cached
+    /// catalog) must not assume `SearchPath`; that could report every
+    /// out-of-path object as dropped.
     fn refresh_scope_for(&self, connection_id: ConnectionId) -> SchemaScope {
         if let Some(scope) = self.scopes.read().get(&connection_id).cloned() {
             return scope;
@@ -1180,8 +1175,6 @@ mod tests {
         assert_eq!(column_count, 1, "column must not appear twice");
     }
 
-    /// Records the scope of every introspection and sweep it serves, so a test
-    /// can prove the service hands the requested scope to the driver.
     struct RecordingDriver {
         scopes: Arc<std::sync::Mutex<Vec<SchemaScope>>>,
     }
@@ -1366,9 +1359,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_cached_snapshot_without_a_remembered_scope_sweeps_every_schema() {
-        // Simulates a restart: the cached catalog is loaded from disk while
-        // the in-memory scope map is empty. An unknown scope must not be
-        // assumed to be SearchPath against a snapshot that may be All.
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let storage: Arc<dyn tempr_workspace::Storage> =
             Arc::new(tempr_workspace::FileSystemStorage::new(tmp.path()));
