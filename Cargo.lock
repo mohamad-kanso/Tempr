@@ -6044,11 +6044,13 @@ name = "tempr_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "futures",
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "tempr_db",
  "tempr_domain",
  "tempr_editor",
  "tempr_events",

@@ -760,12 +760,153 @@ mod view_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use std::time::Duration;
+
+    use async_trait::async_trait;
     use chrono::Utc;
     use gpui::{AnyWindowHandle, AppContext as _, Keystroke, TestAppContext};
-    use tempr_domain::{SchemaObject, SchemaObjectId, SchemaSnapshot, SchemaSnapshotId};
+    use tempr_db::{
+        CancelHandle, DatabaseDriver, DriverConnection, DriverError, EngineId, QueryStream,
+        QueryStreamImpl, SchemaScope, SchemaSnapshotEntry,
+    };
+    use tempr_domain::{
+        DriverKind, SchemaObject, SchemaObjectId, SchemaSnapshot, SchemaSnapshotId, SecretRef,
+        TlsMode, Value, ValueType,
+    };
     use tempr_events::EventBus;
 
     use super::*;
+
+    /// Minimal driver so `MainWindow` can connect and stream without a
+    /// database. Deliberately local: production ships no test-support driver.
+    struct MockDriver;
+
+    #[async_trait]
+    impl DatabaseDriver for MockDriver {
+        fn engine(&self) -> EngineId {
+            EngineId(DriverKind::Postgres.engine_name().to_string())
+        }
+
+        async fn connect(
+            &self,
+            _connection: &Connection,
+        ) -> Result<Box<dyn DriverConnection>, DriverError> {
+            Ok(Box::new(MockConnection))
+        }
+    }
+
+    struct MockConnection;
+
+    #[async_trait]
+    impl DriverConnection for MockConnection {
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<QueryStream, DriverError> {
+            let columns = vec![ColumnSpec {
+                name: "n".into(),
+                ordinal: 0,
+                data_type: "int8".into(),
+                value_type: ValueType::Int,
+                nullable: false,
+                table_schema: None,
+                table_name: None,
+            }];
+            let batches = (0..2)
+                .map(|b| Batch {
+                    rows: (0..2)
+                        .map(|r| vec![Value::Int8((b * 2 + r) as i64)])
+                        .collect(),
+                    batch_index: b,
+                })
+                .collect();
+            Ok(QueryStream::new(
+                Box::new(MockStream { columns, batches }),
+                2,
+            ))
+        }
+
+        async fn cancel(&mut self) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+
+        fn cancel_handle(&self) -> Box<dyn CancelHandle> {
+            Box::new(NoopCancel)
+        }
+
+        async fn snapshot_schema(
+            &mut self,
+            _scope: SchemaScope,
+        ) -> Result<Vec<SchemaSnapshotEntry>, DriverError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct NoopCancel;
+
+    #[async_trait]
+    impl CancelHandle for NoopCancel {
+        async fn cancel(&self) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
+    /// Two batches of two single-int rows.
+    struct MockStream {
+        columns: Vec<ColumnSpec>,
+        batches: std::collections::VecDeque<Batch>,
+    }
+
+    #[async_trait]
+    impl QueryStreamImpl for MockStream {
+        fn columns(&self) -> &[ColumnSpec] {
+            &self.columns
+        }
+
+        async fn next_batch(&mut self) -> Result<Option<Batch>, DriverError> {
+            Ok(self.batches.pop_front())
+        }
+
+        fn rows_affected(&self) -> u64 {
+            0
+        }
+    }
+
+    fn mock_connection() -> Connection {
+        Connection {
+            id: ConnectionId::new(),
+            name: "mock".into(),
+            driver: DriverKind::Postgres,
+            host: "localhost".into(),
+            port: 5432,
+            database: "db".into(),
+            username: "u".into(),
+            password: "p".into(),
+            secret_ref: SecretRef {
+                vault_key: "k".into(),
+            },
+            tls: TlsMode::Disable,
+        }
+    }
+
+    /// The driver's connect/execute finish on tokio threads, so the test has
+    /// to keep draining the foreground queue until the state it waits for
+    /// shows up. The bound turns a stuck bridge into a failure, not a hang.
+    fn settle(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("timed out waiting for background work");
+    }
 
     /// `public.users(id)`: enough for the analyzer to reject an unknown
     /// column and emit one error diagnostic.
@@ -955,5 +1096,71 @@ mod view_tests {
             }),
             "the bus event must reach the status-bar summary"
         );
+    }
+
+    /// The window binding (`ctrl-enter` → editor `Run` → `run_sql` →
+    /// `QueryService` on tokio → channel sink → grid → outcome status) with a
+    /// driver that never opens a socket.
+    #[gpui::test]
+    fn ctrl_enter_streams_the_mock_query_into_the_grid(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_tokio::init(cx);
+            cx.background_executor().allow_parking();
+        });
+        let bus = Arc::new(EventBus::new());
+        let connection_service = ConnectionService::new(bus.clone());
+        connection_service.register_driver(Arc::new(MockDriver));
+        let query = QueryService::new(bus.clone(), connection_service.clone());
+        let schema = SchemaService::new(bus.clone(), connection_service.clone());
+        let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
+        let command = CommandService::new(bus.clone());
+        cx.update(|cx| commands::install(cx, &command));
+        let services = Services {
+            bus,
+            connection: connection_service,
+            query,
+            command,
+            schema,
+            intelligence,
+        };
+        let root = cx.add_window(|window, cx| {
+            MainWindow::new(
+                services,
+                Some(mock_connection()),
+                DevOptions::default(),
+                window,
+                cx,
+            )
+        });
+        let window = *root;
+        let editor = cx.read(|cx| root.read(cx).expect("root").editor.clone());
+
+        settle(cx, |cx| {
+            cx.read(|cx| root.read(cx).expect("root").connection_state)
+                == ConnectionState::Connected
+        });
+        draw(cx, window);
+
+        editor.update(cx, |editor, cx| editor.set_text("select n from t", cx));
+        press(cx, window, "ctrl-enter");
+
+        settle(cx, |cx| {
+            cx.read(|cx| {
+                let root = root.read(cx).expect("root");
+                root.grid.read(cx).row_count() == 4 && root.current_run.is_none()
+            })
+        });
+
+        let (rows, columns, status) = cx.read(|cx| {
+            let root = root.read(cx).expect("root");
+            (
+                root.grid.read(cx).row_count(),
+                root.grid.read(cx).column_count(),
+                root.status.clone(),
+            )
+        });
+        assert_eq!(rows, 4, "both streamed batches reach the grid");
+        assert_eq!(columns, 1, "the column metadata arrives first");
+        assert_eq!(status, "Done — 4 rows", "the outcome task owns the status");
     }
 }
