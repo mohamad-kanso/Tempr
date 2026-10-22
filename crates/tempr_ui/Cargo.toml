@@ -29,6 +29,8 @@ unicode-segmentation.workspace = true
 # per package, so this also applies to `cargo bench` for this crate — benches
 # that must stay free of test-support belong in their own crate (docs/TODO.md).
 gpui = { workspace = true, features = ["test-support"] }
+# Snapshot fixtures for the schema-aware view tests.
+chrono.workspace = true
 
 [lints]
 workspace = true

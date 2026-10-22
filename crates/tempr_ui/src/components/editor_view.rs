@@ -1546,3 +1546,177 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod view_tests {
+    use chrono::Utc;
+    use gpui::{
+        AnyWindowHandle, AppContext as _, Context, Entity, IntoElement, Keystroke, Render,
+        TestAppContext, Window, div, prelude::*,
+    };
+    use tempr_domain::{
+        ConnectionId, SchemaObject, SchemaObjectId, SchemaSnapshot, SchemaSnapshotId,
+    };
+    use tempr_events::EventBus;
+    use tempr_services::{CommandService, ConnectionService, SchemaService};
+
+    use super::*;
+    use crate::commands;
+
+    struct Harness {
+        editor: Entity<EditorView>,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.editor.clone())
+        }
+    }
+
+    /// `public.users(id, email, "createdAt")` — `createdAt` needs quoting, so
+    /// accepting it proves the candidate's `insert` is used, not its label.
+    fn users_snapshot() -> SchemaSnapshot {
+        let table = SchemaObjectId::new();
+        let column = |name: &str, ordinal: usize| SchemaObject::Column {
+            id: SchemaObjectId::new(),
+            parent_id: table,
+            name: name.into(),
+            data_type: "text".into(),
+            nullable: true,
+            ordinal,
+            default: None,
+        };
+        SchemaSnapshot {
+            id: SchemaSnapshotId::new(),
+            connection_id: ConnectionId::new(),
+            version: 1,
+            fetched_at: Utc::now(),
+            objects: vec![
+                SchemaObject::Table {
+                    id: table,
+                    schema: "public".into(),
+                    name: "users".into(),
+                    estimated_rows: Some(1),
+                },
+                column("id", 0),
+                column("email", 1),
+                column("createdAt", 2),
+            ],
+            keywords: vec!["select".into(), "from".into(), "where".into()],
+            fingerprints: Vec::new(),
+        }
+    }
+
+    fn setup(cx: &mut TestAppContext, text: &str) -> (Entity<EditorView>, AnyWindowHandle) {
+        let service = CommandService::new(Arc::new(EventBus::new()));
+        cx.update(|cx| commands::install(cx, &service));
+
+        let bus = Arc::new(EventBus::new());
+        let connections = ConnectionService::new(bus.clone());
+        let schema = SchemaService::new(bus.clone(), connections);
+        let intelligence = IntelligenceService::new(bus, schema);
+        intelligence.install_snapshot(&users_snapshot());
+
+        let root = cx.add_window(|_, cx| {
+            let editor = cx.new(|cx| EditorView::new(text, intelligence, cx));
+            Harness { editor }
+        });
+        let editor = cx.read(|cx| root.read(cx).expect("window root").editor.clone());
+        (editor, root.into())
+    }
+
+    fn draw(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn press(cx: &mut TestAppContext, window: AnyWindowHandle, keystroke: &str) {
+        let keystroke = Keystroke::parse(keystroke).expect("valid keystroke");
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        })
+        .unwrap();
+    }
+
+    fn labels(editor: &Entity<EditorView>, cx: &TestAppContext) -> Vec<String> {
+        let mut labels = editor.read_with(cx, |editor, _| {
+            editor
+                .completion
+                .as_ref()
+                .map(|popup| {
+                    popup
+                        .items
+                        .iter()
+                        .map(|item| item.label.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        labels.sort_unstable();
+        labels
+    }
+
+    /// End to end: the catalog snapshot feeds the popup, typing after `u.`
+    /// re-filters it, and enter replaces the typed prefix with the *quoted*
+    /// insert. Every step is a keystroke, so this also covers the editor and
+    /// completion contexts resolving their own bindings.
+    #[gpui::test]
+    fn completion_accept_inserts_the_quoted_column_after_a_qualifier(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            // Edits debounce an analysis onto the tokio bridge; without the
+            // bridge the task panics when the harness drains it at teardown.
+            gpui_tokio::init(cx);
+            cx.background_executor().allow_parking();
+        });
+
+        let (editor, window) = setup(cx, "select * from users u where u.");
+        let focus = editor.read_with(cx, |editor, cx| editor.focus_handle(cx));
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        // `ctrl-end` is the editor's own `DocumentEnd` binding.
+        press(cx, window, "ctrl-end");
+        // `ctrl-space` is `TriggerCompletion`; after a dot it offers the
+        // binding's columns only.
+        press(cx, window, "ctrl-space");
+        draw(cx, window);
+        assert_eq!(
+            labels(&editor, cx),
+            vec!["createdAt", "email", "id"],
+            "the popup must offer the `u` binding's columns"
+        );
+
+        // Typing narrows the popup to the camel-case column.
+        for ch in "cr".chars() {
+            press(cx, window, &ch.to_string());
+        }
+        draw(cx, window);
+        assert_eq!(
+            labels(&editor, cx),
+            vec!["createdAt"],
+            "typing must re-filter the popup"
+        );
+
+        press(cx, window, "enter");
+
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.text()),
+            "select * from users u where u.\"createdAt\"",
+            "accept must insert the quoted identifier, not the label"
+        );
+        assert!(
+            !editor.read_with(cx, |editor, _| editor.completion_open()),
+            "accepting must close the popup"
+        );
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.primary().head),
+            "select * from users u where u.\"createdAt\"".len(),
+            "the caret belongs after the inserted identifier"
+        );
+    }
+}
