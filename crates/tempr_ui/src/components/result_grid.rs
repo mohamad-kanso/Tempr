@@ -100,11 +100,13 @@ impl ResultGrid {
 
     /// Columns intersecting the horizontal viewport, including overscan.
     fn visible_columns(&self, viewport_width: f32) -> std::ops::Range<usize> {
-        visible_column_range(
-            self.columns.len(),
-            self.column_scroll.offset().x.into(),
-            viewport_width,
-        )
+        // `ScrollHandle` offsets are non-positive: zero at the left edge, more
+        // negative as the content moves left. `visible_column_range` wants the
+        // distance scrolled, so flip the sign — clamping the raw offset to zero
+        // pinned the window to columns 0..N and left the rest of a scrolled
+        // wide table blank.
+        let scrolled = (-self.column_scroll.offset().x).max(px(0.));
+        visible_column_range(self.columns.len(), scrolled.into(), viewport_width)
     }
 
     fn column_spacer(columns: usize) -> impl IntoElement {
@@ -192,7 +194,8 @@ impl ResultGrid {
 }
 
 /// The column range that intersects a horizontal viewport, clamped to the
-/// table. `viewport_width` is a pixel count.
+/// table. `offset` is the distance scrolled from the left edge (a non-negative
+/// pixel count) and `viewport_width` a pixel count.
 fn visible_column_range(
     column_count: usize,
     offset: f32,
@@ -322,6 +325,21 @@ mod tests {
         g.reset();
         assert_eq!(g.row_count(), 0);
         assert_eq!(g.column_count(), 0);
+    }
+
+    #[test]
+    fn visible_columns_follow_the_scroll_handle_offset() {
+        let mut g = ResultGrid::new();
+        g.set_columns((0..100).map(|i| col(&format!("c{i}"))).collect());
+        // gpui keeps a scrolled-right offset negative (clamped to
+        // -max_offset..=0), so the grid must flip the sign before treating it
+        // as a distance. Passing the raw offset pinned the window to the first
+        // columns and left the rest of a wide table blank.
+        g.column_scroll.set_offset(gpui::point(px(-900.), px(0.)));
+        assert_eq!(g.visible_columns(800.0), 3..12);
+        // An unscrolled grid still starts at the first column.
+        g.column_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        assert_eq!(g.visible_columns(800.0), 0..7);
     }
 
     #[test]
