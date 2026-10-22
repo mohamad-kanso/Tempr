@@ -342,7 +342,7 @@ The semantic analyzer walks the tree-sitter AST to build a scope chain. Each sco
 
 ### Name Resolution
 
-The walk compares names with any surrounding double quotes removed (`"createdAt"` denotes `createdAt`, and `""` inside is one literal quote). The comparisons below still fold case, so quoted case sensitivity is not enforced yet (parked in docs/TODO.md).
+The walk first applies PostgreSQL's identifier rule: an unquoted name folds to ASCII lower case, while a quoted name keeps its case and drops the delimiters (`"createdAt"` denotes `createdAt`, and `""` inside is one literal quote). The comparisons below still fold case, so quoted case sensitivity is not enforced yet (parked in docs/TODO.md).
 
 The engine resolves names in three steps:
 
@@ -475,7 +475,7 @@ The completion pipeline is the most latency-sensitive path in the entire system.
 
 Auto-open follows spec decision 5: one identifier character or a qualifier dot opens the popup; `ctrl-space` (`explicit`) forces it anywhere.
 
-Identifier candidates are inserted the way PostgreSQL will read them back: a name outside the unquoted `[a-z_][a-z0-9_$]*` shape (or a reserved word) gets double quotes, so accepting `createdAt` writes `"createdAt"` rather than the folded `createdat` that names a different column. The analyzer strips those quotes before resolving a reference; quoted-context case sensitivity is parked in docs/TODO.md.
+Identifier candidates are inserted the way PostgreSQL will read them back: a name outside the unquoted `[a-z_][a-z0-9_$]*` shape (or a reserved word) gets double quotes, so accepting `createdAt` writes `"createdAt"` rather than the folded `createdat` that names a different column. The analyzer applies the mirror rule before resolving a reference (unquoted folds to lower case, quoted keeps its case and drops the quotes); quoted-context case sensitivity is parked in docs/TODO.md.
 
 ### Stage 2: Candidate Generation
 

@@ -293,7 +293,7 @@ impl<'a> Walker<'a> {
         collect_identifier_ranges(node, &mut ranges);
         ranges
             .into_iter()
-            .map(|r| (unquote_identifier(&self.text(r.clone())), r))
+            .map(|r| (normalize_identifier(&self.text(r.clone())), r))
             .collect()
     }
 
@@ -1082,13 +1082,14 @@ impl<'a> Walker<'a> {
 
 // === Free functions ===
 
-/// The name a quoted identifier denotes (`"createdAt"` → `createdAt`);
-/// doubled quotes inside are one literal quote.
-fn unquote_identifier(raw: &str) -> String {
+/// PostgreSQL's identifier rule: an unquoted name folds to ASCII lower case;
+/// a quoted one keeps its case and denotes the text inside, with doubled
+/// quotes standing for one literal quote.
+fn normalize_identifier(raw: &str) -> String {
     if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
         raw[1..raw.len() - 1].replace("\"\"", "\"")
     } else {
-        raw.to_string()
+        raw.to_ascii_lowercase()
     }
 }
 
@@ -1249,6 +1250,13 @@ mod tests {
 
     fn empty_catalog() -> Arc<CatalogCache> {
         catalog_with(&[])
+    }
+
+    #[test]
+    fn identifiers_follow_postgres_fold_or_unquote() {
+        assert_eq!(normalize_identifier("createdAt"), "createdat");
+        assert_eq!(normalize_identifier("\"createdAt\""), "createdAt");
+        assert_eq!(normalize_identifier("\"a\"\"b\""), "a\"b");
     }
 
     fn analyze(
