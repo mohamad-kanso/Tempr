@@ -5,7 +5,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{Level, error, info};
+use tracing::{Level, debug, error, info};
 use tracing_subscriber::FmtSubscriber;
 
 use tempr_db::DatabaseDriver;
@@ -222,7 +222,17 @@ fn main() -> Result<()> {
         services
             .bus
             .subscribe(EventFilter::Not(AppEventKind::BufferChanged), |event| {
-                info!(event = ?event.kind(), "event");
+                let kind = event.kind();
+                // Typing produces one of these per debounce interval; keep the
+                // default console to lifecycle and query events.
+                if matches!(
+                    kind,
+                    AppEventKind::DiagnosticsReady | AppEventKind::RowsReceived
+                ) {
+                    debug!(event = ?kind, "event");
+                } else {
+                    info!(event = ?kind, "event");
+                }
             });
 
     gpui_compat::run_app(move |cx| {
