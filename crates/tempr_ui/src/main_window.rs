@@ -760,10 +760,43 @@ mod view_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use chrono::Utc;
     use gpui::{AnyWindowHandle, AppContext as _, Keystroke, TestAppContext};
+    use tempr_domain::{SchemaObject, SchemaObjectId, SchemaSnapshot, SchemaSnapshotId};
     use tempr_events::EventBus;
 
     use super::*;
+
+    /// `public.users(id)`: enough for the analyzer to reject an unknown
+    /// column and emit one error diagnostic.
+    fn users_snapshot() -> SchemaSnapshot {
+        let table = SchemaObjectId::new();
+        SchemaSnapshot {
+            id: SchemaSnapshotId::new(),
+            connection_id: ConnectionId::new(),
+            version: 1,
+            fetched_at: Utc::now(),
+            objects: vec![
+                SchemaObject::Table {
+                    id: table,
+                    schema: "public".into(),
+                    name: "users".into(),
+                    estimated_rows: Some(1),
+                },
+                SchemaObject::Column {
+                    id: SchemaObjectId::new(),
+                    parent_id: table,
+                    name: "id".into(),
+                    data_type: "text".into(),
+                    nullable: true,
+                    ordinal: 0,
+                    default: None,
+                },
+            ],
+            keywords: vec!["select".into(), "from".into()],
+            fingerprints: Vec::new(),
+        }
+    }
 
     fn draw(cx: &mut TestAppContext, window: AnyWindowHandle) {
         cx.update_window(window, |_, window, cx| {
@@ -868,6 +901,59 @@ mod view_tests {
             *notices.borrow(),
             2,
             "closing the palette must re-enable the window binding"
+        );
+    }
+
+    /// The edit's analysis is debounced, and the test clock never advances
+    /// under `TestAppContext`, so the analysis is computed directly here.
+    /// `analyze` publishes `DiagnosticsReady` on the bus; only the bridge
+    /// task and `on_ui_event` can put it into the status-bar segment.
+    #[gpui::test]
+    fn diagnostics_ready_from_the_bus_fills_the_status_bar_summary(cx: &mut TestAppContext) {
+        let bus = Arc::new(EventBus::new());
+        let connection = ConnectionService::new(bus.clone());
+        let query = QueryService::new(bus.clone(), connection.clone());
+        let schema = SchemaService::new(bus.clone(), connection.clone());
+        let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
+        intelligence.install_snapshot(&users_snapshot());
+        let command = CommandService::new(bus.clone());
+        cx.update(|cx| commands::install(cx, &command));
+        let services = Services {
+            bus,
+            connection,
+            query,
+            command,
+            schema,
+            intelligence: intelligence.clone(),
+        };
+        let root = cx.add_window(|window, cx| {
+            MainWindow::new(services, None, DevOptions::default(), window, cx)
+        });
+        let editor = cx.read(|cx| root.read(cx).expect("root").editor.clone());
+
+        let text = "select zz from users";
+        let (file, revision) = cx.update(|cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_text(text, cx);
+                (editor.file_id(), editor.revision())
+            })
+        });
+        assert_eq!(
+            cx.read(|cx| root.read(cx).expect("root").diagnostics),
+            None,
+            "no summary until the analysis lands"
+        );
+
+        intelligence.analyze(file, revision, text);
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.read(|cx| root.read(cx).expect("root").diagnostics),
+            Some(DiagnosticsSummary {
+                errors: 1,
+                warnings: 0
+            }),
+            "the bus event must reach the status-bar summary"
         );
     }
 }
