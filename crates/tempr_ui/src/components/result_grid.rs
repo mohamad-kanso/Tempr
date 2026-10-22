@@ -294,6 +294,9 @@ impl Render for ResultGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{
+        AnyWindowHandle, Entity, InputEvent as _, Pixels, Point, TestAppContext, TouchPhase, point,
+    };
 
     fn col(name: &str) -> ColumnSpec {
         ColumnSpec {
@@ -353,5 +356,90 @@ mod tests {
         assert_eq!(visible_column_range(0, 0.0, 800.0), 0..0);
         // A missing layout pass (width 0) still renders at least one column.
         assert_eq!(visible_column_range(4, 0.0, 0.0), 0..3);
+    }
+
+    struct GridHarness {
+        grid: Entity<ResultGrid>,
+    }
+
+    impl Render for GridHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.grid.clone())
+        }
+    }
+
+    /// D29 regression: the wheel axis belongs to one container. A vertical
+    /// tick moves the rows only; a horizontal tick (shift-wheel/tilt) moves the
+    /// column container only. Reaching for gpui's cross-axis fallback on either
+    /// element makes the grid slide sideways on every wheel tick instead.
+    #[gpui::test]
+    fn wheel_axes_split_between_the_rows_and_the_columns(cx: &mut TestAppContext) {
+        let grid = cx.update(|cx| {
+            cx.new(|_| {
+                let mut grid = ResultGrid::new();
+                grid.set_columns((0..20).map(|i| col(&format!("c{i}"))).collect());
+                grid.append(Batch {
+                    rows: vec![vec![Value::Int8(1); 20]; 400],
+                    batch_index: 0,
+                });
+                grid
+            })
+        });
+        let window: AnyWindowHandle = cx
+            .add_window(|_, _| GridHarness { grid: grid.clone() })
+            .into();
+
+        // The window's first frame registers the scroll listeners and hitboxes.
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        let pointer = point(px(400.), px(300.));
+        let scroll = |cx: &mut TestAppContext, delta: Point<Pixels>| {
+            cx.update_window(window, |_, window, cx| {
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position: pointer,
+                        delta: ScrollDelta::Pixels(delta),
+                        modifiers: Default::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+        };
+        let offsets = |cx: &TestAppContext| {
+            cx.read(|cx| {
+                let grid = grid.read(cx);
+                let rows = grid.scroll_handle.0.borrow().base_handle.offset();
+                (rows, grid.column_scroll.offset())
+            })
+        };
+
+        scroll(cx, point(px(0.), px(-240.)));
+        let (rows, columns) = offsets(cx);
+        assert!(
+            rows.y < px(0.),
+            "a vertical wheel tick must scroll the rows, got {rows:?}"
+        );
+        assert_eq!(
+            columns.x,
+            px(0.),
+            "a vertical wheel tick must not scroll the columns"
+        );
+
+        scroll(cx, point(px(-240.), px(0.)));
+        let (rows_after, columns_after) = offsets(cx);
+        assert!(
+            columns_after.x < px(0.),
+            "a horizontal wheel tick must scroll the columns, got {columns_after:?}"
+        );
+        assert_eq!(
+            rows_after.y, rows.y,
+            "a horizontal wheel tick must not scroll the rows"
+        );
     }
 }
