@@ -1664,13 +1664,6 @@ mod view_tests {
     /// completion contexts resolving their own bindings.
     #[gpui::test]
     fn completion_accept_inserts_the_quoted_column_after_a_qualifier(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            // Edits debounce an analysis onto the tokio bridge; without the
-            // bridge the task panics when the harness drains it at teardown.
-            gpui_tokio::init(cx);
-            cx.background_executor().allow_parking();
-        });
-
         let (editor, window) = setup(cx, "select * from users u where u.");
         let focus = editor.read_with(cx, |editor, cx| editor.focus_handle(cx));
         cx.update_window(window, |_, window, cx| {
@@ -1717,6 +1710,91 @@ mod view_tests {
             editor.read_with(cx, |editor, _| editor.primary().head),
             "select * from users u where u.\"createdAt\"".len(),
             "the caret belongs after the inserted identifier"
+        );
+    }
+
+    /// `ctrl-k ctrl-i` is a chord in the catalog, so this also covers the
+    /// pending-chord dispatch path. The card is resolved synchronously from
+    /// the catalog; nothing was typed, so no analysis task is scheduled.
+    #[gpui::test]
+    fn ctrl_k_ctrl_i_shows_the_hover_card_for_the_word_at_the_caret(cx: &mut TestAppContext) {
+        let (editor, window) = setup(cx, "select id from users");
+        let focus = editor.read_with(cx, |editor, cx| editor.focus_handle(cx));
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        // Caret after `id` (the engine accepts the offset on the space).
+        for _ in 0..9 {
+            press(cx, window, "right");
+        }
+        press(cx, window, "ctrl-k");
+        press(cx, window, "ctrl-i");
+
+        let (text, anchored) = editor.read_with(cx, |editor, _| {
+            let hover = editor.hover.as_ref().expect("hover card is open");
+            (hover.text.clone(), hover.anchor.is_some())
+        });
+        assert!(
+            text.contains("public.users.id"),
+            "the card describes the column under the caret: {text}"
+        );
+        assert!(anchored, "the card is anchored to the painted caret line");
+    }
+
+    /// f8 walks to the diagnostic and defers the card to the next frame, so
+    /// the test must deliver one with `simulate_next_frame`.
+    #[gpui::test]
+    fn f8_jumps_to_the_next_diagnostic_and_shows_its_message(cx: &mut TestAppContext) {
+        let text = "select zz from users";
+        let (editor, window) = setup(cx, text);
+        let focus = editor.read_with(cx, |editor, cx| editor.focus_handle(cx));
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        let (file, revision) =
+            editor.read_with(cx, |editor, _| (editor.file_id(), editor.revision()));
+        editor
+            .read_with(cx, |editor, _| editor.intelligence().clone())
+            .analyze(file, revision, text);
+        assert!(
+            editor.update(cx, |editor, cx| editor.on_diagnostics(cx)),
+            "the analysis belongs to the revision on screen"
+        );
+        let diagnostic = editor.read_with(cx, |editor, _| {
+            editor.analysis().expect("analysis").diagnostics[0].clone()
+        });
+        assert_eq!(
+            diagnostic.range.start, 7,
+            "setup: `zz` starts after `select `"
+        );
+
+        press(cx, window, "f8");
+        // `on_next_frame` runs only when the test delivers a frame; there is
+        // no platform frame loop under `TestAppContext`.
+        cx.update_window(window, |_, window, cx| {
+            assert_eq!(window.simulate_next_frame(cx), 1, "one deferred card");
+        })
+        .unwrap();
+
+        let (head, card) = editor.read_with(cx, |editor, _| {
+            (
+                editor.primary().head,
+                editor.hover.as_ref().expect("card").text.clone(),
+            )
+        });
+        assert_eq!(
+            head, diagnostic.range.start,
+            "f8 puts the caret on the diagnostic"
+        );
+        assert_eq!(
+            card, diagnostic.message,
+            "the card carries the diagnostic message"
         );
     }
 }
