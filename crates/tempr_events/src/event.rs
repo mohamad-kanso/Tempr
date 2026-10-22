@@ -56,12 +56,24 @@ pub enum AppEvent {
         connection: ConnectionId,
         snapshot: SchemaSnapshotId,
     },
+    /// An introspection/refresh attempt failed; the previous catalog (or the
+    /// offline cache) stays in use.
+    SchemaRefreshFailed {
+        connection: ConnectionId,
+        message: String,
+    },
 
     // Editor
     BufferChanged {
         file: SqlFileId,
     },
     BufferSaved {
+        file: SqlFileId,
+    },
+
+    /// Background analysis for `file` finished; the UI reads the fresh
+    /// diagnostics from `IntelligenceService` (payload stays an id).
+    DiagnosticsReady {
         file: SqlFileId,
     },
 
@@ -89,8 +101,10 @@ pub enum AppEventKind {
     RowsReceived,
     QueryFinished,
     SchemaRefreshed,
+    SchemaRefreshFailed,
     BufferChanged,
     BufferSaved,
+    DiagnosticsReady,
     CommandExecuted,
     PluginEvent,
 }
@@ -107,8 +121,10 @@ impl AppEvent {
             AppEvent::RowsReceived { .. } => AppEventKind::RowsReceived,
             AppEvent::QueryFinished { .. } => AppEventKind::QueryFinished,
             AppEvent::SchemaRefreshed { .. } => AppEventKind::SchemaRefreshed,
+            AppEvent::SchemaRefreshFailed { .. } => AppEventKind::SchemaRefreshFailed,
             AppEvent::BufferChanged { .. } => AppEventKind::BufferChanged,
             AppEvent::BufferSaved { .. } => AppEventKind::BufferSaved,
+            AppEvent::DiagnosticsReady { .. } => AppEventKind::DiagnosticsReady,
             AppEvent::CommandExecuted { .. } => AppEventKind::CommandExecuted,
             AppEvent::PluginEvent { .. } => AppEventKind::PluginEvent,
         }

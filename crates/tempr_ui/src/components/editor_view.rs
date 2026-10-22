@@ -6,19 +6,25 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point as GpuiPoint, Render,
-    ScrollStrategy, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
-    UniformListScrollHandle, Window, actions, div, fill, point, prelude::*, px, relative, rgb,
-    size, uniform_list,
+    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, IntoElement,
+    LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point, Point as GpuiPoint, Render,
+    ScrollStrategy, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+    UniformListScrollHandle, Window, actions, anchored, div, fill, point, prelude::*, px, relative,
+    rgb, size, uniform_list,
 };
 use tempr_domain::SqlFileId;
 use tempr_editor::edit_ops::LineDirection;
 use tempr_editor::{Buffer, Highlight, HighlightKind, Selection, StatementKind};
+use tempr_intel::{Analysis, HoverInfo, Severity};
+use tempr_services::IntelligenceService;
 
+use crate::components::completion_popup::{self, CompletionPopup};
+use crate::gpui_compat;
 use crate::theme;
 
 actions!(
@@ -57,6 +63,10 @@ actions!(
         MoveLineUp,
         MoveLineDown,
         RunAll,
+        TriggerCompletion,
+        Hover,
+        NextDiagnostic,
+        PrevDiagnostic,
     ]
 );
 
@@ -65,6 +75,15 @@ pub const LINE_HEIGHT: f32 = 22.0;
 pub const FONT_SIZE: f32 = 14.0;
 const GUTTER_WIDTH: f32 = 56.0;
 const TAB: &str = "  ";
+const POPUP_ROWS: usize = 12;
+const POPUP_ROW_HEIGHT: f32 = 20.0;
+const POPUP_WIDTH: f32 = 420.0;
+const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(100);
+
+struct HoverCard {
+    text: String,
+    anchor: Option<Point<Pixels>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {
@@ -85,6 +104,8 @@ struct LineLayout {
 
 pub struct EditorView {
     buffer: Buffer,
+    intelligence: Arc<IntelligenceService>,
+    analysis: Option<(u64, Arc<Analysis>)>,
     selections: Vec<Selection>,
     goal_column: Option<usize>,
     marked_range: Option<Range<usize>>,
@@ -99,14 +120,43 @@ pub struct EditorView {
     visible_lines: Range<usize>,
     /// Highlights for the lines rendered this frame.
     visible_highlights: Vec<Highlight>,
+    completion: Option<CompletionPopup>,
+    completion_anchor: Option<Point<Pixels>>,
+    completion_scroll: UniformListScrollHandle,
+    hover: Option<HoverCard>,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiagnosticsSummary {
+    pub errors: usize,
+    pub warnings: usize,
+}
+
+impl DiagnosticsSummary {
+    /// "2 errors · 1 warning" — the status-bar form.
+    pub fn text(&self) -> String {
+        format!(
+            "{} {} · {} {}",
+            self.errors,
+            plural(self.errors, "error", "errors"),
+            self.warnings,
+            plural(self.warnings, "warning", "warnings"),
+        )
+    }
+}
+
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    if count == 1 { one } else { many }
+}
+
 impl EditorView {
-    pub fn new(text: &str, cx: &mut Context<Self>) -> Self {
+    pub fn new(text: &str, intelligence: Arc<IntelligenceService>, cx: &mut Context<Self>) -> Self {
         Self {
             buffer: Buffer::new(SqlFileId::new(), text),
+            intelligence,
+            analysis: None,
             selections: vec![Selection::cursor(0)],
             goal_column: None,
             marked_range: None,
@@ -115,6 +165,10 @@ impl EditorView {
             line_layouts: HashMap::new(),
             visible_lines: 0..0,
             visible_highlights: Vec::new(),
+            completion: None,
+            completion_anchor: None,
+            completion_scroll: UniformListScrollHandle::new(),
+            hover: None,
         }
     }
 
@@ -126,6 +180,53 @@ impl EditorView {
         &self.buffer
     }
 
+    pub fn file_id(&self) -> SqlFileId {
+        self.buffer.file_id()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.buffer.revision()
+    }
+
+    pub fn intelligence(&self) -> &Arc<IntelligenceService> {
+        &self.intelligence
+    }
+
+    /// The current analysis, but only while it describes the text on screen.
+    pub fn analysis(&self) -> Option<&Arc<Analysis>> {
+        match &self.analysis {
+            Some((revision, analysis)) if *revision == self.buffer.revision() => Some(analysis),
+            _ => None,
+        }
+    }
+
+    /// Window-space caret box from the last painted line layouts. `None`
+    /// before the first frame or when the caret's line was not laid out.
+    pub fn caret_bounds(&self) -> Option<Bounds<Pixels>> {
+        let head = self.primary().head;
+        let line = self.buffer.point_for_offset(head).line;
+        let layout = self.line_layouts.get(&line)?;
+        let index = head.checked_sub(layout.start)?;
+        let x = layout.shaped.x_for_index(index);
+        Some(Bounds::new(
+            point(layout.bounds.left() + x, layout.bounds.top()),
+            size(px(2.), layout.bounds.size.height),
+        ))
+    }
+
+    pub fn diagnostics_summary(&self) -> DiagnosticsSummary {
+        let mut summary = DiagnosticsSummary::default();
+        if let Some(analysis) = self.analysis() {
+            for diagnostic in &analysis.diagnostics {
+                match diagnostic.severity {
+                    Severity::Error => summary.errors += 1,
+                    Severity::Warning => summary.warnings += 1,
+                }
+            }
+        }
+        summary
+    }
+
     pub fn selections(&self) -> &[Selection] {
         &self.selections
     }
@@ -134,7 +235,10 @@ impl EditorView {
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let len = self.buffer.len();
         if let Ok(Some(_)) = self.buffer.edit(&[(0..len, text)]) {
+            self.close_completion();
+            self.hover = None;
             cx.emit(EditorEvent::Changed);
+            self.schedule_analysis(cx);
         }
         self.set_selections(vec![Selection::cursor(self.buffer.len())], cx);
     }
@@ -142,6 +246,7 @@ impl EditorView {
     /// Emit the statement under the primary cursor (or a `Notice` when there
     /// is none / it is a parse-error fragment).
     pub fn run_statement_under_cursor(&mut self, cx: &mut Context<Self>) {
+        self.close_completion();
         let head = self.primary().head;
         // A non-empty selection runs as-is.
         let primary = self.primary();
@@ -174,6 +279,7 @@ impl EditorView {
         } else {
             tempr_editor::selection::normalize(&sels)
         };
+        self.hover = None;
         let line = self.buffer.point_for_offset(self.primary().head).line;
         // `visible_lines` is last frame's range: good enough to pick a side.
         if line < self.visible_lines.start {
@@ -189,7 +295,9 @@ impl EditorView {
     /// selections (or a cursor at 0 for edits recorded without any).
     fn restore(&mut self, sels: Option<Vec<Selection>>, cx: &mut Context<Self>) {
         cx.emit(EditorEvent::Changed);
+        self.close_completion();
         self.goal_column = None;
+        self.schedule_analysis(cx);
         self.set_selections(sels.unwrap_or_else(|| vec![Selection::cursor(0)]), cx);
     }
 
@@ -204,6 +312,7 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl Fn(&Buffer, usize) -> usize,
     ) {
+        self.close_completion();
         self.goal_column = None;
         let sels: Vec<Selection> = self
             .selections
@@ -222,6 +331,7 @@ impl EditorView {
     }
 
     fn move_vertical(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        self.close_completion();
         let goal = self.goal_column;
         let mut new_goal = None;
         let sels: Vec<Selection> = self
@@ -245,14 +355,39 @@ impl EditorView {
             &[Selection],
         ) -> Result<tempr_editor::EditOutcome, tempr_editor::EditError>,
     ) {
+        self.apply_with(cx, true, op);
+    }
+
+    fn apply_structural(
+        &mut self,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(
+            &mut Buffer,
+            &[Selection],
+        ) -> Result<tempr_editor::EditOutcome, tempr_editor::EditError>,
+    ) {
+        self.apply_with(cx, false, op);
+    }
+
+    fn apply_with(
+        &mut self,
+        cx: &mut Context<Self>,
+        auto_complete: bool,
+        op: impl FnOnce(
+            &mut Buffer,
+            &[Selection],
+        ) -> Result<tempr_editor::EditOutcome, tempr_editor::EditError>,
+    ) {
         let sels = self.selections.clone();
         match op(&mut self.buffer, &sels) {
             Ok(outcome) => {
-                if outcome.edit.is_some() {
-                    cx.emit(EditorEvent::Changed);
-                }
+                let changed = outcome.edit.is_some();
                 self.goal_column = None;
                 self.set_selections(outcome.selections, cx);
+                if changed {
+                    cx.emit(EditorEvent::Changed);
+                    self.after_edit(auto_complete, cx);
+                }
             }
             Err(e) => cx.emit(EditorEvent::Notice(format!("edit rejected: {e}"))),
         }
@@ -261,6 +396,186 @@ impl EditorView {
     fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = text.to_string();
         self.apply(cx, |b, s| b.insert_at(s, &text));
+    }
+
+    fn schedule_analysis(&self, cx: &mut Context<Self>) {
+        let revision = self.buffer.revision();
+        let file = self.buffer.file_id();
+        let intelligence = self.intelligence.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ANALYSIS_DEBOUNCE).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.buffer.revision() != revision {
+                    return;
+                }
+                let text = view.buffer.text().to_string();
+                let service = intelligence.clone();
+                gpui_compat::spawn_tokio(cx, async move {
+                    service.analyze(file, revision, &text);
+                })
+                .detach();
+            });
+        })
+        .detach();
+    }
+
+    /// Store the analysis for the revision on screen after
+    /// `UiEvent::DiagnosticsReady`; returns whether it was current.
+    pub fn on_diagnostics(&mut self, cx: &mut Context<Self>) -> bool {
+        let revision = self.buffer.revision();
+        if let Some(analysis) = self.intelligence.analysis(self.buffer.file_id(), revision) {
+            self.analysis = Some((revision, analysis));
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The catalog changed: analyses built against the previous one are
+    /// invalid, so drop the rendered copy and schedule a fresh one.
+    pub fn on_schema_refreshed(&mut self, cx: &mut Context<Self>) {
+        self.analysis = None;
+        self.hover = None;
+        self.schedule_analysis(cx);
+        cx.notify();
+    }
+
+    fn after_edit(&mut self, auto_complete: bool, cx: &mut Context<Self>) {
+        self.hover = None;
+        if !auto_complete || !self.should_auto_complete() {
+            self.close_completion();
+        } else if self.completion.is_some() {
+            self.refilter_completion();
+        } else {
+            self.open_completion(false, cx);
+        }
+        self.schedule_analysis(cx);
+        cx.notify();
+    }
+
+    fn should_auto_complete(&self) -> bool {
+        let head = self.primary().head;
+        if head == 0 {
+            return false;
+        }
+        let start = self.buffer.prev_grapheme_boundary(head);
+        self.buffer
+            .slice(start..head)
+            .ok()
+            .and_then(|text| text.chars().next_back())
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"' || c == '.')
+    }
+
+    fn open_completion(&mut self, explicit: bool, cx: &mut Context<Self>) {
+        if !explicit && !self.should_auto_complete() {
+            self.close_completion();
+            return;
+        }
+        let head = self.primary().head;
+        let items = self.intelligence.complete(&mut self.buffer, head, explicit);
+        if items.is_empty() {
+            self.close_completion();
+        } else {
+            self.completion = Some(CompletionPopup::new(items));
+            self.completion_anchor = self.caret_anchor();
+            self.hover = None;
+        }
+        self.completion_scroll = UniformListScrollHandle::new();
+        cx.notify();
+    }
+
+    fn refilter_completion(&mut self) {
+        let head = self.primary().head;
+        let items = self.intelligence.complete(&mut self.buffer, head, false);
+        if items.is_empty() {
+            self.close_completion();
+            return;
+        }
+        if let Some(popup) = &mut self.completion {
+            popup.refilter(items);
+            self.completion_anchor = self.caret_anchor();
+        }
+    }
+
+    fn caret_anchor(&self) -> Option<Point<Pixels>> {
+        self.caret_bounds()
+            .map(|bounds| point(bounds.left(), bounds.bottom() + px(4.)))
+    }
+
+    /// The popup is open only while it has rows *and* an anchor. The key
+    /// context, render path and accept guard share this predicate, so a
+    /// popup the user cannot see can never capture enter/tab/escape.
+    fn completion_open(&self) -> bool {
+        self.completion
+            .as_ref()
+            .is_some_and(|popup| !popup.is_empty())
+            && self.completion_anchor.is_some()
+    }
+
+    fn close_completion(&mut self) {
+        self.completion = None;
+        self.completion_anchor = None;
+    }
+
+    fn show_hover(&mut self, cx: &mut Context<Self>) {
+        let head = self.primary().head;
+        let hover = self.intelligence.hover(&mut self.buffer, head);
+        let text = match hover {
+            Some(HoverInfo { contents, .. }) => contents,
+            None => match self.diagnostic_at(head) {
+                Some(message) => message,
+                None => {
+                    self.hover = None;
+                    cx.notify();
+                    cx.emit(EditorEvent::Notice(
+                        "No symbol or diagnostic at the cursor.".into(),
+                    ));
+                    return;
+                }
+            },
+        };
+        self.hover = Some(HoverCard {
+            text,
+            anchor: self.caret_anchor(),
+        });
+        cx.notify();
+    }
+
+    fn diagnostic_at(&self, offset: usize) -> Option<String> {
+        self.analysis()?
+            .diagnostics
+            .iter()
+            .find(|d| d.range.start <= offset && offset <= d.range.end)
+            .map(|d| d.message.clone())
+    }
+
+    fn move_to_diagnostic(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .analysis()
+            .and_then(|analysis| diagnostic_target(analysis, self.primary().head, forward))
+        else {
+            cx.emit(EditorEvent::Notice("No diagnostics.".into()));
+            return;
+        };
+        self.close_completion();
+        self.set_selections(vec![Selection::cursor(target.0)], cx);
+        // The new line has not been laid out yet (it may have just been
+        // scrolled into view), so anchor the card after the frame paints.
+        let text = target.1;
+        let revision = self.buffer.revision();
+        cx.on_next_frame(window, move |this, _window, cx| {
+            // The user typed before the frame landed: the message describes
+            // text that is no longer on screen.
+            if this.buffer.revision() != revision {
+                return;
+            }
+            this.hover = Some(HoverCard {
+                text,
+                anchor: this.caret_anchor(),
+            });
+            cx.notify();
+        });
     }
 
     // ── actions ──────────────────────────────────────────────────────────
@@ -314,13 +629,16 @@ impl EditorView {
         self.move_each(true, false, cx, |b, o| b.line_end(o));
     }
     fn document_start(&mut self, _: &DocumentStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         self.set_selections(vec![Selection::cursor(0)], cx);
     }
     fn document_end(&mut self, _: &DocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         let end = self.buffer.len();
         self.set_selections(vec![Selection::cursor(end)], cx);
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         let end = self.buffer.len();
         self.set_selections(vec![Selection::new(0, end)], cx);
     }
@@ -356,7 +674,7 @@ impl EditorView {
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         self.copy(&Copy, window, cx);
         if self.selections.iter().any(|s| !s.is_empty()) {
-            self.apply(cx, |b, s| b.insert_at(s, ""));
+            self.apply_structural(cx, |b, s| b.insert_at(s, ""));
         }
     }
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
@@ -365,25 +683,139 @@ impl EditorView {
         }
     }
     fn delete_line(&mut self, _: &DeleteLine, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply(cx, |b, s| b.delete_lines(s));
+        self.apply_structural(cx, |b, s| b.delete_lines(s));
     }
     fn duplicate_line(&mut self, _: &DuplicateLine, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply(cx, |b, s| b.duplicate_lines(s));
+        self.apply_structural(cx, |b, s| b.duplicate_lines(s));
     }
     fn move_line_up(&mut self, _: &MoveLineUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply(cx, |b, s| b.move_lines(s, LineDirection::Up));
+        self.apply_structural(cx, |b, s| b.move_lines(s, LineDirection::Up));
     }
     fn move_line_down(&mut self, _: &MoveLineDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply(cx, |b, s| b.move_lines(s, LineDirection::Down));
+        self.apply_structural(cx, |b, s| b.move_lines(s, LineDirection::Down));
     }
     fn run_all(&mut self, _: &RunAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         let all = self.text();
         if !all.trim().is_empty() {
             cx.emit(EditorEvent::Run(all));
         }
     }
 
+    fn trigger_completion(
+        &mut self,
+        _: &TriggerCompletion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_completion(true, cx);
+    }
+
+    fn completion_next(
+        &mut self,
+        _: &completion_popup::Next,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(popup) = &mut self.completion {
+            popup.move_selection(1);
+            self.completion_scroll
+                .scroll_to_item(popup.selected, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+    }
+
+    fn completion_prev(
+        &mut self,
+        _: &completion_popup::Prev,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(popup) = &mut self.completion {
+            popup.move_selection(-1);
+            self.completion_scroll
+                .scroll_to_item(popup.selected, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+    }
+
+    fn completion_accept(
+        &mut self,
+        _: &completion_popup::Accept,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.completion_open() {
+            return;
+        }
+        let head = self.primary().head;
+        let Some(item) = self
+            .completion
+            .as_ref()
+            .and_then(|popup| popup.selected_item().cloned())
+        else {
+            return;
+        };
+        if item.replace.end != head {
+            // The item was ranked for a caret that has since moved; applying
+            // its range now could replace unrelated text.
+            self.close_completion();
+            cx.notify();
+            return;
+        }
+        let (range, cursor) = completion_popup::accept_edit(&item);
+        self.close_completion();
+        match self.buffer.edit(&[(range, item.insert.as_str())]) {
+            Ok(changed) => {
+                self.set_selections(vec![Selection::cursor(cursor)], cx);
+                if changed.is_some() {
+                    cx.emit(EditorEvent::Changed);
+                    // An accept completes one word: do not immediately
+                    // reopen on the identifier the insert just produced.
+                    self.hover = None;
+                    self.close_completion();
+                    self.schedule_analysis(cx);
+                }
+                cx.notify();
+            }
+            Err(e) => {
+                cx.emit(EditorEvent::Notice(format!("completion rejected: {e}")));
+                cx.notify();
+            }
+        }
+    }
+
+    fn completion_dismiss(
+        &mut self,
+        _: &completion_popup::Dismiss,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.completion.take().is_some() {
+            self.completion_anchor = None;
+            cx.notify();
+        }
+    }
+
+    fn hover_action(&mut self, _: &Hover, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_hover(cx);
+    }
+
+    fn next_diagnostic(&mut self, _: &NextDiagnostic, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_to_diagnostic(true, window, cx);
+    }
+
+    fn previous_diagnostic(
+        &mut self,
+        _: &PrevDiagnostic,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to_diagnostic(false, window, cx);
+    }
+
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         if let Some(offset) = self.offset_for_position(event.position) {
             let sel = if event.modifiers.shift {
                 self.primary().with_head(offset, true)
@@ -437,19 +869,152 @@ impl EditorView {
             let b = h.range.end.min(line_end) - line_start;
             kinds[a..b].fill(Some(h.kind));
         }
+
+        let mut underlines: Vec<Option<(u32, bool)>> = vec![None; text.len()];
+        if let Some(analysis) = self.analysis() {
+            for diagnostic in analysis.diagnostics_in(line_start..line_end) {
+                let a = diagnostic.range.start.max(line_start) - line_start;
+                let b = diagnostic.range.end.min(line_end) - line_start;
+                let style = match diagnostic.severity {
+                    Severity::Error => (theme::ERROR, false),
+                    Severity::Warning => (theme::WARNING, true),
+                };
+                for slot in &mut underlines[a..b] {
+                    match slot {
+                        Some((_, false)) => {}
+                        _ => *slot = Some(style),
+                    }
+                }
+            }
+        }
+
         let mut runs: Vec<TextRun> = Vec::new();
-        for kind in kinds {
+        for (index, kind) in kinds.into_iter().enumerate() {
             let color: gpui::Hsla = rgb(kind.map_or(theme::TEXT, theme::highlight_color)).into();
+            let underline = underlines[index].map(|(color, wavy)| UnderlineStyle {
+                thickness: px(1.),
+                color: Some(rgb(color).into()),
+                wavy,
+            });
             match runs.last_mut() {
-                Some(last) if last.color == color => last.len += 1,
+                Some(last) if last.color == color && last.underline == underline => last.len += 1,
                 _ => runs.push(TextRun {
                     len: 1,
                     color,
+                    underline,
                     ..base.clone()
                 }),
             }
         }
         runs
+    }
+
+    fn render_completion_popup(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (anchor, rows) = {
+            let popup = self.completion.as_ref()?;
+            (self.completion_anchor?, popup.items.len())
+        };
+        let height = px(rows.min(POPUP_ROWS) as f32 * POPUP_ROW_HEIGHT);
+        Some(
+            anchored()
+                .position(anchor)
+                .child(
+                    div()
+                        .w(px(POPUP_WIDTH))
+                        .h(height)
+                        .bg(rgb(theme::SURFACE_INPUT))
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .rounded(px(4.))
+                        .overflow_hidden()
+                        .child(
+                            uniform_list(
+                                "completion-items",
+                                rows,
+                                cx.processor(|this, range: Range<usize>, _window, _cx| {
+                                    range
+                                        .map(|index| this.render_completion_row(index))
+                                        .collect::<Vec<_>>()
+                                }),
+                            )
+                            .track_scroll(&self.completion_scroll)
+                            .h_full(),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_completion_row(&self, index: usize) -> AnyElement {
+        let Some(popup) = &self.completion else {
+            return div().into_any_element();
+        };
+        let Some(item) = popup.items.get(index) else {
+            return div().into_any_element();
+        };
+        let selected = popup.selected == index;
+        div()
+            .id(index)
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(POPUP_ROW_HEIGHT))
+            .px_2()
+            .bg(rgb(if selected {
+                theme::SURFACE_RAISED
+            } else {
+                theme::SURFACE_INPUT
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(rgb(if selected { theme::ACCENT } else { theme::TEXT }))
+                    .child(item.label.clone()),
+            )
+            .child(
+                div()
+                    .w(px(52.))
+                    .text_size(px(11.))
+                    .text_color(rgb(theme::TEXT_DIM))
+                    .child(CompletionPopup::kind_label(item.kind)),
+            )
+            .child(
+                div()
+                    .max_w(px(180.))
+                    .text_size(px(11.))
+                    .text_color(rgb(theme::TEXT_DIM))
+                    .child(item.detail.clone()),
+            )
+            .into_any_element()
+    }
+
+    fn render_hover_card(&self) -> Option<AnyElement> {
+        let card = self.hover.as_ref()?;
+        let anchor = card.anchor?;
+        Some(
+            anchored()
+                .position(anchor)
+                .child(
+                    div()
+                        .w(px(440.))
+                        .p_2()
+                        .bg(rgb(theme::SURFACE_RAISED))
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .rounded(px(4.))
+                        .text_size(px(12.))
+                        .text_color(rgb(theme::TEXT))
+                        .flex()
+                        .flex_col()
+                        .children(
+                            card.text
+                                .lines()
+                                .map(|line| div().child(line.to_string()))
+                                .collect::<Vec<_>>(),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_line(&self, line: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -549,10 +1114,12 @@ impl EntityInputHandler for EditorView {
                 let sels = vec![sel];
                 match self.buffer.insert_at(&sels, &text) {
                     Ok(outcome) => {
-                        if outcome.edit.is_some() {
-                            cx.emit(EditorEvent::Changed);
-                        }
+                        let changed = outcome.edit.is_some();
                         self.set_selections(outcome.selections, cx);
+                        if changed {
+                            cx.emit(EditorEvent::Changed);
+                            self.after_edit(true, cx);
+                        }
                     }
                     Err(e) => cx.emit(EditorEvent::Notice(format!("edit rejected: {e}"))),
                 }
@@ -610,8 +1177,14 @@ impl EntityInputHandler for EditorView {
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let line_count = self.buffer.len_lines();
+        let popup = self.render_completion_popup(cx);
+        let hover = self.render_hover_card();
         div()
-            .key_context(KEY_CONTEXT)
+            .key_context(if self.completion_open() {
+                completion_popup::KEY_CONTEXT
+            } else {
+                KEY_CONTEXT
+            })
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::move_left))
@@ -647,6 +1220,14 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::move_line_up))
             .on_action(cx.listener(Self::move_line_down))
             .on_action(cx.listener(Self::run_all))
+            .on_action(cx.listener(Self::trigger_completion))
+            .on_action(cx.listener(Self::completion_next))
+            .on_action(cx.listener(Self::completion_prev))
+            .on_action(cx.listener(Self::completion_accept))
+            .on_action(cx.listener(Self::completion_dismiss))
+            .on_action(cx.listener(Self::hover_action))
+            .on_action(cx.listener(Self::next_diagnostic))
+            .on_action(cx.listener(Self::previous_diagnostic))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .size_full()
             .bg(rgb(theme::SURFACE))
@@ -678,6 +1259,8 @@ impl Render for EditorView {
                 .track_scroll(&self.scroll_handle)
                 .h_full(),
             )
+            .children(popup)
+            .children(hover)
     }
 }
 
@@ -848,5 +1431,118 @@ impl gpui::Element for LineElement {
                 },
             );
         });
+    }
+}
+
+fn diagnostic_target(analysis: &Analysis, from: usize, forward: bool) -> Option<(usize, String)> {
+    let from = if forward {
+        from
+    } else {
+        analysis
+            .diagnostics
+            .iter()
+            .find(|d| d.range.start < from && from < d.range.end)
+            .map_or(from, |d| d.range.start)
+    };
+    let diagnostic = if forward {
+        analysis
+            .diagnostics
+            .iter()
+            .find(|d| d.range.start > from)
+            .or_else(|| analysis.diagnostics.first())?
+    } else {
+        analysis
+            .previous_diagnostic(from)
+            .or_else(|| analysis.diagnostics.last())?
+    };
+    Some((diagnostic.range.start, diagnostic.message.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempr_intel::{Diagnostic, DiagnosticKind};
+
+    fn analysis(diagnostics: Vec<Diagnostic>) -> Analysis {
+        Analysis {
+            scopes: Vec::new(),
+            diagnostics,
+        }
+    }
+
+    fn error(start: usize, message: &str) -> Diagnostic {
+        Diagnostic::new(
+            DiagnosticKind::UnknownColumn,
+            start..start + 2,
+            message.into(),
+        )
+    }
+
+    #[test]
+    fn diagnostic_navigation_walks_and_wraps() {
+        let analysis = analysis(vec![error(2, "first"), error(10, "second")]);
+        assert_eq!(
+            diagnostic_target(&analysis, 0, true),
+            Some((2, "first".into()))
+        );
+        assert_eq!(
+            diagnostic_target(&analysis, 2, true),
+            Some((10, "second".into())),
+            "the diagnostic at the cursor is skipped"
+        );
+        assert_eq!(
+            diagnostic_target(&analysis, 10, true),
+            Some((2, "first".into())),
+            "forward wraps to the first"
+        );
+        assert_eq!(
+            diagnostic_target(&analysis, 10, false),
+            Some((2, "first".into())),
+            "backward skips the one at the cursor"
+        );
+        assert_eq!(
+            diagnostic_target(&analysis, 11, false),
+            Some((2, "first".into())),
+            "backward skips the diagnostic the cursor sits inside"
+        );
+        assert_eq!(
+            diagnostic_target(&analysis, 2, false),
+            Some((10, "second".into())),
+            "backward wraps to the last"
+        );
+        assert_eq!(
+            diagnostic_target(&analysis, 0, false),
+            Some((10, "second".into()))
+        );
+    }
+
+    #[test]
+    fn no_diagnostics_is_no_target() {
+        assert_eq!(diagnostic_target(&analysis(Vec::new()), 0, true), None);
+        assert_eq!(diagnostic_target(&analysis(Vec::new()), 0, false), None);
+    }
+
+    #[test]
+    fn diagnostics_summary_pluralizes() {
+        assert_eq!(
+            DiagnosticsSummary {
+                errors: 2,
+                warnings: 1
+            }
+            .text(),
+            "2 errors · 1 warning"
+        );
+        assert_eq!(
+            DiagnosticsSummary {
+                errors: 1,
+                warnings: 3
+            }
+            .text(),
+            "1 error · 3 warnings"
+        );
+        assert_eq!(
+            DiagnosticsSummary::default().text(),
+            "0 errors · 0 warnings"
+        );
     }
 }

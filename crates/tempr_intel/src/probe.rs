@@ -283,4 +283,38 @@ fn probe_completion_latency() {
             ms(max)
         );
     }
+
+    let mut typing_sql = String::new();
+    for n in 0..500 {
+        typing_sql.push_str(&format!("select col_00 from rel_{n:06};\n"));
+    }
+    typing_sql.push_str("select * from rel_0001");
+    let mut buffer = Buffer::new(SqlFileId::new(), &typing_sql);
+    let file = buffer.file_id();
+    let mut times = Vec::with_capacity(RUNS as usize);
+    for i in 0..RUNS {
+        let offset = buffer.len();
+        let digit = if i % 2 == 0 { "2" } else { "1" };
+        buffer
+            .edit(&[(offset - 1..offset, digit)])
+            .expect("typing edit");
+        let offset = buffer.len();
+        let start = std::time::Instant::now();
+        let items = engine.complete(CompletionRequest {
+            file,
+            buffer: &mut buffer,
+            offset,
+            explicit: false,
+        });
+        times.push(start.elapsed());
+        assert!(!items.is_empty(), "typing probe: candidates");
+    }
+    let (p50, p95, p99, max) = percentiles(times);
+    println!(
+        "per-keystroke completion over 500 statements: p50 {} · p95 {} · p99 {} · max {}",
+        ms(p50),
+        ms(p95),
+        ms(p99),
+        ms(max)
+    );
 }

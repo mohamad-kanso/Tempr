@@ -52,12 +52,12 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 
 ### 4. SQL Intelligence (Phase 3)
 - ✅ Catalog cache loads schema metadata (tables, columns, indexes, functions, views) from PostgreSQL, caches it locally as `.tcat`, and refreshes incrementally with full refresh on demand *(`SchemaService::with_cache`/`refresh`/`refresh_incremental`/`load_cached`; ids stable across refreshes, incremental diff via fingerprint sweep, offline load verified with no database connection; 2026-09-08, → D25, D26, D27)*
-- ✅ Completion provider offers context-aware suggestions ranked by relevance *(`tempr_intel::completion`: text-lexer context classification, catalog/binding/CTE/keyword candidates, one deterministic score; the editor popup is stage 6 — 2026-10-21)*
-- ✅ Completion latency from keystroke to popup < 5 ms for cached catalogs with up to 10,000 schema objects *(release probe: warm p99 1.384 ms worst case (schema dot), 0.003–0.082 ms typical, cold max 1.657 ms; 2026-10-21)*
+- ✅ Completion provider offers context-aware suggestions ranked by relevance *(`tempr_intel::completion`: text-lexer context classification, catalog/binding/CTE/keyword candidates, one deterministic score; the editor renders a caret-anchored popup with keyboard navigation and accept — 2026-10-21)*
+- ✅ Completion latency from keystroke to popup < 5 ms for cached catalogs with up to 10,000 schema objects *(release probe: warm p99 1.714 ms worst case (schema dot), 0.004–0.148 ms typical, cold max 1.888 ms; 2026-10-21)*
 - ✅ Semantic analyzer resolves column references; detects ambiguous and unresolvable names *(`tempr_intel::SemanticEngine`; two-phase scope walk, CTE/FROM-subquery/DML bindings, no-catalog silence; 2026-10-21)*
-- 🔜 Diagnostics produced for syntax and semantic errors in real time
-- 🔜 Hover information displays column types and table definitions
-- 🔜 All intelligence features work offline from local cache after initial load; no I/O on the request path
+- ✅ Diagnostics produced for syntax and semantic errors in real time *(`EditorView` debounces 100 ms, analyzes a snapshot on tokio, paints solid error / wavy warning underlines, f8/shift-f8 navigate, status shows counts — 2026-10-21)*
+- ✅ Hover information displays column types and table definitions *(`ctrl-k ctrl-i`; `tempr_intel::hover` cards for columns, relations, functions, schemas, aliases/CTEs with a diagnostic-message fallback — 2026-10-21)*
+- ✅ All intelligence features work offline from local cache after initial load; no I/O on the request path *(`IntelligenceService` loads `.tcat` on connect before the network refresh; completion/hover are synchronous engine calls with no DB access — 2026-10-21)*
 - AC: Completion popup appears in < 5 ms on a cold (no revalidation) catalog with 10,000 objects. Typing an unknown column reference produces a diagnostic underline.
 
 ### 5. Extensibility & Polish (Phase 4)

@@ -17,11 +17,16 @@ use gpui::{
 use tempr_domain::{
     Batch, ColumnSpec, Connection, ConnectionId, ConnectionState, QueryOutcome, QueryRunId,
 };
-use tempr_events::EventBus;
-use tempr_services::{CommandService, ConnectionService, QueryService, RowSink, ServiceError};
+use tempr_events::{AppEvent, EventBus};
+use tempr_services::{
+    CommandService, ConnectionService, IntelligenceService, QueryService, RefreshPath, RowSink,
+    SchemaService, ServiceError,
+};
 
 use crate::commands;
-use crate::components::{EditorEvent, EditorView, Palette, PaletteEvent, ResultGrid};
+use crate::components::{
+    DiagnosticsSummary, EditorEvent, EditorView, Palette, PaletteEvent, ResultGrid,
+};
 use crate::events::{self, UiEvent};
 use crate::gpui_compat;
 use crate::scroll_bench::ScrollBench;
@@ -37,6 +42,8 @@ actions!(
         Quit
     ]
 );
+
+actions!(schema, [Refresh, RefreshIncremental, RefreshAllSchemas]);
 
 pub const KEY_CONTEXT: &str = "MainWindow";
 /// Binding context for main-window commands: active only while no overlay
@@ -84,6 +91,8 @@ pub struct Services {
     pub connection: Arc<ConnectionService>,
     pub query: Arc<QueryService>,
     pub command: Arc<CommandService>,
+    pub schema: Arc<SchemaService>,
+    pub intelligence: Arc<IntelligenceService>,
 }
 
 /// Outcome of the tokio-side query task, as seen by the view.
@@ -99,6 +108,7 @@ pub struct MainWindow {
     palette: Entity<Palette>,
     status: String,
     status_is_error: bool,
+    diagnostics: Option<DiagnosticsSummary>,
     /// The run in flight, allocated by the view before the task starts so
     /// `CancelQuery` can target it immediately. Cleared only by the task's
     /// outcome — the single owner of "is a query running".
@@ -119,7 +129,7 @@ impl MainWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let editor = cx.new(|cx| EditorView::new("", cx));
+        let editor = cx.new(|cx| EditorView::new("", services.intelligence.clone(), cx));
         let grid = cx.new(|_| ResultGrid::new());
         let command_service = services.command.clone();
         let palette = cx.new(|cx| Palette::new(command_service, window, cx));
@@ -141,7 +151,12 @@ impl MainWindow {
             |this, _editor, event, window, cx| match event {
                 EditorEvent::Run(sql) => this.run_sql(sql.clone(), window, cx),
                 EditorEvent::Notice(text) => this.set_status(text.clone(), true, cx),
-                EditorEvent::Changed => {}
+                EditorEvent::Changed => {
+                    let file = this.editor.read(cx).file_id();
+                    this.diagnostics = None;
+                    cx.notify();
+                    this.services.bus.publish(AppEvent::BufferChanged { file });
+                }
             },
         );
 
@@ -182,6 +197,7 @@ impl MainWindow {
             palette,
             status,
             status_is_error: false,
+            diagnostics: None,
             current_run: None,
             dev,
             bench: None,
@@ -272,6 +288,84 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) {
         self.start_bench(window, cx);
+    }
+
+    fn refresh_schema_action(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_schema(false, false, cx);
+    }
+
+    fn refresh_incremental_action(
+        &mut self,
+        _: &RefreshIncremental,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_schema(false, true, cx);
+    }
+
+    fn refresh_all_action(
+        &mut self,
+        _: &RefreshAllSchemas,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_schema(true, false, cx);
+    }
+
+    fn refresh_schema(&mut self, all: bool, incremental: bool, cx: &mut Context<Self>) {
+        let Some(connection) = self.connection_id() else {
+            self.set_status("No connection configured (DATABASE_URL).", true, cx);
+            return;
+        };
+        self.set_status(
+            if incremental {
+                "Checking schema…"
+            } else {
+                "Refreshing schema…"
+            },
+            false,
+            cx,
+        );
+        let schema = self.services.schema.clone();
+        let task = gpui_compat::spawn_tokio(cx, async move {
+            if incremental {
+                schema
+                    .refresh_incremental(connection)
+                    .await
+                    .map(|(snapshot, path)| (snapshot, Some(path)))
+            } else if all {
+                schema
+                    .refresh_all_schemas(connection)
+                    .await
+                    .map(|snapshot| (snapshot, None))
+            } else {
+                schema
+                    .refresh(connection)
+                    .await
+                    .map(|snapshot| (snapshot, None))
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            this.update(cx, |this, cx| match outcome {
+                Ok(Ok((snapshot, path))) => {
+                    let text = match path {
+                        Some(RefreshPath::Unchanged) => "Schema unchanged".to_string(),
+                        Some(RefreshPath::Incremental { schemas, touched }) => {
+                            format!("Schema refreshed — {touched} changes across {schemas} schemas")
+                        }
+                        Some(RefreshPath::FullRefresh(_)) | None => {
+                            format!("Schema refreshed — {} objects", snapshot.objects.len())
+                        }
+                    };
+                    this.set_status(text, false, cx);
+                }
+                Ok(Err(e)) => this.set_status(format!("Schema refresh failed: {e}"), true, cx),
+                Err(join) => this.set_status(format!("Schema task failed: {join}"), true, cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_palette_action(
@@ -446,6 +540,26 @@ impl MainWindow {
                 let rows = self.grid.read(cx).row_count();
                 self.set_status(format!("Running… {rows} {}", row_word(rows)), false, cx);
             }
+            UiEvent::DiagnosticsReady { file } if file == self.editor.read(cx).file_id() => {
+                let current = self
+                    .editor
+                    .update(cx, |editor, cx| editor.on_diagnostics(cx));
+                if current {
+                    self.diagnostics = Some(self.editor.read(cx).diagnostics_summary());
+                    cx.notify();
+                }
+            }
+            UiEvent::SchemaRefreshed { connection } if Some(connection) == self.connection_id() => {
+                self.diagnostics = None;
+                self.editor
+                    .update(cx, |editor, cx| editor.on_schema_refreshed(cx));
+            }
+            UiEvent::SchemaRefreshFailed {
+                connection,
+                message,
+            } if Some(connection) == self.connection_id() => {
+                self.set_status(format!("Schema refresh failed: {message}"), true, cx);
+            }
             // QueryStarted/QueryFinished: the outcome task owns final status.
             _ => {}
         }
@@ -549,6 +663,9 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::cancel_query_action))
             .on_action(cx.listener(Self::bench_action))
             .on_action(cx.listener(Self::toggle_palette_action))
+            .on_action(cx.listener(Self::refresh_schema_action))
+            .on_action(cx.listener(Self::refresh_incremental_action))
+            .on_action(cx.listener(Self::refresh_all_action))
             .relative()
             .flex()
             .flex_col()
@@ -608,7 +725,20 @@ impl Render for MainWindow {
                                 theme::TEXT_DIM
                             }))
                             .child(self.status.clone()),
-                    ),
+                    )
+                    .children(self.diagnostics.map(|summary| {
+                        let color = if summary.errors > 0 {
+                            theme::ERROR
+                        } else if summary.warnings > 0 {
+                            theme::WARNING
+                        } else {
+                            theme::TEXT_DIM
+                        };
+                        div()
+                            .ml_auto()
+                            .text_color(rgb(color))
+                            .child(format!("Diagnostics: {}", summary.text()))
+                    })),
             )
     }
 }

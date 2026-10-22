@@ -76,7 +76,7 @@ This is deliberate. Developers building plugins or contributing to Tempr already
 
 ### SemanticEngine
 
-The central type. Owned by `IntelligenceService` (stage 6), constructed once per workspace, and fed catalog updates via `set_catalog`. **Stages 4–5 shipped the `analyze` and `complete` halves of this API** (hover and definition land with stage 6); the sketch below reflects what exists today:
+The central type. Owned by `IntelligenceService` (stage 6), constructed once per workspace, and fed catalog updates via `set_catalog`. **Stages 4–6 shipped `analyze`, `complete` and `hover`**; `definition` is deferred (no file targets yet, docs/TODO.md). The sketch below reflects what exists today:
 
 ```rust
 pub struct SemanticEngine {
@@ -92,9 +92,30 @@ impl SemanticEngine {
     /// deviation from the spec's `&BufferSnapshot` sketch).
     pub fn analyze(&self, file: SqlFileId, buffer: &mut Buffer) -> Arc<Analysis>;
 
+    /// Analysis keyed by the editor's source revision rather than the
+    /// buffer's own counter. `IntelligenceService` analyzes a mirror buffer
+    /// whose revision is unrelated to the view's, so diagnostics use this
+    /// entry point and hover/completion hit the same cached analysis.
+    pub fn analyze_at(
+        &self,
+        file: SqlFileId,
+        source_revision: u64,
+        buffer: &mut Buffer,
+    ) -> Arc<Analysis>;
+
     /// Ranked completion candidates at the cursor (stage 5). Reads the same
     /// cached analysis and the immutable catalog; no I/O.
     pub fn complete(&self, req: CompletionRequest<'_>) -> Vec<CompletionItem>;
+
+    /// Hover for the reference under `offset` (stage 6): relation, column,
+    /// function or CTE card text plus the symbol's byte range. Reads the
+    /// cached analysis and catalog; no I/O.
+    pub fn hover(
+        &self,
+        file: SqlFileId,
+        buffer: &mut Buffer,
+        offset: usize,
+    ) -> Option<HoverInfo>;
 
     /// A refresh built a new catalog cache; the analysis cache resets.
     pub fn set_catalog(&self, catalog: Arc<CatalogCache>);
@@ -102,18 +123,22 @@ impl SemanticEngine {
 }
 ```
 
-Two corrections to the spec's original sketch, recorded here and in the PROGRESS decisions log:
+Three corrections to the spec's original sketch, recorded here and in the PROGRESS decisions log:
 
 - **Cache key.** The spec claimed analysis caching validates by `EditId`. Undo recreates an earlier text state while reusing ids, so `EditId` cannot be the key. Tempr added `Buffer::revision` (re-assigned by every edit, undo and redo, untouched by failed edits); revision — not `EditId` — validates the cache. Revisions come from a process-wide counter, so a freshly opened `Buffer` for the same file never shares a revision with a previous instance and cannot hit its stale entry.
+- **Catalog identity.** A cache entry also records the exact `Arc<CatalogCache>` it was built against, and a hit requires `Arc::ptr_eq` with the installed catalog. `set_catalog` clears the map, but an analysis already running on another thread could otherwise re-insert an entry whose arena indices point into the retired catalog; the pointer check makes that entry a guaranteed miss.
 - **Borrow shape.** `analyze` takes `&mut Buffer`, not `&BufferSnapshot`. The workspace still has no `BufferSnapshot` type; the engine consumes the editor's `Buffer` directly, per the layout doc's grouping of editor and intelligence layers.
+- **Hot path scope.** `complete` and `hover` prefer a cached full analysis for the revision (diagnostics usually produced it). On a miss they walk only the top-level statement(s) containing the cursor — plus the statement an incomplete trailing fragment trails — which is all `scope_chain` and `frame_chain` need. A 500-statement typing probe keeps p50 at 0.4 ms (p99 3.1 ms), instead of scaling with file length on every keystroke.
 
 The walk is two-phase per region so clause order cannot mislead visibility: phase A collects all of the region's bindings (CTEs in declaration order, FROM/JOIN sources, `UPDATE`/`INSERT` targets, the `DELETE` target that the grammar keeps in the statement-level `from` sibling, `LATERAL (subquery)` and `LATERAL function(…)` aliases — `lateral_join` and `lateral_cross_join` are distinct nodes) *without analyzing any subquery body*; phase B analyzes every subquery and CTE body after the region's frame is complete, so a `select`-list subquery still sees a `FROM` alias appearing later in the source. A **region is its container node** (`statement`, `subquery`, `set_operation`), not the `select` node — the grammar keeps `select`, `from`, `where`, … as siblings, so selecting only the `select` would drop every binding and predicate. `set_operation` statements scope per `select` side and its clause siblings (merging sides' bindings would invent ambiguity the server does not see). CTE bodies see only earlier CTEs; a `WITH RECURSIVE` self-reference resolves with no column knowledge and stays silent. Column qualifiers follow PostgreSQL: an alias hides the source's own name, and a schema never answers a two-part qualifier (three-part names resolve through the catalog). FROM-subquery/lateral-subquery columns derive from the body's top select list, so derived-table references are checked like any other binding.
 
-The completion, hover and definition signatures (`complete`, `hover`, `definition`) were sketched on a `&BufferSnapshot` that never materialised. Stage 5 shipped `complete` on the real `Buffer` (again `&mut`, for the analysis cache's lazy reparse) and stage 6 will do the same for `hover`/`definition`; there is no separate snapshot type.
+The completion, hover and definition signatures (`complete`, `hover`, `definition`) were sketched on a `&BufferSnapshot` that never materialised. Stage 5 shipped `complete` on the real `Buffer` (again `&mut`, for the analysis cache's lazy reparse) and stage 6 did the same for `hover`; `definition` remains deferred because there are no file targets yet. There is no separate snapshot type.
+
+Hover resolves the reference under the cursor against that same analysis. A bare column follows the analyzer's nearest-level rule: the innermost scope with any match decides, so an inner `id` is not reported as ambiguous with an outer `id`. A dotted path longer than a relation (`db.schema.rel.col`) qualifies the relation by its **last two** path segments, ignoring any database prefix. Byte offsets that land inside a multi-byte character produce no reference rather than slicing invalid UTF-8.
 
 ### CompletionRequest
 
-The input to the completion pipeline. Constructed by `IntelligenceService` on every completion trigger (keystroke debounce or explicit request). **Shipped shape (stage 5):**
+The input to the completion pipeline. Constructed by `IntelligenceService` on every completion trigger (an identifier character or qualifier dot, or an explicit `ctrl-space` request). **Shipped shape (stage 5):**
 
 ```rust
 pub struct CompletionRequest<'a> {
@@ -130,7 +155,7 @@ pub struct CompletionRequest<'a> {
 }
 ```
 
-Multi-connection workspaces are stage 6's concern — the engine holds a single catalog today, and `IntelligenceService` will own one engine per live connection.
+Multi-connection workspaces are not solved yet: the engine holds a single catalog, and `IntelligenceService` swaps it on any connection's `SchemaRefreshed`. One engine per live connection (and gating analyses by connection) is parked in docs/TODO.md.
 
 ### CompletionItem
 
@@ -143,8 +168,8 @@ pub struct CompletionItem {
     pub kind: CompletionKind,
     /// Type, signature, schema or ownership hint (empty when there is none).
     pub detail: String,
-    /// Text the editor writes. Equal to `label` today; separate so stage-6
-    /// snippets can differ without reshaping the item.
+    /// Text the editor writes. Usually `label`, but a name PostgreSQL would
+    /// fold differently (e.g. `createdAt`) arrives quoted (`"createdAt"`).
     pub insert: String,
     /// Byte range the item replaces (the word under the cursor).
     pub replace: Range<usize>,
@@ -161,56 +186,57 @@ Views use `CompletionKind::Table` with `detail: "view · public"` (the canonical
 
 ### Analysis
 
-The result of a full semantic analysis pass over a buffer.
+The result of a full semantic analysis pass over a buffer. **Shipped shape (stages 4–6):**
 
 ```rust
 pub struct Analysis {
-    /// All resolved scopes in the buffer, keyed by byte range.
-    /// Each scope knows its parent scope, its visible tables/aliases,
-    /// and its CTE definitions.
+    /// Top-level statement scopes, in byte order. Children carry subquery and
+    /// CTE frames plus the bindings each region exposes.
     pub scopes: Vec<Scope>,
 
-    /// Diagnostics produced by the analysis.
+    /// Sorted by (byte order, errors before warnings) by the engine.
     pub diagnostics: Vec<Diagnostic>,
+}
 
-    /// Star-expansion knowledge: for each `SELECT *` or `t.*`,
-    /// the resolved list of columns that star would expand to.
-    pub star_expansions: HashMap<ByteRange, Vec<ColumnId>>,
+impl Analysis {
+    /// Diagnostics overlapping `query`, already severity-ordered.
+    pub fn diagnostics_in(&self, query: Range<usize>) -> Vec<&Diagnostic>;
+
+    /// Next diagnostic at or after `from` (f8).
+    pub fn next_diagnostic(&self, from: usize) -> Option<&Diagnostic>;
+
+    /// Last diagnostic strictly before `from` (shift-f8).
+    pub fn previous_diagnostic(&self, from: usize) -> Option<&Diagnostic>;
+
+    /// Scopes containing `offset`, outermost first.
+    pub fn scope_chain(&self, offset: usize) -> Vec<&Scope>;
 }
 
 pub struct Diagnostic {
-    pub range: ByteRange,
-    pub severity: DiagnosticSeverity,
+    pub range: Range<usize>,
+    pub kind: DiagnosticKind,       // SyntaxError | UnknownRelation | UnknownColumn | AmbiguousColumn
+    pub severity: Severity,         // Warning | Error
     pub message: String,
-    pub code: DiagnosticCode,
-}
-
-pub enum DiagnosticSeverity {
-    Error,
-    Warning,
-    Information,
-}
-
-pub enum DiagnosticCode {
-    UnknownColumn,
-    AmbiguousReference,
-    TypeMismatch,
-    UnknownTable,
-    UnusedAlias,
 }
 ```
+
+Star-expansion knowledge is **not** in `Analysis` yet: hover shows a relation's column list from the catalog, and expanding `*` into an explicit list is future work (docs/TODO.md). Type mismatch is likewise unimplemented.
 
 ### HoverInfo
 
+**Shipped shape (stage 6):**
+
 ```rust
 pub struct HoverInfo {
-    /// Markdown-formatted hover content.
+    /// Plain-text card contents (`\n`-separated lines).
     pub contents: String,
 
-    /// The byte range of the symbol under the cursor.
-    pub range: ByteRange,
+    /// Byte range of the symbol under the cursor.
+    pub range: Range<usize>,
 }
 ```
+
+A relation name (including a bare relation in `FROM`) resolves to its richer relation card (schema, estimated rows, column list); aliases and CTEs resolve to their binding card. Markdown is not parsed — the card renders one `div` per line.
 
 ---
 
@@ -263,11 +289,11 @@ sequenceDiagram
 
     User->>Editor: Keystroke (character typed)
 
-    Note over Editor: Debounce window (50ms)
+    Note over Editor: No debounce — completion runs on the keystroke
 
-    Editor->>IS: CompletionRequest { file, buffer, offset, explicit }
+    Editor->>IS: complete(buffer, offset, explicit)
 
-    IS->>SE: complete(req)
+    IS->>SE: complete(CompletionRequest { file, buffer, offset, explicit })
 
     Note over SE: 1. Classify cursor context<br/>(text lexer: statement start / relation / expression / alias / qualifier)
 
@@ -316,6 +342,8 @@ The semantic analyzer walks the tree-sitter AST to build a scope chain. Each sco
 
 ### Name Resolution
 
+The walk first applies PostgreSQL's identifier rule: an unquoted name folds to ASCII lower case, while a quoted name keeps its case and drops the delimiters (`"createdAt"` denotes `createdAt`, and `""` inside is one literal quote). The comparisons below still fold case, so quoted case sensitivity is not enforced yet (parked in docs/TODO.md).
+
 The engine resolves names in three steps:
 
 1. **Unqualified name** (e.g., `column_name`): Walk up the scope chain looking for a table or alias that contains a column with this name. If exactly one match is found, the reference is resolved. If zero matches are found, emit `DiagnosticCode::UnknownColumn`. If multiple matches are found, emit `DiagnosticCode::AmbiguousReference`.
@@ -343,7 +371,7 @@ Subqueries in WHERE, HAVING, and FROM clauses each create a distinct scope:
 
 ### Star-Expansion Knowledge
 
-The engine maintains a mapping of star expressions to their expanded column lists. This enables:
+The engine does not yet maintain a star-expansion map (deferred; docs/TODO.md). Once it does, it enables:
 
 - **Hover on `*`**: Show a tooltip listing all columns that `*` would produce, with types.
 - **Hover on `t.*`**: Show the columns of table `t` specifically.
@@ -431,7 +459,7 @@ The catalog cache is an immutable, resolution-shaped arena built from one `Schem
 
 ## Completion Pipeline
 
-The completion pipeline is the most latency-sensitive path in the entire system. It runs on every keystroke (after debounce) and must return results before the user perceives a delay.
+The completion pipeline is the most latency-sensitive path in the entire system. It runs on every completing keystroke (no debounce) and must return results before the user perceives a delay.
 
 ### Stage 1: Context Classification
 
@@ -446,6 +474,8 @@ The completion pipeline is the most latency-sensitive path in the entire system.
 | **Qualifier** | After a dot: `u.`, `public.`, `public.users.` (whitespace tolerated). | Columns of that binding/CTE; relations of that schema; columns of a schema-qualified relation. |
 
 Auto-open follows spec decision 5: one identifier character or a qualifier dot opens the popup; `ctrl-space` (`explicit`) forces it anywhere.
+
+Identifier candidates are inserted the way PostgreSQL will read them back: a name outside the unquoted `[a-z_][a-z0-9_$]*` shape (or a reserved word) gets double quotes, so accepting `createdAt` writes `"createdAt"` rather than the folded `createdat` that names a different column. The analyzer applies the mirror rule before resolving a reference (unquoted folds to lower case, quoted keeps its case and drops the quotes); quoted-context case sensitivity is parked in docs/TODO.md.
 
 ### Stage 2: Candidate Generation
 
@@ -500,21 +530,30 @@ If profiling reveals that any stage consistently exceeds its budget, the engine 
 
 ## Data Flow
 
-### Incremental Analysis on Buffer Edit
+### Analysis on Buffer Edit
 
-When the user types a character, the following sequence occurs:
+The buffer belongs to `EditorView`, so analysis is view-driven rather than event-driven in stage 6:
 
-1. **Buffer::edit** applies the change to the rope and triggers tree-sitter incremental reparse. The reparse produces a new `SyntaxTree` that differs from the previous tree only in the nodes affected by the edit.
+1. **The edit applies** to the rope and triggers tree-sitter's incremental reparse inside `Buffer`.
 
-2. **BufferChanged** is published to the `EventBus`.
+2. **`EditorEvent::Changed`** is emitted; `MainWindow` publishes `AppEvent::BufferChanged { file }` for any other observer.
 
-3. **IntelligenceService** receives the event and calls `SemanticEngine::analyze` with the real `Buffer` (stage 4 shipped `&mut Buffer`, not a snapshot).
+3. **`EditorView` debounces** for 100 ms (`cx.spawn` + the background executor's timer). If the buffer's revision changed while waiting, the pass is dropped — the newest revision wins.
 
-4. **SemanticEngine** compares `Buffer::revision` against the analysis cached for that `SqlFileId`; any change invalidates it and the engine re-analyzes the whole buffer. (The spec's per-scope incremental re-analysis is not shipped: the revision compare plus cached `Arc<Analysis>` is what keeps the request path cheap, and whole-buffer analysis is ~1 ms at 10 MB.)
+4. **The view sends an immutable text snapshot** to `IntelligenceService::analyze(file, source_revision, &text)` on tokio. The service keeps one mirror `Buffer` per file, applied as a single minimal replacement so tree-sitter stays incremental, and calls `SemanticEngine::analyze` on it. The mirror exists precisely because the real buffer cannot leave the UI thread and `analyze` needs `&mut Buffer`.
 
-5. **Diagnostics** for the whole buffer are recomputed as part of that pass; none are carried over from the previous `Analysis`.
+5. **The service caches** `(source_revision, Arc<Analysis>)` and publishes `DiagnosticsReady { file }`.
 
-6. **The updated `Analysis`** is stored in the cache and made available to `complete`, `hover`, and `definition` calls.
+6. **The view pulls the result** on the main thread via `IntelligenceService::analysis(file, buffer.revision())`. A revision mismatch is a miss: stale analysis is never rendered. The status bar then shows `N errors · M warnings`.
+
+Completion and hover remain synchronous UI-thread calls: `IntelligenceService::complete` / `hover` take the live `&mut Buffer` and return immediately (no I/O, no locks beyond the catalog `Arc`), per spec decision 7.
+
+### UI surfaces (stage 6)
+
+- **Completion popup.** Caret-anchored (`anchored()` at the caret's window point), at most 12 visible rows in a `uniform_list`, each with label, kind and detail. It opens automatically after an identifier character or a qualifier dot and on `ctrl-space`; typing re-filters and keeps the selected label when it survives. `enter`/`tab` replace the item's `replace` range with `insert` and put the caret after it; `escape` dismisses; `down`/`up` and `ctrl-n`/`ctrl-p` move with wrap and scroll the selection into view. While open, the editor's key context is `Editor Completion`, and the four `completion::*` commands are hidden from palette search so a closed popup can never consume `enter`/`tab`/`escape`.
+- **Diagnostic underlines.** `runs_for_line` tracks `(color, underline)` per byte for the visible diagnostics only: errors are solid `theme::ERROR`, warnings wavy `theme::WARNING`, and an error wins where the two overlap.
+- **Hover card.** `ctrl-k ctrl-i` resolves the reference at the primary cursor; with no symbol it shows the diagnostic under the cursor instead, and with neither it emits a status notice. Any edit or motion closes the card.
+- **Diagnostic navigation.** `f8` / `shift-f8` walk `next_diagnostic` / `previous_diagnostic`, skipping the diagnostic under the cursor, wrapping at the ends, moving the caret to `range.start` and showing the message card after the frame that scrolls it into view.
 
 ### Schema Refresh Integration
 
@@ -525,6 +564,8 @@ When a `SchemaRefreshed` event arrives:
 2. **SemanticEngine** receives notification that the catalog changed (`set_catalog`). It swaps the `Arc<CatalogCache>` and clears every cached `Analysis` — all resolution results are catalog-dependent.
 
 3. **Next completion request** uses the new catalog. The transition is seamless — the user sees no flicker or interruption.
+
+On `ConnectionStateChanged { Connected }` the service loads the persisted `.tcat` cache first (offline catalog before the network), then runs `refresh_incremental`. A failed refresh publishes `SchemaRefreshFailed` and leaves the previous catalog installed. The UI's `schema::Refresh`, `schema::RefreshIncremental` and `schema::RefreshAllSchemas` commands run the same service paths on tokio and report object counts or the refresh path in the status bar.
 
 ---
 

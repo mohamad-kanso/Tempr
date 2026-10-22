@@ -266,8 +266,7 @@ impl SemanticEngine {
             explicit,
         } = req;
         let offset = offset.min(buffer.len());
-        let analysis = self.analyze(file, buffer);
-        let catalog = self.catalog();
+        let (analysis, catalog) = self.analyzed_at(file, buffer.revision(), offset, buffer);
         complete_with(&catalog, &analysis, buffer, offset, explicit)
     }
 }
@@ -398,11 +397,11 @@ fn open_quote_before(text: &str, word_start: usize) -> Option<usize> {
     (quotes % 2 == 1).then_some(word_start - 1)
 }
 
-fn is_ident_start(c: char) -> bool {
+pub(crate) fn is_ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
-fn is_ident_char(c: char) -> bool {
+pub(crate) fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
@@ -422,7 +421,7 @@ fn word_start(text: &str) -> usize {
 /// The qualifier path before a dot, left to right, plus the byte offset
 /// where it begins. Whitespace around dots is tolerated (`u . id` is valid
 /// PostgreSQL); quoted parts are unquoted for matching.
-fn qualifier_before(text: &str, word_start: usize) -> Option<(Vec<String>, usize)> {
+pub(crate) fn qualifier_before(text: &str, word_start: usize) -> Option<(Vec<String>, usize)> {
     let mut cursor = word_start;
     let mut parts = Vec::new();
     loop {
@@ -448,7 +447,7 @@ fn qualifier_before(text: &str, word_start: usize) -> Option<(Vec<String>, usize
 }
 
 /// Read the identifier ending `text` (already trimmed at the right).
-fn identifier_back(text: &str) -> Option<(String, usize)> {
+pub(crate) fn identifier_back(text: &str) -> Option<(String, usize)> {
     let text = text.trim_end();
     if let Some(body) = text.strip_suffix('"') {
         // Quoted identifier: find the opening quote, honouring "" escapes.
@@ -842,7 +841,7 @@ impl Generator<'_> {
             };
             out.push(Candidate {
                 label: name.to_string(),
-                insert: name.to_string(),
+                insert: quote_ident(name),
                 kind: CompletionKind::Cte,
                 detail: format!("cte · {} columns", cte.columns.len()),
                 weight: WEIGHT_CTE,
@@ -863,7 +862,7 @@ impl Generator<'_> {
             };
             out.push(Candidate {
                 label: entry.name().to_string(),
-                insert: entry.name().to_string(),
+                insert: quote_ident(entry.name()),
                 kind: CompletionKind::Table,
                 detail: format!("{kind_word} · {schema}"),
                 weight,
@@ -890,7 +889,7 @@ impl Generator<'_> {
                 .join(", ");
             out.push(Candidate {
                 label: name.to_string(),
-                insert: name.to_string(),
+                insert: quote_ident(name),
                 kind: CompletionKind::Function,
                 detail: format!("({args}) → {return_type}"),
                 weight: WEIGHT_FUNCTION,
@@ -902,7 +901,7 @@ impl Generator<'_> {
         for schema in self.catalog.schemas() {
             out.push(Candidate {
                 label: schema.to_string(),
-                insert: schema.to_string(),
+                insert: quote_ident(schema),
                 kind: CompletionKind::Schema,
                 detail: "schema".to_string(),
                 weight: WEIGHT_SCHEMA,
@@ -935,7 +934,7 @@ impl Generator<'_> {
             };
             out.push(Candidate {
                 label: alias.to_string(),
-                insert: alias.to_string(),
+                insert: quote_ident(alias),
                 kind: CompletionKind::Alias,
                 detail: "alias".to_string(),
                 weight: WEIGHT_ALIAS,
@@ -973,7 +972,7 @@ impl Generator<'_> {
                 if counts.get(&name.to_lowercase()).copied().unwrap_or(0) <= 1 {
                     out.push(Candidate {
                         label: name.clone(),
-                        insert: name,
+                        insert: quote_ident(&name),
                         kind: CompletionKind::Column,
                         detail,
                         weight: WEIGHT_COLUMN,
@@ -981,7 +980,7 @@ impl Generator<'_> {
                 } else if let Some(owner) = owner {
                     out.push(Candidate {
                         label: format!("{owner}.{name}"),
-                        insert: format!("{owner}.{name}"),
+                        insert: format!("{}.{}", quote_ident(owner), quote_ident(&name)),
                         kind: CompletionKind::Column,
                         detail,
                         weight: WEIGHT_COLUMN_QUALIFIED,
@@ -1038,7 +1037,7 @@ impl Generator<'_> {
                 };
                 out.push(Candidate {
                     label: entry.name().to_string(),
-                    insert: entry.name().to_string(),
+                    insert: quote_ident(entry.name()),
                     kind: CompletionKind::Table,
                     detail: format!("{kind_word} · {last}"),
                     weight: WEIGHT_RELATION,
@@ -1055,7 +1054,7 @@ impl Generator<'_> {
             let owner = binding_qualifier(binding);
             out.push(Candidate {
                 label: name.clone(),
-                insert: name,
+                insert: quote_ident(&name),
                 kind: CompletionKind::Column,
                 detail: column_detail(ty.as_deref(), owner),
                 weight: WEIGHT_COLUMN,
@@ -1083,7 +1082,7 @@ impl Generator<'_> {
             };
             out.push(Candidate {
                 label: name.to_string(),
-                insert: name.to_string(),
+                insert: quote_ident(name),
                 kind: CompletionKind::Column,
                 detail: column_detail(Some(&ty), owner),
                 weight: WEIGHT_COLUMN,
@@ -1125,6 +1124,20 @@ fn push_keyword(out: &mut Vec<Candidate>, keyword: &str, weight: i32) {
         detail: String::new(),
         weight,
     });
+}
+
+/// PostgreSQL folds an unquoted identifier to lower case, so a catalog name
+/// with uppercase letters (or anything outside `[a-z_][a-z0-9_$]*`) must be
+/// inserted quoted or it names a different column.
+fn quote_ident(name: &str) -> String {
+    let mut chars = name.chars();
+    let plain_start = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_');
+    let plain_rest =
+        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+    if plain_start && plain_rest && !FALLBACK_KEYWORDS.contains(&name) {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn binding_qualifier(binding: &Binding) -> Option<&str> {
@@ -1250,6 +1263,7 @@ fn rank(candidates: Vec<Candidate>, prefix: &str, replace: Range<usize>) -> Vec<
 mod tests {
     use self::tempr_intel_catalog_test_support::{catalog, empty_catalog};
     use super::*;
+    use std::sync::Arc;
     use tempr_domain::ids::{ConnectionId, SchemaObjectId, SchemaSnapshotId};
     use tempr_domain::schema::{SchemaObject, SchemaSnapshot};
 
@@ -1450,6 +1464,70 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, vec!["email", "id", "name"]);
         assert!(items.iter().all(|i| i.kind == CompletionKind::Column));
+    }
+
+    #[test]
+    fn a_name_that_needs_quotes_is_inserted_quoted() {
+        let table_id = SchemaObjectId::new();
+        let snapshot = SchemaSnapshot {
+            id: SchemaSnapshotId::new(),
+            connection_id: ConnectionId::new(),
+            version: 1,
+            fetched_at: chrono::Utc::now(),
+            objects: vec![
+                SchemaObject::Table {
+                    id: table_id,
+                    schema: "public".into(),
+                    name: "booking_record".into(),
+                    estimated_rows: None,
+                },
+                SchemaObject::Column {
+                    id: SchemaObjectId::new(),
+                    parent_id: table_id,
+                    name: "id".into(),
+                    data_type: "uuid".into(),
+                    nullable: false,
+                    ordinal: 0,
+                    default: None,
+                },
+                SchemaObject::Column {
+                    id: SchemaObjectId::new(),
+                    parent_id: table_id,
+                    name: "createdAt".into(),
+                    data_type: "timestamptz".into(),
+                    nullable: false,
+                    ordinal: 1,
+                    default: None,
+                },
+            ],
+            keywords: vec![],
+            fingerprints: vec![],
+        };
+        let engine = SemanticEngine::new(Arc::new(CatalogCache::from_snapshot(&snapshot)));
+        let sql = "select * from booking_record br order by br.";
+        let items = complete(&engine, sql, sql.len());
+        let inserted: Vec<(&str, &str)> = items
+            .iter()
+            .map(|item| (item.label.as_str(), item.insert.as_str()))
+            .collect();
+        assert!(
+            inserted.contains(&("createdAt", "\"createdAt\"")),
+            "{inserted:?}"
+        );
+        assert!(inserted.contains(&("id", "id")), "{inserted:?}");
+
+        for sql in [
+            "select * from booking_record br order by br.createdAt",
+            "select * from booking_record br order by br.\"createdAt\"",
+        ] {
+            let mut buffer = Buffer::new(SqlFileId::new(), sql);
+            let analysis = engine.analyze(buffer.file_id(), &mut buffer);
+            assert!(
+                analysis.diagnostics.is_empty(),
+                "{sql}: {:?}",
+                analysis.diagnostics
+            );
+        }
     }
 
     #[test]
