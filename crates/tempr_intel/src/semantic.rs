@@ -41,6 +41,9 @@ pub struct SemanticEngine {
 
 struct CachedAnalysis {
     revision: u64,
+    /// The catalog the analysis was built against; arena indices are only
+    /// valid while this exact `Arc` is installed.
+    catalog: Arc<CatalogCache>,
     analysis: Arc<Analysis>,
 }
 
@@ -105,13 +108,40 @@ impl SemanticEngine {
     /// unchanged. The key is `Buffer::revision`, which moves on every text
     /// mutation — edits, undo and redo (unlike `EditId`, which undo reuses).
     pub fn analyze(&self, file: SqlFileId, buffer: &mut Buffer) -> Arc<Analysis> {
-        let revision = buffer.revision();
+        self.analyzed(file, buffer.revision(), buffer).0
+    }
+
+    /// Analyze a buffer on behalf of a *source* revision. The service's
+    /// mirror buffer has its own revision counter, so diagnostics are keyed
+    /// by the source editor's revision; hover and completion then hit the
+    /// analysis already produced for the text on screen.
+    pub fn analyze_at(
+        &self,
+        file: SqlFileId,
+        source_revision: u64,
+        buffer: &mut Buffer,
+    ) -> Arc<Analysis> {
+        self.analyzed(file, source_revision, buffer).0
+    }
+
+    /// Analyze and return the exact catalog the result was built against. A
+    /// cache hit is valid only while that catalog is still installed: a
+    /// `set_catalog` racing an in-flight analysis can insert an entry built
+    /// from the old arena after the map was cleared.
+    pub(crate) fn analyzed(
+        &self,
+        file: SqlFileId,
+        revision: u64,
+        buffer: &mut Buffer,
+    ) -> (Arc<Analysis>, Arc<CatalogCache>) {
+        let catalog = self.catalog();
         if let Some(cached) = self.analyses.lock().get(&file)
             && cached.revision == revision
+            && Arc::ptr_eq(&cached.catalog, &catalog)
         {
-            return cached.analysis.clone();
+            return (cached.analysis.clone(), catalog);
         }
-        let analysis = Arc::new(self.analyze_now(buffer));
+        let analysis = Arc::new(self.analyze_now(buffer, &catalog));
         let mut cache = self.analyses.lock();
         if cache.len() >= ANALYSIS_CACHE_MAX {
             let oldest = cache.keys().next().copied();
@@ -125,10 +155,11 @@ impl SemanticEngine {
             file,
             CachedAnalysis {
                 revision,
+                catalog: catalog.clone(),
                 analysis: analysis.clone(),
             },
         );
-        analysis
+        (analysis, catalog)
     }
 
     /// The hover card for the reference under `offset` (spec §5.3). Reads the
@@ -137,8 +168,7 @@ impl SemanticEngine {
         let offset = offset.min(buffer.len());
         let text = buffer.text().to_string();
         let reference = crate::hover::reference_at(&text, offset)?;
-        let analysis = self.analyze(file, buffer);
-        let catalog = self.catalog();
+        let (analysis, catalog) = self.analyzed(file, buffer.revision(), buffer);
         let contents = crate::hover::resolve(&catalog, &analysis, offset, &reference)?;
         Some(HoverInfo {
             contents,
@@ -146,13 +176,12 @@ impl SemanticEngine {
         })
     }
 
-    fn analyze_now(&self, buffer: &mut Buffer) -> Analysis {
+    fn analyze_now(&self, buffer: &mut Buffer, catalog: &Arc<CatalogCache>) -> Analysis {
         buffer.syntax(); // lazy reparse when edited
         let fresh = buffer.fresh_syntax();
         let Some(tree) = fresh else {
             return Analysis::default();
         };
-        let catalog = self.catalog();
         let mut walker = Walker {
             buffer,
             catalog: catalog.as_ref(),

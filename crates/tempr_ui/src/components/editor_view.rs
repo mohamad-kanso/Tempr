@@ -245,7 +245,7 @@ impl EditorView {
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let len = self.buffer.len();
         if let Ok(Some(_)) = self.buffer.edit(&[(0..len, text)]) {
-            self.completion = None;
+            self.close_completion();
             self.hover = None;
             cx.emit(EditorEvent::Changed);
             self.schedule_analysis(cx);
@@ -256,6 +256,7 @@ impl EditorView {
     /// Emit the statement under the primary cursor (or a `Notice` when there
     /// is none / it is a parse-error fragment).
     pub fn run_statement_under_cursor(&mut self, cx: &mut Context<Self>) {
+        self.close_completion();
         let head = self.primary().head;
         // A non-empty selection runs as-is.
         let primary = self.primary();
@@ -305,7 +306,7 @@ impl EditorView {
     /// selections (or a cursor at 0 for edits recorded without any).
     fn restore(&mut self, sels: Option<Vec<Selection>>, cx: &mut Context<Self>) {
         cx.emit(EditorEvent::Changed);
-        self.completion = None;
+        self.close_completion();
         self.goal_column = None;
         self.schedule_analysis(cx);
         self.set_selections(sels.unwrap_or_else(|| vec![Selection::cursor(0)]), cx);
@@ -322,6 +323,7 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl Fn(&Buffer, usize) -> usize,
     ) {
+        self.close_completion();
         self.goal_column = None;
         let sels: Vec<Selection> = self
             .selections
@@ -340,6 +342,7 @@ impl EditorView {
     }
 
     fn move_vertical(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        self.close_completion();
         let goal = self.goal_column;
         let mut new_goal = None;
         let sels: Vec<Selection> = self
@@ -414,12 +417,25 @@ impl EditorView {
 
     /// Store the analysis the service produced, but only for the revision on
     /// screen. Called by the owner after `UiEvent::DiagnosticsReady`.
-    pub fn on_diagnostics(&mut self, cx: &mut Context<Self>) {
+    /// Returns whether the analysis was current.
+    pub fn on_diagnostics(&mut self, cx: &mut Context<Self>) -> bool {
         let revision = self.buffer.revision();
         if let Some(analysis) = self.intelligence.analysis(self.buffer.file_id(), revision) {
             self.analysis = Some((revision, analysis));
             cx.notify();
+            true
+        } else {
+            false
         }
+    }
+
+    /// The catalog changed: analyses built against the previous one are
+    /// invalid, so drop the rendered copy and schedule a fresh one.
+    pub fn on_schema_refreshed(&mut self, cx: &mut Context<Self>) {
+        self.analysis = None;
+        self.hover = None;
+        self.schedule_analysis(cx);
+        cx.notify();
     }
 
     /// Anything a keystroke changed: close stale cards, keep the popup in
@@ -427,7 +443,7 @@ impl EditorView {
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.hover = None;
         if !self.should_auto_complete() {
-            self.completion = None;
+            self.close_completion();
         } else if self.completion.is_some() {
             self.refilter_completion();
         } else {
@@ -454,13 +470,13 @@ impl EditorView {
 
     fn open_completion(&mut self, explicit: bool, cx: &mut Context<Self>) {
         if !explicit && !self.should_auto_complete() {
-            self.completion = None;
+            self.close_completion();
             return;
         }
         let head = self.primary().head;
         let items = self.intelligence.complete(&mut self.buffer, head, explicit);
         if items.is_empty() {
-            self.completion = None;
+            self.close_completion();
         } else {
             self.completion = Some(CompletionPopup::new(items));
             self.completion_anchor = self.caret_anchor();
@@ -474,7 +490,7 @@ impl EditorView {
         let head = self.primary().head;
         let items = self.intelligence.complete(&mut self.buffer, head, false);
         if items.is_empty() {
-            self.completion = None;
+            self.close_completion();
             return;
         }
         if let Some(popup) = &mut self.completion {
@@ -488,6 +504,21 @@ impl EditorView {
             .map(|bounds| point(bounds.left(), bounds.bottom() + px(4.)))
     }
 
+    /// The popup is open only while it has rows *and* an anchor. The key
+    /// context, render path and accept guard share this predicate, so a
+    /// popup the user cannot see can never capture enter/tab/escape.
+    fn completion_open(&self) -> bool {
+        self.completion
+            .as_ref()
+            .is_some_and(|popup| !popup.is_empty())
+            && self.completion_anchor.is_some()
+    }
+
+    fn close_completion(&mut self) {
+        self.completion = None;
+        self.completion_anchor = None;
+    }
+
     /// Resolve at the primary cursor: symbol hover first, then the diagnostic
     /// under the cursor. Neither existing is a status notice, not a card.
     fn show_hover(&mut self, cx: &mut Context<Self>) {
@@ -498,6 +529,8 @@ impl EditorView {
             None => match self.diagnostic_at(head) {
                 Some(message) => message,
                 None => {
+                    self.hover = None;
+                    cx.notify();
                     cx.emit(EditorEvent::Notice(
                         "No symbol or diagnostic at the cursor.".into(),
                     ));
@@ -532,7 +565,13 @@ impl EditorView {
         // The new line has not been laid out yet (it may have just been
         // scrolled into view), so anchor the card after the frame paints.
         let text = target.1;
+        let revision = self.buffer.revision();
         cx.on_next_frame(window, move |this, _window, cx| {
+            // The user typed before the frame landed: the message describes
+            // text that is no longer on screen.
+            if this.buffer.revision() != revision {
+                return;
+            }
             this.hover = Some(HoverCard {
                 text,
                 anchor: this.caret_anchor(),
@@ -592,13 +631,16 @@ impl EditorView {
         self.move_each(true, false, cx, |b, o| b.line_end(o));
     }
     fn document_start(&mut self, _: &DocumentStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         self.set_selections(vec![Selection::cursor(0)], cx);
     }
     fn document_end(&mut self, _: &DocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         let end = self.buffer.len();
         self.set_selections(vec![Selection::cursor(end)], cx);
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         let end = self.buffer.len();
         self.set_selections(vec![Selection::new(0, end)], cx);
     }
@@ -655,6 +697,7 @@ impl EditorView {
         self.apply(cx, |b, s| b.move_lines(s, LineDirection::Down));
     }
     fn run_all(&mut self, _: &RunAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         let all = self.text();
         if !all.trim().is_empty() {
             cx.emit(EditorEvent::Run(all));
@@ -704,6 +747,10 @@ impl EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.completion_open() {
+            return;
+        }
+        let head = self.primary().head;
         let Some(item) = self
             .completion
             .as_ref()
@@ -711,17 +758,27 @@ impl EditorView {
         else {
             return;
         };
+        if item.replace.end != head {
+            // The item was ranked for a caret that has since moved; applying
+            // its range now could replace unrelated text.
+            self.close_completion();
+            cx.notify();
+            return;
+        }
         let (range, cursor) = completion_popup::accept_edit(&item);
-        self.completion = None;
+        self.close_completion();
         match self.buffer.edit(&[(range, item.insert.as_str())]) {
             Ok(changed) => {
                 self.set_selections(vec![Selection::cursor(cursor)], cx);
                 if changed.is_some() {
                     cx.emit(EditorEvent::Changed);
-                    self.after_edit(cx);
-                } else {
-                    cx.notify();
+                    // An accept completes one word: do not immediately
+                    // reopen on the identifier the insert just produced.
+                    self.hover = None;
+                    self.close_completion();
+                    self.schedule_analysis(cx);
                 }
+                cx.notify();
             }
             Err(e) => {
                 cx.emit(EditorEvent::Notice(format!("completion rejected: {e}")));
@@ -737,6 +794,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         if self.completion.take().is_some() {
+            self.completion_anchor = None;
             cx.notify();
         }
     }
@@ -759,6 +817,7 @@ impl EditorView {
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.close_completion();
         if let Some(offset) = self.offset_for_position(event.position) {
             let sel = if event.modifiers.shift {
                 self.primary().with_head(offset, true)
@@ -1127,7 +1186,7 @@ impl Render for EditorView {
         let popup = self.render_completion_popup(cx);
         let hover = self.render_hover_card();
         div()
-            .key_context(if self.completion.is_some() {
+            .key_context(if self.completion_open() {
                 completion_popup::KEY_CONTEXT
             } else {
                 KEY_CONTEXT

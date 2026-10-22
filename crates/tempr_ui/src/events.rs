@@ -32,6 +32,11 @@ pub enum UiEvent {
     DiagnosticsReady {
         file: SqlFileId,
     },
+    /// A schema refresh installed a new catalog for `connection`; UI state
+    /// (diagnostics, underlines) built against the old one is stale.
+    SchemaRefreshed {
+        connection: ConnectionId,
+    },
     /// A manual or automatic schema refresh failed; the previous catalog is
     /// still installed.
     SchemaRefreshFailed {
@@ -57,6 +62,9 @@ impl UiEvent {
                 outcome: outcome.clone(),
             },
             AppEvent::DiagnosticsReady { file } => Self::DiagnosticsReady { file: *file },
+            AppEvent::SchemaRefreshed { connection, .. } => Self::SchemaRefreshed {
+                connection: *connection,
+            },
             AppEvent::SchemaRefreshFailed {
                 connection,
                 message,
@@ -79,6 +87,7 @@ pub fn bridge(bus: &EventBus) -> (Subscription, UnboundedReceiver<UiEvent>) {
         AppEventKind::RowsReceived,
         AppEventKind::QueryFinished,
         AppEventKind::DiagnosticsReady,
+        AppEventKind::SchemaRefreshed,
         AppEventKind::SchemaRefreshFailed,
     ]);
     let sub = bus.subscribe(filter, move |event| {
@@ -119,6 +128,13 @@ mod tests {
             Some(UiEvent::DiagnosticsReady { file })
         );
         let connection = ConnectionId::new();
+        assert_eq!(
+            UiEvent::from_app(&AppEvent::SchemaRefreshed {
+                connection,
+                snapshot: tempr_domain::SchemaSnapshotId::new(),
+            }),
+            Some(UiEvent::SchemaRefreshed { connection })
+        );
         assert_eq!(
             UiEvent::from_app(&AppEvent::SchemaRefreshFailed {
                 connection,

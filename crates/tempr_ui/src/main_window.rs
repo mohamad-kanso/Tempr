@@ -24,7 +24,9 @@ use tempr_services::{
 };
 
 use crate::commands;
-use crate::components::{EditorEvent, EditorView, Palette, PaletteEvent, ResultGrid};
+use crate::components::{
+    DiagnosticsSummary, EditorEvent, EditorView, Palette, PaletteEvent, ResultGrid,
+};
 use crate::events::{self, UiEvent};
 use crate::gpui_compat;
 use crate::scroll_bench::ScrollBench;
@@ -108,6 +110,9 @@ pub struct MainWindow {
     palette: Entity<Palette>,
     status: String,
     status_is_error: bool,
+    /// Latest diagnostics counts, rendered as their own status-bar segment
+    /// so query/schema messages can never erase them.
+    diagnostics: Option<DiagnosticsSummary>,
     /// The run in flight, allocated by the view before the task starts so
     /// `CancelQuery` can target it immediately. Cleared only by the task's
     /// outcome — the single owner of "is a query running".
@@ -194,6 +199,7 @@ impl MainWindow {
             palette,
             status,
             status_is_error: false,
+            diagnostics: None,
             current_run: None,
             dev,
             bench: None,
@@ -542,10 +548,18 @@ impl MainWindow {
                 self.set_status(format!("Running… {rows} {}", row_word(rows)), false, cx);
             }
             UiEvent::DiagnosticsReady { file } if file == self.editor.read(cx).file_id() => {
-                self.editor
+                let current = self
+                    .editor
                     .update(cx, |editor, cx| editor.on_diagnostics(cx));
-                let summary = self.editor.read(cx).diagnostics_summary();
-                self.set_status(format!("Diagnostics: {}", summary.text()), false, cx);
+                if current {
+                    self.diagnostics = Some(self.editor.read(cx).diagnostics_summary());
+                    cx.notify();
+                }
+            }
+            UiEvent::SchemaRefreshed { connection } if Some(connection) == self.connection_id() => {
+                self.diagnostics = None;
+                self.editor
+                    .update(cx, |editor, cx| editor.on_schema_refreshed(cx));
             }
             UiEvent::SchemaRefreshFailed {
                 connection,
@@ -718,7 +732,20 @@ impl Render for MainWindow {
                                 theme::TEXT_DIM
                             }))
                             .child(self.status.clone()),
-                    ),
+                    )
+                    .children(self.diagnostics.map(|summary| {
+                        let color = if summary.errors > 0 {
+                            theme::ERROR
+                        } else if summary.warnings > 0 {
+                            theme::WARNING
+                        } else {
+                            theme::TEXT_DIM
+                        };
+                        div()
+                            .ml_auto()
+                            .text_color(rgb(color))
+                            .child(format!("Diagnostics: {}", summary.text()))
+                    })),
             )
     }
 }

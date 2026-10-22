@@ -36,6 +36,9 @@ pub(crate) struct Reference {
 /// or immediately after it (the common case after moving right).
 pub(crate) fn reference_at(text: &str, offset: usize) -> Option<Reference> {
     let offset = offset.min(text.len());
+    if !text.is_char_boundary(offset) {
+        return None;
+    }
     let (word_range, word) = word_at(text, offset)?;
     let (path, path_start) = qualifier_before(text, word_range.start).unzip();
     let start = path_start.unwrap_or(word_range.start);
@@ -141,7 +144,9 @@ pub(crate) fn resolve(
     match reference.path.as_slice() {
         [] => resolve_bare(catalog, analysis, offset, word),
         [qualifier] => resolve_qualified(catalog, analysis, offset, qualifier, word),
-        [schema, relation, ..] => resolve_schema_relation(catalog, schema, relation, word),
+        // A database prefix (`db.schema.rel.col`) precedes the schema and
+        // relation; only the last two path segments qualify the relation.
+        [.., schema, relation] => resolve_schema_relation(catalog, schema, relation, word),
     }
 }
 
@@ -151,36 +156,47 @@ fn resolve_bare(
     offset: usize,
     word: &str,
 ) -> Option<String> {
-    let bindings = visible_bindings(analysis, offset);
-    let hits: Vec<(&Binding, ColumnRef)> = bindings
-        .iter()
-        .flat_map(|binding| {
-            binding
-                .column_hits(word, catalog)
-                .into_iter()
-                .map(move |column| (*binding, column))
-        })
-        .collect();
-    match hits.as_slice() {
-        [(binding, column)] => return column_card(catalog, column, Some(binding)),
-        [] => {}
-        many => {
-            let names: Vec<String> = many
-                .iter()
-                .filter_map(|(binding, _)| {
-                    binding_owner(catalog, binding).map(|owner| format!("{owner}.{word}"))
-                })
-                .collect();
-            if !names.is_empty() {
-                return Some(format!(
-                    "column `{word}` is ambiguous\n{}",
-                    names.join("\n")
-                ));
+    let chain = analysis.scope_chain(offset);
+    // PostgreSQL resolves a bare column one nesting level at a time: the
+    // innermost scope with any match decides, so an inner `id` is never
+    // ambiguous with an outer `id`.
+    for scope in chain.iter().rev() {
+        let hits: Vec<(&Binding, ColumnRef)> = scope
+            .bindings
+            .iter()
+            .flat_map(|binding| {
+                binding
+                    .column_hits(word, catalog)
+                    .into_iter()
+                    .map(move |column| (binding, column))
+            })
+            .collect();
+        match hits.as_slice() {
+            [] => continue,
+            [(binding, column)] => return column_card(catalog, column, Some(binding)),
+            many => {
+                let names: Vec<String> = many
+                    .iter()
+                    .filter_map(|(binding, _)| {
+                        binding_owner(catalog, binding).map(|owner| format!("{owner}.{word}"))
+                    })
+                    .collect();
+                let mut message = format!("column `{word}` is ambiguous");
+                if !names.is_empty() {
+                    message.push('\n');
+                    message.push_str(&names.join("\n"));
+                }
+                return Some(message);
             }
         }
     }
 
-    if let Some(binding) = bindings.iter().find(|b| b.matches_qualifier(word)) {
+    if let Some(binding) = chain
+        .iter()
+        .rev()
+        .flat_map(|scope| scope.bindings.iter())
+        .find(|b| b.matches_qualifier(word))
+    {
         // A FROM source with a catalog relation resolves to the richer
         // relation card (rows, view definition); an alias or a CTE keeps the
         // binding card.
@@ -303,15 +319,6 @@ fn resolve_schema_relation(
             .map(|column| catalog_column_card(catalog, rel, column)),
         None => relation_card(catalog, rel),
     }
-}
-
-fn visible_bindings(analysis: &Analysis, offset: usize) -> Vec<&Binding> {
-    analysis
-        .scope_chain(offset)
-        .iter()
-        .rev()
-        .flat_map(|scope| scope.bindings.iter())
-        .collect()
 }
 
 fn qualifier_binding<'a>(
@@ -811,6 +818,42 @@ mod tests {
             "{}",
             hover.contents
         );
+    }
+
+    #[test]
+    fn bare_column_ambiguity_is_scoped_to_the_innermost_nesting_level() {
+        let sql = "select u.id from users u where exists (select id from orders o)";
+        let offset = sql.find("select id from orders").expect("inner select") + "select id".len();
+        let hover = hover_at_offset(sql, offset, catalog()).expect("hover");
+        assert!(
+            hover.contents.contains("public.orders.id"),
+            "{}",
+            hover.contents
+        );
+        assert!(!hover.contents.contains("ambiguous"), "{}", hover.contents);
+    }
+
+    #[test]
+    fn a_database_prefix_is_ignored_when_qualifying_the_relation() {
+        let sql = "select 1 from public.users where catalog.public.users.id = 1";
+        let offset = sql.rfind("users.id").expect("needle") + "users.id".len();
+        let hover = hover_at_offset(sql, offset, catalog()).expect("hover");
+        assert!(
+            hover.contents.contains("column `public.users.id`"),
+            "{}",
+            hover.contents
+        );
+    }
+
+    #[test]
+    fn offsets_inside_a_multibyte_character_have_no_reference() {
+        let sql = "select é";
+        let mid = sql.find('é').expect("é") + 1;
+        assert!(
+            !sql.is_char_boundary(mid),
+            "test needs a mid-character byte"
+        );
+        assert!(reference_at(sql, mid).is_none());
     }
 
     #[test]

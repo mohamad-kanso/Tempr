@@ -19,6 +19,7 @@
 //! catalog in place.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -47,6 +48,10 @@ pub struct IntelligenceService {
     /// Mirror buffers for background analysis, keyed by file.
     mirrors: Mutex<HashMap<SqlFileId, Buffer>>,
     analyses: RwLock<HashMap<SqlFileId, StoredAnalysis>>,
+    /// Bumped on every catalog swap. An analysis started before the swap
+    /// may reference arena indices into the old catalog, so it is never
+    /// stored or published.
+    catalog_generation: AtomicU64,
     active_connection: RwLock<Option<ConnectionId>>,
     /// Set by `Service::start`; event handlers use it to spawn the async
     /// cache/refresh work. Falls back to `Handle::try_current()` for events
@@ -63,6 +68,7 @@ impl IntelligenceService {
             engine: Arc::new(SemanticEngine::new(empty_catalog())),
             mirrors: Mutex::new(HashMap::new()),
             analyses: RwLock::new(HashMap::new()),
+            catalog_generation: AtomicU64::new(0),
             active_connection: RwLock::new(None),
             handle: Mutex::new(None),
             subscriptions: Mutex::new(Vec::new()),
@@ -151,13 +157,21 @@ impl IntelligenceService {
     /// resets (it may hold arena indices into the old cache).
     pub fn install_snapshot(&self, snapshot: &SchemaSnapshot) {
         let catalog = Arc::new(CatalogCache::from_snapshot(snapshot));
-        self.engine.set_catalog(catalog);
-        self.analyses.write().clear();
+        self.replace_catalog(catalog);
     }
 
     /// Install a catalog directly (tests, and a future workspace index).
     pub fn set_catalog(&self, catalog: Arc<CatalogCache>) {
+        self.replace_catalog(catalog);
+    }
+
+    fn replace_catalog(&self, catalog: Arc<CatalogCache>) {
+        // Swap the engine's catalog first, then bump the generation: an
+        // analysis that loaded the old generation is guaranteed to see a
+        // mismatch after this, and one that loads the new generation already
+        // reads the new catalog.
         self.engine.set_catalog(catalog);
+        self.catalog_generation.fetch_add(1, Ordering::AcqRel);
         self.analyses.write().clear();
     }
 
@@ -185,28 +199,55 @@ impl IntelligenceService {
 
     /// Analyze an immutable text snapshot on a background task and publish
     /// `DiagnosticsReady`. The revision recorded is the *source* buffer's
-    /// revision, not the mirror's.
+    /// revision, not the mirror's. Tasks are spawned out of order, so a
+    /// result older than the stored one, or one started before a catalog
+    /// swap, is dropped instead of published.
     pub fn analyze(&self, file: SqlFileId, source_revision: u64, text: &str) {
-        let mut mirrors = self.mirrors.lock();
-        match mirrors.get_mut(&file) {
-            Some(buffer) => replace_text(buffer, text),
-            None => {
-                mirrors.insert(file, Buffer::new(file, text));
-            }
-        }
-        let Some(buffer) = mirrors.get_mut(&file) else {
+        if let Some(stored) = self.analyses.read().get(&file)
+            && stored.source_revision >= source_revision
+        {
             return;
+        }
+        let generation = self.catalog_generation.load(Ordering::Acquire);
+        let analysis = {
+            let mut mirrors = self.mirrors.lock();
+            let buffer = mirrors
+                .entry(file)
+                .or_insert_with(|| Buffer::new(file, text));
+            if let Err(e) = replace_text(buffer, text) {
+                // A failed minimal edit would leave the mirror analyzing the
+                // wrong text; rebuild it from the snapshot instead.
+                tracing::warn!(error = %e, "intelligence: mirror edit failed; rebuilding");
+                *buffer = Buffer::new(file, text);
+            }
+            self.engine.analyze_at(file, source_revision, buffer)
         };
-        let analysis = self.engine.analyze(file, buffer);
-        drop(mirrors);
 
-        self.analyses.write().insert(
+        if self.catalog_generation.load(Ordering::Acquire) != generation {
+            tracing::debug!("intelligence: analysis dropped across a catalog swap");
+            return;
+        }
+        let mut analyses = self.analyses.write();
+        // Re-check under the lock: `replace_catalog` may have swapped the
+        // catalog between the first check and acquiring this write lock.
+        if self.catalog_generation.load(Ordering::Acquire) != generation {
+            tracing::debug!("intelligence: analysis dropped across a catalog swap");
+            return;
+        }
+        if analyses
+            .get(&file)
+            .is_some_and(|stored| stored.source_revision >= source_revision)
+        {
+            return;
+        }
+        analyses.insert(
             file,
             StoredAnalysis {
                 source_revision,
                 analysis,
             },
         );
+        drop(analyses);
         self.event_bus.publish(AppEvent::DiagnosticsReady { file });
     }
 
@@ -249,10 +290,10 @@ impl Service for IntelligenceService {
 
 /// Apply `next` to `buffer` as one minimal replacement, so the tree-sitter
 /// reparse stays incremental instead of re-parsing the whole document.
-fn replace_text(buffer: &mut Buffer, next: &str) {
+fn replace_text(buffer: &mut Buffer, next: &str) -> Result<(), tempr_editor::EditError> {
     let old = buffer.text().to_string();
     if old == next {
-        return;
+        return Ok(());
     }
     let old_bytes = old.as_bytes();
     let new_bytes = next.as_bytes();
@@ -283,11 +324,11 @@ fn replace_text(buffer: &mut Buffer, next: &str) {
     let old_end = old.len() - suffix;
     let new_end = next.len() - suffix;
     if prefix > old_end || prefix > new_end {
-        return;
+        return Ok(());
     }
-    if let Err(e) = buffer.edit(&[(prefix..old_end, &next[prefix..new_end])]) {
-        tracing::warn!(error = %e, "intelligence: mirror buffer edit failed");
-    }
+    buffer
+        .edit(&[(prefix..old_end, &next[prefix..new_end])])
+        .map(|_| ())
 }
 
 fn empty_catalog() -> Arc<CatalogCache> {
@@ -401,6 +442,42 @@ mod tests {
         let analysis = service.analysis(file, 2).expect("latest");
         assert!(analysis.scopes.iter().any(|s| !s.bindings.is_empty()));
         assert!(service.analysis(file, 1).is_none());
+    }
+
+    #[test]
+    fn an_out_of_order_analysis_never_overwrites_a_newer_one() {
+        let (service, _) = service();
+        let file = SqlFileId::new();
+        service.analyze(file, 4, "select zz from users");
+        assert_eq!(
+            service.analysis(file, 4).expect("newer").diagnostics.len(),
+            1
+        );
+
+        // A slower task for revision 3 lands after revision 4. It must not
+        // replace the newer analysis, and the mirror must still hold rev 4.
+        service.analyze(file, 3, "select id from users");
+        assert!(service.analysis(file, 3).is_none(), "stale result stored");
+        assert_eq!(
+            service
+                .analysis(file, 4)
+                .expect("still current")
+                .diagnostics
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_catalog_swap_drops_stored_analyses() {
+        let (service, _) = service();
+        let file = SqlFileId::new();
+        service.analyze(file, 7, "select id from users");
+        service.install_snapshot(&snapshot());
+        assert!(
+            service.analysis(file, 7).is_none(),
+            "analyses built against the previous catalog must not survive"
+        );
     }
 
     #[test]

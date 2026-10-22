@@ -8,7 +8,7 @@ pub mod palette;
 pub mod result_grid;
 
 pub use completion_popup::CompletionPopup;
-pub use editor_view::{EditorEvent, EditorView};
+pub use editor_view::{DiagnosticsSummary, EditorEvent, EditorView};
 pub use input::{Input, InputEvent};
 pub use palette::{Palette, PaletteEvent};
 pub use result_grid::ResultGrid;

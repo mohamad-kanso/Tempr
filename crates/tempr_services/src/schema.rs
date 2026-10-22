@@ -116,8 +116,10 @@ impl SchemaService {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Arc<SchemaSnapshot>, ServiceError> {
-        self.refresh_scope(connection_id, SchemaScope::SearchPath)
-            .await
+        // Keep the scope invariant: a full refresh after an `All` snapshot
+        // must not silently shrink the catalog to the search path.
+        let scope = self.refresh_scope_for(connection_id);
+        self.refresh_scope(connection_id, scope).await
     }
 
     /// Refresh every non-system schema. The UI's "refresh all schemas"
@@ -197,14 +199,20 @@ impl SchemaService {
         Ok(snapshot)
     }
 
-    /// The scope the current snapshot was built from (`SearchPath` before the
-    /// first successful refresh).
+    /// The scope the current snapshot was built from. A snapshot already in
+    /// memory means a scope existed at some point but was lost (a restart
+    /// that reused a cached catalog); sweeping `SearchPath` against an `All`
+    /// snapshot would report every out-of-path object as dropped, so fall
+    /// back to the conservative `All` sweep instead.
     fn refresh_scope_for(&self, connection_id: ConnectionId) -> SchemaScope {
-        self.scopes
-            .read()
-            .get(&connection_id)
-            .cloned()
-            .unwrap_or(SchemaScope::SearchPath)
+        if let Some(scope) = self.scopes.read().get(&connection_id).cloned() {
+            return scope;
+        }
+        if self.snapshots.read().contains_key(&connection_id) {
+            SchemaScope::All
+        } else {
+            SchemaScope::SearchPath
+        }
     }
 
     /// Map driver entries to domain objects, deriving every id from
@@ -1250,19 +1258,8 @@ mod tests {
         }
     }
 
-    async fn connected_service() -> (
-        Arc<SchemaService>,
-        ConnectionId,
-        Arc<std::sync::Mutex<Vec<SchemaScope>>>,
-    ) {
-        let bus = make_event_bus();
-        let scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let connections = ConnectionService::new(bus.clone());
-        connections.register_driver(Arc::new(RecordingDriver {
-            scopes: scopes.clone(),
-        }));
-        let id = ConnectionId::new();
-        let connection = tempr_domain::Connection {
+    fn test_connection(id: ConnectionId) -> tempr_domain::Connection {
+        tempr_domain::Connection {
             id,
             name: "test".to_string(),
             driver: tempr_domain::DriverKind::Postgres,
@@ -1275,8 +1272,25 @@ mod tests {
                 vault_key: "test".to_string(),
             },
             tls: tempr_domain::TlsMode::Disable,
-        };
-        connections.connect(&connection).await.expect("connect");
+        }
+    }
+
+    async fn connected_service() -> (
+        Arc<SchemaService>,
+        ConnectionId,
+        Arc<std::sync::Mutex<Vec<SchemaScope>>>,
+    ) {
+        let bus = make_event_bus();
+        let scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connections = ConnectionService::new(bus.clone());
+        connections.register_driver(Arc::new(RecordingDriver {
+            scopes: scopes.clone(),
+        }));
+        let id = ConnectionId::new();
+        connections
+            .connect(&test_connection(id))
+            .await
+            .expect("connect");
         let service = SchemaService::new(bus, connections);
         (service, id, scopes)
     }
@@ -1332,6 +1346,67 @@ mod tests {
             scopes_of(&scopes),
             ["all"],
             "an All snapshot must be swept with All, not SearchPath"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_reuses_the_scope_the_snapshot_was_built_from() {
+        let (service, id, scopes) = connected_service().await;
+
+        service.refresh_all_schemas(id).await.expect("all");
+        scopes.lock().unwrap_or_else(|p| p.into_inner()).clear();
+
+        service.refresh(id).await.expect("full refresh");
+        assert_eq!(
+            scopes_of(&scopes),
+            ["all", "all"],
+            "a plain refresh must not shrink an All snapshot to the search path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_snapshot_without_a_remembered_scope_sweeps_every_schema() {
+        // Simulates a restart: the cached catalog is loaded from disk while
+        // the in-memory scope map is empty. An unknown scope must not be
+        // assumed to be SearchPath against a snapshot that may be All.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let storage: Arc<dyn tempr_workspace::Storage> =
+            Arc::new(tempr_workspace::FileSystemStorage::new(tmp.path()));
+        storage.init_workspace_dir().await.expect("init");
+
+        let bus = make_event_bus();
+        let scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connections = ConnectionService::new(bus.clone());
+        connections.register_driver(Arc::new(RecordingDriver {
+            scopes: scopes.clone(),
+        }));
+        let id = ConnectionId::new();
+        connections
+            .connect(&test_connection(id))
+            .await
+            .expect("connect");
+        let service = SchemaService::with_cache(bus, connections, storage.clone());
+
+        let cached = SchemaSnapshot {
+            id: SchemaSnapshotId::new(),
+            connection_id: id,
+            version: 3,
+            fetched_at: chrono::Utc::now(),
+            objects: Vec::new(),
+            keywords: Vec::new(),
+            fingerprints: Vec::new(),
+        };
+        storage
+            .catalog_cache(id)
+            .save(&cached)
+            .await
+            .expect("save cached snapshot");
+
+        service.refresh_incremental(id).await.expect("incremental");
+        assert_eq!(
+            scopes_of(&scopes),
+            ["all", "all"],
+            "an unknown scope with a cached snapshot must fall back to All"
         );
     }
 

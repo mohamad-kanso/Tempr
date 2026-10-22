@@ -175,7 +175,16 @@ impl SchemaService {
 
     /// Full introspection: derives ids, fetches keywords and a fingerprint
     /// sweep, saves to the catalog cache (best-effort) if one is configured.
+    /// Reuses the scope the current snapshot was built from, so a plain
+    /// refresh after `refresh_all_schemas` stays `All`.
     pub async fn refresh(&self, connection_id: ConnectionId) -> Result<Arc<SchemaSnapshot>, ServiceError>;
+
+    /// Full introspection over an explicit scope; remembers it for the
+    /// connection so later incremental sweeps compare like with like.
+    pub async fn refresh_scope(&self, connection_id: ConnectionId, scope: SchemaScope) -> Result<Arc<SchemaSnapshot>, ServiceError>;
+
+    /// `refresh_scope(.., SchemaScope::All)` — the UI's "refresh all schemas".
+    pub async fn refresh_all_schemas(&self, connection_id: ConnectionId) -> Result<Arc<SchemaSnapshot>, ServiceError>;
 
     /// Diffs a fresh fingerprint sweep against the cached snapshot's
     /// fingerprints and re-introspects only the touched schemas; falls back
@@ -197,6 +206,8 @@ impl SchemaService {
 
 **Events published:** `SchemaRefreshed { connection: ConnectionId, snapshot: SchemaSnapshotId }`.
 
+Scope memory is per connection and in memory only. `refresh_incremental` sweeps the remembered scope; when a snapshot exists but no scope is remembered (a restart that loaded a cached catalog), it conservatively sweeps `All` rather than assuming `SearchPath` and reporting every out-of-path object as dropped. Persisting the scope across restarts remains a TODO.
+
 **Events consumed:** `ConnectionStateChanged` (triggers refresh when a connection reaches `Connected` state), `QueryFinished` (future: triggers refresh if DDL was detected in the query result).
 
 ---
@@ -205,7 +216,7 @@ impl SchemaService {
 
 `IntelligenceService` owns the `SemanticEngine` — the internal completion, diagnostics, and hover pipeline that gives Tempr its "DataGrip" half. It rebuilds the immutable `CatalogCache` from `SchemaRefreshed`, keeps one mirror `Buffer` per file for background analysis, and serves completion and hover synchronously from the UI thread (no I/O, no database access). Plugins can contribute additional completion providers via `CommandContribution` registration through the `PluginService`; `IntelligenceService` fans out requests to all registered providers and merges results (Phase 4).
 
-**Owned state:** `SemanticEngine` instance, the analysis cache (`(source revision, Arc<Analysis>)` per file), mirror buffers for analysis, the active connection, and the engine's `CatalogCache`.
+**Owned state:** `SemanticEngine` instance, the analysis cache (`(source revision, Arc<Analysis>)` per file), mirror buffers for analysis, a catalog generation counter, the active connection, and the engine's `CatalogCache`.
 
 **Key methods (shipped stage 6):**
 
@@ -235,6 +246,8 @@ impl IntelligenceService {
 **Events published:** `DiagnosticsReady { file: SqlFileId }` (the view pulls the exact revision from `analysis()`), `SchemaRefreshFailed { connection: ConnectionId, message: String }` (a refresh failed; the previous catalog stays installed).
 
 **Events consumed:** `SchemaRefreshed { connection, snapshot }` (install that snapshot), `ConnectionStateChanged { id, Connected }` (load the cached `.tcat`, then refresh incrementally — offline catalog first, network second).
+
+Background analyses are spawned per idle edit and can finish out of order. `analyze` drops a result whose source revision is older than the stored one, and drops one whose catalog generation changed mid-analysis (a refresh installed a new catalog); the view reschedules after `SchemaRefreshed`. If the minimal mirror edit fails, the mirror is rebuilt from the snapshot rather than left analyzing stale text. Because engine entries are keyed by the editor's source revision, hover and completion for that same revision reuse the diagnostics pass instead of re-walking the tree.
 
 The spec's `BufferSnapshot`-based sketches are superseded: `complete` and `hover` read the real `Buffer` (`&mut` for the analysis cache's lazy reparse), and diagnostics run against a service-owned mirror buffer because the view owns the real one.
 

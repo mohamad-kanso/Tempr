@@ -68,12 +68,20 @@ impl CompletionPopup {
     }
 
     /// Keep the current item selected after a re-filter when it is still
-    /// present; otherwise fall back to the first row.
+    /// present; otherwise fall back to the first row. Labels alone are not
+    /// unique (a column and a keyword may share one), so identity includes
+    /// the kind.
     pub fn refilter(&mut self, items: Vec<CompletionItem>) {
-        let previous = self.selected_item().map(|item| item.label.clone());
+        let previous = self
+            .selected_item()
+            .map(|item| (item.label.clone(), item.kind));
         self.items = items;
         self.selected = previous
-            .and_then(|label| self.items.iter().position(|item| item.label == label))
+            .and_then(|(label, kind)| {
+                self.items
+                    .iter()
+                    .position(|item| item.label == label && item.kind == kind)
+            })
             .unwrap_or(0);
     }
 
@@ -144,5 +152,20 @@ mod tests {
         assert_eq!(popup.selected, 0, "beta stays selected");
         popup.refilter(vec![item("gamma")]);
         assert_eq!(popup.selected, 0, "gone selection clamps to the first row");
+    }
+
+    #[test]
+    fn refilter_does_not_confuse_items_that_share_a_label() {
+        let mut keyword = item("id");
+        keyword.kind = CompletionKind::Keyword;
+        let mut popup = CompletionPopup::new(vec![item("id"), keyword.clone()]);
+        popup.move_selection(1); // the keyword row at index 1
+        let mut column = item("id");
+        column.kind = CompletionKind::Column;
+        popup.refilter(vec![column, keyword]);
+        assert_eq!(
+            popup.selected, 1,
+            "the keyword row stays selected, not the first same-label column"
+        );
     }
 }

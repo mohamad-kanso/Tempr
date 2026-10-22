@@ -266,8 +266,7 @@ impl SemanticEngine {
             explicit,
         } = req;
         let offset = offset.min(buffer.len());
-        let analysis = self.analyze(file, buffer);
-        let catalog = self.catalog();
+        let (analysis, catalog) = self.analyzed(file, buffer.revision(), buffer);
         complete_with(&catalog, &analysis, buffer, offset, explicit)
     }
 }

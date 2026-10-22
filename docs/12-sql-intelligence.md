@@ -92,6 +92,17 @@ impl SemanticEngine {
     /// deviation from the spec's `&BufferSnapshot` sketch).
     pub fn analyze(&self, file: SqlFileId, buffer: &mut Buffer) -> Arc<Analysis>;
 
+    /// Analysis keyed by the editor's source revision rather than the
+    /// buffer's own counter. `IntelligenceService` analyzes a mirror buffer
+    /// whose revision is unrelated to the view's, so diagnostics use this
+    /// entry point and hover/completion hit the same cached analysis.
+    pub fn analyze_at(
+        &self,
+        file: SqlFileId,
+        source_revision: u64,
+        buffer: &mut Buffer,
+    ) -> Arc<Analysis>;
+
     /// Ranked completion candidates at the cursor (stage 5). Reads the same
     /// cached analysis and the immutable catalog; no I/O.
     pub fn complete(&self, req: CompletionRequest<'_>) -> Vec<CompletionItem>;
@@ -112,14 +123,17 @@ impl SemanticEngine {
 }
 ```
 
-Two corrections to the spec's original sketch, recorded here and in the PROGRESS decisions log:
+Three corrections to the spec's original sketch, recorded here and in the PROGRESS decisions log:
 
 - **Cache key.** The spec claimed analysis caching validates by `EditId`. Undo recreates an earlier text state while reusing ids, so `EditId` cannot be the key. Tempr added `Buffer::revision` (re-assigned by every edit, undo and redo, untouched by failed edits); revision — not `EditId` — validates the cache. Revisions come from a process-wide counter, so a freshly opened `Buffer` for the same file never shares a revision with a previous instance and cannot hit its stale entry.
+- **Catalog identity.** A cache entry also records the exact `Arc<CatalogCache>` it was built against, and a hit requires `Arc::ptr_eq` with the installed catalog. `set_catalog` clears the map, but an analysis already running on another thread could otherwise re-insert an entry whose arena indices point into the retired catalog; the pointer check makes that entry a guaranteed miss.
 - **Borrow shape.** `analyze` takes `&mut Buffer`, not `&BufferSnapshot`. The workspace still has no `BufferSnapshot` type; the engine consumes the editor's `Buffer` directly, per the layout doc's grouping of editor and intelligence layers.
 
 The walk is two-phase per region so clause order cannot mislead visibility: phase A collects all of the region's bindings (CTEs in declaration order, FROM/JOIN sources, `UPDATE`/`INSERT` targets, the `DELETE` target that the grammar keeps in the statement-level `from` sibling, `LATERAL (subquery)` and `LATERAL function(…)` aliases — `lateral_join` and `lateral_cross_join` are distinct nodes) *without analyzing any subquery body*; phase B analyzes every subquery and CTE body after the region's frame is complete, so a `select`-list subquery still sees a `FROM` alias appearing later in the source. A **region is its container node** (`statement`, `subquery`, `set_operation`), not the `select` node — the grammar keeps `select`, `from`, `where`, … as siblings, so selecting only the `select` would drop every binding and predicate. `set_operation` statements scope per `select` side and its clause siblings (merging sides' bindings would invent ambiguity the server does not see). CTE bodies see only earlier CTEs; a `WITH RECURSIVE` self-reference resolves with no column knowledge and stays silent. Column qualifiers follow PostgreSQL: an alias hides the source's own name, and a schema never answers a two-part qualifier (three-part names resolve through the catalog). FROM-subquery/lateral-subquery columns derive from the body's top select list, so derived-table references are checked like any other binding.
 
 The completion, hover and definition signatures (`complete`, `hover`, `definition`) were sketched on a `&BufferSnapshot` that never materialised. Stage 5 shipped `complete` on the real `Buffer` (again `&mut`, for the analysis cache's lazy reparse) and stage 6 did the same for `hover`; `definition` remains deferred because there are no file targets yet. There is no separate snapshot type.
+
+Hover resolves the reference under the cursor against that same analysis. A bare column follows the analyzer's nearest-level rule: the innermost scope with any match decides, so an inner `id` is not reported as ambiguous with an outer `id`. A dotted path longer than a relation (`db.schema.rel.col`) qualifies the relation by its **last two** path segments, ignoring any database prefix. Byte offsets that land inside a multi-byte character produce no reference rather than slicing invalid UTF-8.
 
 ### CompletionRequest
 
@@ -140,7 +154,7 @@ pub struct CompletionRequest<'a> {
 }
 ```
 
-Multi-connection workspaces are stage 6's concern — the engine holds a single catalog today, and `IntelligenceService` will own one engine per live connection.
+Multi-connection workspaces are not solved yet: the engine holds a single catalog, and `IntelligenceService` swaps it on any connection's `SchemaRefreshed`. One engine per live connection (and gating analyses by connection) is parked in docs/TODO.md.
 
 ### CompletionItem
 

@@ -459,6 +459,39 @@ mod tests {
     }
 
     #[test]
+    fn completion_bindings_come_after_editor_and_window_bindings() {
+        // GPUI resolves a keystroke to the last matching binding, so the
+        // popup's enter/tab/escape/down/up must be registered after every
+        // binding they could shadow (the editor's, and the main window's
+        // `CancelQuery` on escape). A reordering of `core_commands` would
+        // silently break accept.
+        let specs = core_commands();
+        let mut shared = 0;
+        for (completion_index, completion) in
+            specs.iter().enumerate().filter(|(_, s)| s.context == COMPL)
+        {
+            for (earlier_index, earlier) in specs
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.context == ED || s.context == MW)
+            {
+                for key in completion.default_keystrokes {
+                    if earlier.default_keystrokes.contains(key) {
+                        shared += 1;
+                        assert!(
+                            completion_index > earlier_index,
+                            "{} ({key}) is shadowed by the earlier {}",
+                            completion.id,
+                            earlier.id
+                        );
+                    }
+                }
+            }
+        }
+        assert!(shared > 0, "the audit must actually find shared keys");
+    }
+
+    #[test]
     fn intelligence_and_schema_commands_are_reachable_by_key() {
         for id in [
             "editor::TriggerCompletion",

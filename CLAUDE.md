@@ -116,4 +116,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 — complete (2026-09-07: rope buffer + tree-sitter tree, palette + three-layer keybindings, editing ops, `EditorView`, execute-statement-under-cursor; all 8 boxes verified). Phase 3 (Intelligence) — stage 6 implemented on `feat/ph3-intelligence-ui`; interactive boxes and PR merge pending.
+Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 — complete (2026-09-07: rope buffer + tree-sitter tree, palette + three-layer keybindings, editing ops, `EditorView`, execute-statement-under-cursor; all 8 boxes verified). Phase 3 (Intelligence) — stage 6 implemented on `feat/ph3-intelligence-ui` (PR #23 review fixes applied 2026-10-22); interactive boxes and PR merge pending.
