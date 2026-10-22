@@ -292,6 +292,12 @@ Tempr's database layer is tokio-based (`tokio-postgres`, `deadpool`). The bridge
 
 `gpui_tokio` is Apache-2.0 (verified at the pinned rev, 2026-09-03) and is a direct dependency of `tempr_ui`. Tempr code calls it only through `tempr_ui::gpui_compat::spawn_tokio`.
 
+### Testing Views
+
+GPUI ships its own deterministic harness, so a `tempr_ui` view can be driven without a real window: `gpui`'s **`test-support`** feature (a dev-dependency of `tempr_ui` only) provides `#[gpui::test]`, `TestAppContext`, `TestApp`, a simulated platform and a 1920×1080 test display. `SEED` reproduces a scheduler interleaving, `ITERATIONS` sweeps them, `PENDING_TRACES=1` explains a `Parking forbidden`; no `ZED_HEADLESS` flag is needed. The skill at `.claude/skills/gpui-test/SKILL.md` carries the full workflow.
+
+Shape (see `ResultGrid::tests::wheel_axes_split_between_the_rows_and_the_columns`): wrap the view entity in a `Render` root, open the window with `cx.add_window`, **draw once** (`window.draw(cx).clear(cx)`) so hitboxes and scroll listeners exist, then dispatch real input (`ScrollWheelEvent{ delta: … }.to_platform_input()`, `simulate_mouse_move`, `simulate_keystrokes`) at a pointer position inside the element, and read state back off the entity. Cargo unifies features per package, so `test-support` also applies to `cargo bench` for `tempr_ui` — benches that must stay free of it live in their own crate.
+
 ### View ↔ Service Pattern
 
 Views never hold raw database connections, query parsers, or business-state structs. Instead, a view holds:

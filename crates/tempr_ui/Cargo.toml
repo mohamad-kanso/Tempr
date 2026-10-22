@@ -23,5 +23,12 @@ tokio.workspace                = true
 tracing.workspace              = true
 unicode-segmentation.workspace = true
 
+[dev-dependencies]
+# `test-support` supplies `#[gpui::test]`, `TestAppContext` and the simulated
+# platform (input injection, 1920x1080 test display). Cargo unifies features
+# per package, so this also applies to `cargo bench` for this crate — benches
+# that must stay free of test-support belong in their own crate (docs/TODO.md).
+gpui = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true
