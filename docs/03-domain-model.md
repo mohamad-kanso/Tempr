@@ -54,8 +54,9 @@ The structural metadata for a database. `SchemaObject` is a tagged enum with the
 | **Column** | parent object, name, data type, nullable, ordinal position, default |
 | **Index** | parent table, name, columns, unique flag, index type (btree/hash/gin/…) |
 | **Function** | schema, name, parameters (name + type), return type, language |
+| **Database** | name (the database the snapshot describes; never schema-scoped) |
 
-Schema objects are organized in a flat list attached to a `SchemaSnapshot`; the parent-child relationships are implicit (a `Column`'s `parent_id` points to its `Table` or `View`).
+Schema objects are organized in a flat list attached to a `SchemaSnapshot`; the parent-child relationships are implicit (a `Column`'s `parent_id` points to its `Table` or `View`). A `Database` has no parent and belongs to no schema, so a schema-scoped incremental splice never drops it. `SchemaObjectKind::Database` was **appended** (discriminant `5`) so existing identity derivations and cached catalogs keep their numbering (D30).
 
 ### HistoryEntry
 
@@ -270,6 +271,10 @@ pub enum SchemaObject {
         parameters: Vec<(String, String)>,
         return_type: String,
         language: String,
+    },
+    Database {
+        id: SchemaObjectId,
+        name: String,
     },
 }
 

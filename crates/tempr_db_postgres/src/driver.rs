@@ -335,6 +335,23 @@ impl DriverConnection for PostgresConnection {
         let (where_clause, binds) = scope_clause(&scope, "n", "c");
         let params = as_params(&binds);
 
+        // The database this connection is open on. Cluster-wide catalog reads
+        // are not in scope (one connection, one database), but the snapshot
+        // must be able to name the database it describes.
+        let sql = "SELECT oid::int8, datname FROM pg_database WHERE datname = current_database()";
+        for row in self
+            .client
+            .query(sql, &[])
+            .await
+            .map_err(|e| DriverError::Query(e.to_string()))?
+        {
+            let oid: i64 = row.get(0);
+            entries.push(SchemaSnapshotEntry::Database {
+                native_id: oid as u64,
+                name: row.get(1),
+            });
+        }
+
         // Tables, partitioned tables, and foreign tables. Views/materialized
         // views are queried separately below; together the two relkind lists
         // cover the same set as the column query's ('r', 'p', 'v', 'm', 'f').

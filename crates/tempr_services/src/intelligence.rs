@@ -116,6 +116,26 @@ impl IntelligenceService {
                     }
                 });
             }
+            // The server was unreachable on startup (or dropped). The cached
+            // catalog is all the intelligence features need, so install it
+            // here too: offline startup must not depend on a `Connected` event
+            // that will never arrive.
+            AppEvent::ConnectionStateChanged {
+                id,
+                state: ConnectionState::Failed | ConnectionState::Disconnected,
+            } => {
+                *self.active_connection.write() = Some(*id);
+                let Some(handle) = self.handle() else {
+                    return;
+                };
+                let weak: Weak<Self> = Arc::downgrade(self);
+                let id = *id;
+                handle.spawn(async move {
+                    if let Some(service) = weak.upgrade() {
+                        service.on_unreachable(id).await;
+                    }
+                });
+            }
             _ => {}
         }
     }
@@ -135,6 +155,24 @@ impl IntelligenceService {
                     connection,
                     message: e.to_string(),
                 });
+            }
+        }
+    }
+
+    /// No live connection: serve the persisted catalog so completion, hover
+    /// and diagnostics keep working without I/O (docs/12, exit criterion 8).
+    async fn on_unreachable(&self, connection: ConnectionId) {
+        match self.schema.load_cached(connection).await {
+            Some(snapshot) => {
+                tracing::info!(
+                    connection = %connection,
+                    objects = snapshot.objects.len(),
+                    "intelligence: offline, using cached catalog"
+                );
+                self.install_snapshot(&snapshot);
+            }
+            None => {
+                tracing::info!("intelligence: offline, no cached catalog for this connection");
             }
         }
     }
@@ -378,6 +416,44 @@ mod tests {
         let service = IntelligenceService::new(bus.clone(), schema);
         service.set_catalog(Arc::new(CatalogCache::from_snapshot(&snapshot())));
         (service, bus)
+    }
+
+    #[tokio::test]
+    async fn a_dead_connection_still_installs_the_cached_catalog() {
+        // Criterion 8's cold start: the persisted `.tcat` must reach the
+        // engine even though no `Connected` event will ever arrive.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let storage: Arc<dyn tempr_workspace::Storage> =
+            Arc::new(tempr_workspace::FileSystemStorage::new(tmp.path()));
+        storage.init_workspace_dir().await.expect("init");
+
+        let bus = Arc::new(EventBus::new());
+        let connection = ConnectionId::new();
+        let schema = SchemaService::with_cache(
+            bus.clone(),
+            crate::connection::ConnectionService::new(bus.clone()),
+            storage.clone(),
+        );
+        let cached = SchemaSnapshot {
+            connection_id: connection,
+            ..snapshot()
+        };
+        storage
+            .catalog_cache(connection)
+            .save(&cached)
+            .await
+            .expect("persist catalog");
+
+        let service = IntelligenceService::new(bus, schema);
+        service.on_unreachable(connection).await;
+
+        let mut buffer = Buffer::new(SqlFileId::new(), "select * from us");
+        let end = buffer.len();
+        let items = service.complete(&mut buffer, end, false);
+        assert!(
+            items.iter().any(|item| item.label == "users"),
+            "offline completion must work from the cached catalog"
+        );
     }
 
     #[test]

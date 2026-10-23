@@ -222,6 +222,16 @@ impl SchemaService {
 
         for entry in entries {
             match entry {
+                SchemaSnapshotEntry::Database { native_id, name } => {
+                    objects.push(SchemaObject::Database {
+                        id: SchemaObjectId::derived(
+                            connection_id,
+                            SchemaObjectKind::Database,
+                            *native_id,
+                        ),
+                        name: name.clone(),
+                    });
+                }
                 SchemaSnapshotEntry::Table {
                     native_id,
                     schema,
@@ -619,7 +629,12 @@ impl SchemaService {
             })
             .cloned()
             .collect();
-        objects.extend(refreshed);
+        // A schema-scoped `snapshot_schema` still reports the database itself
+        // (it is scope-independent), so a splice would otherwise append a
+        // second copy of the object it just kept. Ids are unique per object;
+        // the retained copy wins.
+        let mut seen: HashSet<SchemaObjectId> = objects.iter().map(SchemaObject::id).collect();
+        objects.extend(refreshed.into_iter().filter(|o| seen.insert(o.id())));
         objects
     }
 }
@@ -700,6 +715,8 @@ fn object_schema(
         } => by_id
             .get(parent_table_id)
             .and_then(|parent| object_schema(by_id, parent)),
+        // A database belongs to no schema: it survives a schema-scoped splice.
+        SchemaObject::Database { .. } => None,
     }
 }
 
@@ -790,6 +807,35 @@ mod tests {
             name: name.to_string(),
             estimated_rows: Some(42),
         }
+    }
+
+    #[test]
+    fn objects_from_entries_records_the_connected_database() {
+        let connection = ConnectionId::new();
+        let entries = vec![
+            SchemaSnapshotEntry::Database {
+                native_id: 16384,
+                name: "tempr".to_string(),
+            },
+            table_entry(16385, "public", "users"),
+        ];
+
+        let objects = SchemaService::objects_from_entries(connection, &entries);
+        let database = objects
+            .iter()
+            .find_map(|o| match o {
+                SchemaObject::Database { id, name } => Some((*id, name.clone())),
+                _ => None,
+            })
+            .expect("database object missing");
+        assert_eq!(
+            database,
+            (
+                SchemaObjectId::derived(connection, SchemaObjectKind::Database, 16384),
+                "tempr".to_string()
+            ),
+            "the database id is derived from its oid like every other kind"
+        );
     }
 
     #[test]
@@ -1146,6 +1192,30 @@ mod tests {
             objects.is_empty(),
             "superseded table must be gone: {objects:?}"
         );
+    }
+
+    #[test]
+    fn splice_does_not_duplicate_the_database_reported_by_a_schema_scoped_read() {
+        // `snapshot_schema(Schema(_))` still returns the connected database
+        // (it is not schema-scoped), so a splice of one touched schema must
+        // keep the single cached copy, not append a second.
+        let connection = ConnectionId::new();
+        let database = SchemaObject::Database {
+            id: SchemaObjectId::derived(connection, SchemaObjectKind::Database, 5),
+            name: "tempr".to_string(),
+        };
+        let cached = vec![database.clone()];
+        let refreshed = vec![database];
+
+        let objects = SchemaService::splice_objects(
+            &cached,
+            refreshed,
+            &HashSet::new(),
+            &["public".to_string()],
+        );
+
+        assert_eq!(objects.len(), 1, "database must appear once: {objects:?}");
+        assert!(matches!(objects[0], SchemaObject::Database { .. }));
     }
 
     #[test]

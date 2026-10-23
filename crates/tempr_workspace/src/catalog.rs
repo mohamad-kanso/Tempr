@@ -26,7 +26,9 @@ use crate::error::WorkspaceError;
 
 pub const CATALOG_MAGIC: [u8; 4] = *b"TCAT";
 /// Bump on ANY layout change: older readers discard what they cannot parse.
-pub const CATALOG_FORMAT_VERSION: u16 = 2;
+/// 3: `SchemaObject::Database` appended (the connected database is now part
+/// of the cached catalog).
+pub const CATALOG_FORMAT_VERSION: u16 = 3;
 const HEADER_LEN: usize = 4 + 2 + 2 + 8;
 
 /// Postcard-shaped mirror of `SchemaSnapshot` — see the module docs. Every
@@ -86,6 +88,9 @@ enum CatalogObject {
         return_type: String,
         language: String,
     },
+    /// Appended last: postcard encodes the variant index, so new variants go
+    /// at the end and existing caches keep decoding.
+    Database { id: SchemaObjectId, name: String },
 }
 
 impl From<&SchemaObject> for CatalogObject {
@@ -159,6 +164,10 @@ impl From<&SchemaObject> for CatalogObject {
                 parameters: parameters.clone(),
                 return_type: return_type.clone(),
                 language: language.clone(),
+            },
+            SchemaObject::Database { id, name } => CatalogObject::Database {
+                id: *id,
+                name: name.clone(),
             },
         }
     }
@@ -236,6 +245,7 @@ impl From<CatalogObject> for SchemaObject {
                 return_type,
                 language,
             },
+            CatalogObject::Database { id, name } => SchemaObject::Database { id, name },
         }
     }
 }
@@ -347,12 +357,18 @@ mod tests {
             connection_id: ConnectionId::new(),
             version: 7,
             fetched_at: chrono::Utc::now(),
-            objects: vec![SchemaObject::Table {
-                id: SchemaObjectId::new(),
-                schema: "public".to_string(),
-                name: "users".to_string(),
-                estimated_rows: Some(42),
-            }],
+            objects: vec![
+                SchemaObject::Database {
+                    id: SchemaObjectId::new(),
+                    name: "tempr".to_string(),
+                },
+                SchemaObject::Table {
+                    id: SchemaObjectId::new(),
+                    schema: "public".to_string(),
+                    name: "users".to_string(),
+                    estimated_rows: Some(42),
+                },
+            ],
             keywords: vec!["select".to_string()],
             fingerprints: vec![],
         }
@@ -367,7 +383,13 @@ mod tests {
             .expect("not discarded");
         assert_eq!(back.id, snapshot.id);
         assert_eq!(back.version, 7);
-        assert_eq!(back.objects.len(), 1);
+        assert_eq!(back.objects.len(), 2);
+        assert!(
+            back.objects
+                .iter()
+                .any(|o| matches!(o, SchemaObject::Database { name, .. } if name == "tempr")),
+            "the connected database survives the cache round-trip"
+        );
         assert_eq!(back.keywords, vec!["select".to_string()]);
     }
 

@@ -91,14 +91,22 @@ fn connection_from_env() -> Result<Option<Connection>> {
             .map_err(|e| anyhow::anyhow!("DATABASE_URL: {e}"))?,
         None => TlsMode::default(),
     };
+    let host = url.host_str().unwrap_or("localhost").to_string();
+    let port = url.port().unwrap_or(5432);
+    let database = decode(url.path().trim_start_matches('/'));
+    let username = decode(url.username());
+    // Stable across launches (the password deliberately is not part of the
+    // key): the `.tcat` cache is filed under this id, and an offline restart
+    // must be able to find the catalog the online session wrote.
+    let endpoint = format!("postgres://{username}@{host}:{port}/{database}");
     Ok(Some(Connection {
-        id: ConnectionId::new(),
+        id: ConnectionId::derived(&endpoint),
         name: "DATABASE_URL".to_string(),
         driver: DriverKind::Postgres,
-        host: url.host_str().unwrap_or("localhost").to_string(),
-        port: url.port().unwrap_or(5432),
-        database: decode(url.path().trim_start_matches('/')),
-        username: decode(url.username()),
+        host,
+        port,
+        database,
+        username,
         password: decode(url.password().unwrap_or("")),
         secret_ref: SecretRef {
             vault_key: "DATABASE_URL".to_string(),

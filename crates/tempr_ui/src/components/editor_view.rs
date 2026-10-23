@@ -12,10 +12,10 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point, Point as GpuiPoint, Render,
-    ScrollStrategy, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    UniformListScrollHandle, Window, actions, anchored, div, fill, point, prelude::*, px, relative,
-    rgb, size, uniform_list,
+    LayoutId, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, PaintQuad, Pixels,
+    Point, Point as GpuiPoint, Render, ScrollStrategy, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window, actions, anchored, div, fill,
+    point, prelude::*, px, relative, rgb, size, uniform_list,
 };
 use tempr_domain::SqlFileId;
 use tempr_editor::edit_ops::LineDirection;
@@ -124,6 +124,12 @@ pub struct EditorView {
     completion_anchor: Option<Point<Pixels>>,
     completion_scroll: UniformListScrollHandle,
     hover: Option<HoverCard>,
+    /// Offset under the pointer as of the last mouse move, so a stationary
+    /// pointer does not rebuild the card every frame.
+    pointer_hover_offset: Option<usize>,
+    /// The open card was opened by the pointer (not the keyboard), so a move
+    /// onto empty text may dismiss it without closing a keyboard hover.
+    hover_from_pointer: bool,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -169,6 +175,8 @@ impl EditorView {
             completion_anchor: None,
             completion_scroll: UniformListScrollHandle::new(),
             hover: None,
+            pointer_hover_offset: None,
+            hover_from_pointer: false,
         }
     }
 
@@ -539,6 +547,7 @@ impl EditorView {
             text,
             anchor: self.caret_anchor(),
         });
+        self.hover_from_pointer = false;
         cx.notify();
     }
 
@@ -812,6 +821,53 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.move_to_diagnostic(false, window, cx);
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A drag (select, scrollbar) is not a rest: do not open a card that
+        // would sit under the pointer while the selection grows.
+        if event.pressed_button.is_some() {
+            self.dismiss_pointer_hover(cx);
+            return;
+        }
+        let offset = self.offset_for_position(event.position);
+        if offset == self.pointer_hover_offset {
+            return;
+        }
+        self.pointer_hover_offset = offset;
+        let Some(offset) = offset else {
+            self.dismiss_pointer_hover(cx);
+            return;
+        };
+        let Some(HoverInfo { contents, .. }) = self.intelligence.hover(&mut self.buffer, offset)
+        else {
+            self.dismiss_pointer_hover(cx);
+            return;
+        };
+        self.hover = Some(HoverCard {
+            text: contents,
+            anchor: Some(point(
+                event.position.x + px(12.),
+                event.position.y + px(18.),
+            )),
+        });
+        self.hover_from_pointer = true;
+        cx.notify();
+    }
+
+    fn on_mouse_exit(&mut self, _: &MouseExitEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_pointer_hover(cx);
+    }
+
+    /// Close only a card the pointer opened: moving off an identifier must not
+    /// take away a card the reader asked for by keystroke.
+    fn dismiss_pointer_hover(&mut self, cx: &mut Context<Self>) {
+        self.pointer_hover_offset = None;
+        if self.hover_from_pointer {
+            self.hover = None;
+            self.hover_from_pointer = false;
+            cx.notify();
+        }
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1229,6 +1285,8 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::next_diagnostic))
             .on_action(cx.listener(Self::previous_diagnostic))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_exit(cx.listener(Self::on_mouse_exit))
             .size_full()
             .bg(rgb(theme::SURFACE))
             .text_size(px(FONT_SIZE))
@@ -1867,6 +1925,54 @@ mod view_tests {
             editor.read_with(cx, |editor, _| editor.primary().head),
             9,
             "the click lands after `id`"
+        );
+    }
+
+    /// The pointer resting on a reference opens the same card the keyboard
+    /// command produces (exit criterion 7's "cursor rests").
+    #[gpui::test]
+    fn resting_the_pointer_on_a_reference_opens_the_hover_card(cx: &mut TestAppContext) {
+        let (editor, window) = setup(cx, "select id from users");
+        let focus = editor.read_with(cx, |editor, cx| editor.focus_handle(cx));
+        cx.update_window(window, |_, window, cx| {
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        // Read the painted box of `id` via the caret, then park the caret away.
+        for _ in 0..9 {
+            press(cx, window, "right");
+        }
+        let caret = editor.read_with(cx, |editor, _| editor.caret_bounds().expect("caret box"));
+        press(cx, window, "ctrl-home");
+
+        let position = gpui::point(caret.left() + gpui::px(1.), caret.center().y);
+        let mut visual = VisualTestContext::from_window(window, cx);
+        visual.simulate_mouse_move(position, None::<MouseButton>, Modifiers::default());
+
+        let (text, anchor) = editor.read_with(cx, |editor, _| {
+            let card = editor.hover.as_ref().expect("pointer hover card");
+            (card.text.clone(), card.anchor)
+        });
+        assert!(
+            text.contains("public.users.id"),
+            "the card describes the column under the pointer: {text}"
+        );
+        assert_eq!(
+            anchor,
+            Some(gpui::point(
+                position.x + gpui::px(12.),
+                position.y + gpui::px(18.)
+            )),
+            "the card is anchored beside the pointer, not the caret"
+        );
+
+        // A drag is not a rest.
+        visual.simulate_mouse_move(position, Some(MouseButton::Left), Modifiers::default());
+        assert!(
+            editor.read_with(cx, |editor, _| editor.hover.is_none()),
+            "dragging dismisses the pointer card"
         );
     }
 }
