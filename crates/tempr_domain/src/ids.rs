@@ -36,6 +36,23 @@ uuid_id!(SchemaSnapshotId);
 uuid_id!(HistoryEntryId);
 uuid_id!(PluginId);
 
+/// Namespace for `ConnectionId::derived`: a fixed Tempr-specific UUID so a
+/// derived id never collides with a `uuid::Uuid::new_v5` in another namespace.
+const CONNECTION_NAMESPACE: Uuid =
+    Uuid::from_u128(0x54_45_4d_50_52_00_00_00_80_00_00_00_00_00_00_01);
+
+impl ConnectionId {
+    /// A connection id derived from an endpoint key (user, host, port,
+    /// database) instead of a random UUID. The `DATABASE_URL` stand-in
+    /// uses it so the same URL maps to the same catalog cache file across
+    /// launches — without this, a restart while the server is unreachable
+    /// cannot find the `.tcat` it wrote last session. Persisted workspace
+    /// connections keep their stored random id (docs/04-workspace.md).
+    pub fn derived(key: &str) -> Self {
+        Self(Uuid::new_v5(&CONNECTION_NAMESPACE, key.as_bytes()))
+    }
+}
+
 impl SchemaObjectId {
     /// Identity derived from the database engine's own identifier, stable
     /// across refreshes, restarts and renames.
@@ -107,6 +124,24 @@ mod tests {
         assert_ne!(
             SchemaObjectId::derived(conn, SchemaObjectKind::Table, 16384),
             SchemaObjectId::derived(conn, SchemaObjectKind::Table, 16385)
+        );
+    }
+
+    #[test]
+    fn derived_connection_ids_are_stable_and_endpoint_specific() {
+        let a = ConnectionId::derived("postgres://tempr@localhost:55432/tempr");
+        assert_eq!(
+            a,
+            ConnectionId::derived("postgres://tempr@localhost:55432/tempr"),
+            "the same endpoint must map to the same cache file every launch"
+        );
+        assert_ne!(
+            a,
+            ConnectionId::derived("postgres://tempr@localhost:55432/other")
+        );
+        assert_ne!(
+            a,
+            ConnectionId::derived("postgres://tempr@localhost:55433/tempr")
         );
     }
 

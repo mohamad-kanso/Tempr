@@ -170,7 +170,7 @@ A `.tcat` file is a fixed 16-byte header followed by a `postcard` body:
 | Bytes | Field | Meaning |
 |---|---|---|
 | 0–3 | magic | `b"TCAT"` |
-| 4–5 | version (`u16`, LE) | `CATALOG_FORMAT_VERSION` (currently `2`), bumped on any layout change |
+| 4–5 | version (`u16`, LE) | `CATALOG_FORMAT_VERSION` (currently `3`), bumped on any layout change |
 | 6–7 | flags (`u16`, LE) | reserved, currently `0` |
 | 8–15 | content hash (`u64`, LE) | FNV-1a over the body bytes |
 | 16.. | body | `postcard::to_allocvec`/`from_bytes` encoding of a private `CatalogSnapshot` mirror |

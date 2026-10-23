@@ -136,6 +136,8 @@ The completion, hover and definition signatures (`complete`, `hover`, `definitio
 
 Hover resolves the reference under the cursor against that same analysis. A bare column follows the analyzer's nearest-level rule: the innermost scope with any match decides, so an inner `id` is not reported as ambiguous with an outer `id`. A dotted path longer than a relation (`db.schema.rel.col`) qualifies the relation by its **last two** path segments, ignoring any database prefix. Byte offsets that land inside a multi-byte character produce no reference rather than slicing invalid UTF-8.
 
+`EditorView` triggers hover two ways: the `editor::Hover` command (`ctrl-k ctrl-i`) resolves the word at the caret and anchors the card below the caret line, and a stationary pointer opens the same card for the reference under the mouse (`on_mouse_move`, anchored 12 px right / 18 px down from the pointer). A pointer-opened card is dismissed when the pointer leaves the reference or the window and is not opened while a drag is in progress; a keyboard-opened card is never dismissed by pointer movement, so reading a card it asked for is not disrupted when the mouse passes over empty text.
+
 ### CompletionRequest
 
 The input to the completion pipeline. Constructed by `IntelligenceService` on every completion trigger (an identifier character or qualifier dot, or an explicit `ctrl-space` request). **Shipped shape (stage 5):**
@@ -457,6 +459,8 @@ classDiagram
 
 The catalog cache is an immutable, resolution-shaped arena built from one `SchemaSnapshot` (`CatalogCache::from_snapshot`): relations first, then functions, then columns grouped contiguously per relation in `ordinal` order, then indexes — every map holds `u32` arena indices, so "columns of this table" is a slice, not a scan. An unquoted SQL identifier folds to lower case (the `*_folded` lookups return a candidate list — coexisting `users` and quoted `"Users"` is ambiguity the *analyzer* reports, never guessed in the cache); a quoted identifier matches through the case-sensitive `*_exact` lookups. `prefix_search` runs over relation and function names via binary search on the folded `name_order`, capped with an overflow flag for the completion top-N heap. The structure is rebuilt wholesale per refresh and swapped behind an `Arc` when the `SemanticEngine` is told to `set_catalog`; readers never see a half-updated catalog. Probe numbers live in `PROGRESS.md`'s session log: on a ~10 000-object synthetic catalog, the request-shape mix (`prefix_search` + `relation_folded` + `columns_of` + `column_folded`) costs p95 ≈ 0.002 ms — far inside the < 5 ms completion budget it shares with context classification, ranking and rendering.
 
+`SchemaObject::Database` is the one snapshot entry with **no arena slot**: it names the catalog the cache describes, and SQL text cannot resolve a database, so it must never become a completion candidate or hover target. The snapshot still carries it (`.tcat` format version 3), and a schema-scoped splice keeps exactly one copy because a database belongs to no schema.
+
 ## Completion Pipeline
 
 The completion pipeline is the most latency-sensitive path in the entire system. It runs on every completing keystroke (no debounce) and must return results before the user perceives a delay.
@@ -511,18 +515,18 @@ The <5 ms completion budget is a **hard requirement**, not a soft target. It is 
 | **No I/O on the request path** | The completion pipeline never performs disk reads, network calls, or subprocess invocations. All data sources (catalog, keyword list, analysis) are pre-loaded and held in memory. Schema refresh happens asynchronously in the background; completion reads a consistent `Arc` snapshot. |
 | **Cached analysis** | `analyze` runs once per `Buffer::revision` and is cached per `SqlFileId`; a completion request after the first keystroke is an integer compare plus candidate generation. (Whole-buffer re-analysis per edit, not incremental regions — the revision cache is what keeps the request path cheap.) |
 
-Measured budget breakdown for a typical completion request (release, synthetic 10 000-object catalog — 1 200 relations × 8 columns, 1 200 indexes, 800 functions; stage-5 probe, 40 warm runs per case):
+Measured budget breakdown for a typical completion request (release, synthetic 10 000-object catalog — 1 200 relations × 8 columns, 1 200 indexes, 800 functions; probe, 40 warm runs per case, 2026-10-23):
 
 | Case | p50 | p95 | p99 | max |
 |---|---|---|---|---|
-| Relation prefix (200 of 1 200 relations) | 0.070 ms | 0.081 ms | 0.091 ms | 0.091 ms |
-| Expression column prefix | 0.002 ms | 0.002 ms | 0.003 ms | 0.003 ms |
-| Qualifier dot (one binding's columns) | 0.008 ms | 0.009 ms | 0.010 ms | 0.010 ms |
-| Schema dot (all relations of a schema) | 1.109 ms | 1.125 ms | 1.138 ms | 1.138 ms |
-| ctrl-space, empty relation prefix | 0.004 ms | 0.005 ms | 0.010 ms | 0.010 ms |
-| Function prefix | 0.004 ms | 0.005 ms | 0.005 ms | 0.005 ms |
+| Relation prefix (200 of 1 200 relations) | 0.066 ms | 0.071 ms | 0.083 ms | 0.083 ms |
+| Expression column prefix | 0.010 ms | 0.011 ms | 0.015 ms | 0.015 ms |
+| Qualifier dot (one binding's columns) | 0.017 ms | 0.019 ms | 0.024 ms | 0.024 ms |
+| Schema dot (all relations of a schema) | 0.883 ms | 0.910 ms | 0.972 ms | 0.972 ms |
+| ctrl-space, empty relation prefix | 0.006 ms | 0.006 ms | 0.007 ms | 0.007 ms |
+| Function prefix | 0.007 ms | 0.007 ms | 0.012 ms | 0.012 ms |
 
-Cold (first request per buffer, including the parse + analysis) stayed under 1.7 ms in every case. The **< 5 ms** budget holds with margin; the schema-dot case is the heaviest because it materialises every relation of the schema before ranking.
+Cold (first request per buffer, including the parse + analysis) stayed under 1.3 ms in every case; 500 statements typed one keystroke at a time stayed at p99 2.798 ms. The **< 5 ms** budget holds with margin, and the probe **asserts** it (cold and warm p99 per case, plus the typing p99) rather than only printing it — a regression fails the release test. The schema-dot case is the heaviest because it materialises every relation of the schema before ranking.
 
 If profiling reveals that any stage consistently exceeds its budget, the engine must be optimized — the budget is not negotiable.
 
@@ -565,7 +569,7 @@ When a `SchemaRefreshed` event arrives:
 
 3. **Next completion request** uses the new catalog. The transition is seamless — the user sees no flicker or interruption.
 
-On `ConnectionStateChanged { Connected }` the service loads the persisted `.tcat` cache first (offline catalog before the network), then runs `refresh_incremental`. A failed refresh publishes `SchemaRefreshFailed` and leaves the previous catalog installed. The UI's `schema::Refresh`, `schema::RefreshIncremental` and `schema::RefreshAllSchemas` commands run the same service paths on tokio and report object counts or the refresh path in the status bar.
+On `ConnectionStateChanged { Connected }` the service loads the persisted `.tcat` cache first (offline catalog before the network), then runs `refresh_incremental`. A failed refresh publishes `SchemaRefreshFailed` and leaves the previous catalog installed. `ConnectionStateChanged { Failed | Disconnected }` — the cold start where the server is unreachable — installs the same cached catalog, so completion, hover and diagnostics work with no live connection at all; the `DATABASE_URL` stand-in derives its `ConnectionId` from the endpoint so a restart finds the cache the previous session wrote (D30). The UI's `schema::Refresh`, `schema::RefreshIncremental` and `schema::RefreshAllSchemas` commands run the same service paths on tokio and report object counts or the refresh path in the status bar.
 
 ---
 

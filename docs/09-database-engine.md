@@ -52,7 +52,7 @@ Three approaches exist for moving data from the database wire to the UI:
 
 The schema metadata pipeline is pull-based and cached rather than querying the database on every completion request:
 
-- **Pull-based:** `SchemaService` calls `DriverConnection::snapshot_schema` explicitly, not on every keystroke. The snapshot is a point-in-time copy of the database's table/view/column structure.
+- **Pull-based:** `SchemaService` calls `DriverConnection::snapshot_schema` explicitly, not on every keystroke. The snapshot is a point-in-time copy of the connected database and its table/view/column structure.
 - **Cached:** The snapshot is written to the catalog cache on disk (see [07-storage.md](07-storage.md)) and held in memory by `SchemaService`. The completion engine reads from the in-memory snapshot — never from the live database.
 
 This eliminates two classes of problem:
@@ -313,6 +313,10 @@ pub enum SchemaScope {
 /// the `native_id` discussion under `DriverConnection` above.
 #[derive(Debug, Clone)]
 pub enum SchemaSnapshotEntry {
+    /// The database this connection is open on (`pg_database` where
+    /// `datname = current_database()`). Scope-independent: even a
+    /// schema-scoped read reports it.
+    Database { native_id: u64, name: String },
     Table { native_id: u64, schema: String, name: String, estimated_rows: Option<u64> },
     View { native_id: u64, schema: String, name: String, definition: String },
     Column {

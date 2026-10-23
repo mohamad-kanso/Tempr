@@ -13,6 +13,9 @@ pub enum SchemaObjectKind {
     Column,
     Index,
     Function,
+    /// The database the catalog describes. Not resolvable from SQL text; it
+    /// gives the cache an identity beyond the connection.
+    Database,
 }
 
 impl SchemaObjectKind {
@@ -25,6 +28,7 @@ impl SchemaObjectKind {
             SchemaObjectKind::Column => 2,
             SchemaObjectKind::Index => 3,
             SchemaObjectKind::Function => 4,
+            SchemaObjectKind::Database => 5,
         }
     }
 }
@@ -95,6 +99,10 @@ pub enum SchemaObject {
         return_type: String,
         language: String,
     },
+    Database {
+        id: SchemaObjectId,
+        name: String,
+    },
 }
 
 impl SchemaObject {
@@ -104,7 +112,8 @@ impl SchemaObject {
             | SchemaObject::View { id, .. }
             | SchemaObject::Column { id, .. }
             | SchemaObject::Index { id, .. }
-            | SchemaObject::Function { id, .. } => *id,
+            | SchemaObject::Function { id, .. }
+            | SchemaObject::Database { id, .. } => *id,
         }
     }
 
@@ -115,6 +124,7 @@ impl SchemaObject {
             SchemaObject::Column { .. } => SchemaObjectKind::Column,
             SchemaObject::Index { .. } => SchemaObjectKind::Index,
             SchemaObject::Function { .. } => SchemaObjectKind::Function,
+            SchemaObject::Database { .. } => SchemaObjectKind::Database,
         }
     }
 }
@@ -194,6 +204,19 @@ mod tests {
         let back: SchemaSnapshot = serde_json::from_str(json).expect("deserialize");
         assert!(back.keywords.is_empty());
         assert!(back.fingerprints.is_empty());
+    }
+
+    #[test]
+    fn database_is_its_own_kind() {
+        let obj = SchemaObject::Database {
+            id: SchemaObjectId::new(),
+            name: "tempr".to_string(),
+        };
+        assert_eq!(obj.kind(), SchemaObjectKind::Database);
+        assert_eq!(SchemaObjectKind::Database.discriminant(), 5);
+        // Appending a kind must not renumber the ones already on disk.
+        assert_eq!(SchemaObjectKind::Table.discriminant(), 0);
+        assert_eq!(SchemaObjectKind::Function.discriminant(), 4);
     }
 
     #[test]

@@ -155,6 +155,11 @@ pub struct SchemaFingerprint {
 /// `SchemaFingerprint` — and must never key on `native_id` alone.
 #[derive(Debug, Clone)]
 pub enum SchemaSnapshotEntry {
+    /// The database the connection is open on (`pg_database.oid`). Recorded
+    /// so the catalog cache names the database it describes; the engine's
+    /// other databases are out of scope until a workspace holds more than
+    /// one live connection.
+    Database { native_id: u64, name: String },
     Table {
         native_id: u64,
         schema: String,

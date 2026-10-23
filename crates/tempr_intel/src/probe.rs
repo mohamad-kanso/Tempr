@@ -119,6 +119,20 @@ fn ms(d: std::time::Duration) -> String {
     format!("{:.3} ms", d.as_secs_f64() * 1e3)
 }
 
+/// The spec's hard budget (12-sql-intelligence §8, exit criterion 4). The
+/// probe used to print timings and assert nothing; a regression that doubled
+/// every request would have gone unnoticed.
+const COMPLETION_BUDGET: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn assert_budget(label: &str, what: &str, d: std::time::Duration) {
+    assert!(
+        d < COMPLETION_BUDGET,
+        "{label}: {what} {} exceeds the {} budget",
+        ms(d),
+        ms(COMPLETION_BUDGET)
+    );
+}
+
 fn report(label: &str, times: Vec<std::time::Duration>) {
     let (p50, p95, p99, max) = percentiles(times);
     println!(
@@ -282,6 +296,8 @@ fn probe_completion_latency() {
             ms(p99),
             ms(max)
         );
+        assert_budget(label, "cold", cold);
+        assert_budget(label, "warm p99", p99);
     }
 
     let mut typing_sql = String::new();
@@ -317,4 +333,5 @@ fn probe_completion_latency() {
         ms(p99),
         ms(max)
     );
+    assert_budget("per-keystroke typing", "p99", p99);
 }

@@ -16,6 +16,10 @@
 //! `Vec<Range<u32>>` indexed by relation arena index rather than a
 //! `HashMap` — relation indices are dense `0..n_relations`, so the vector
 //! needs no hashing on the hot path. No public shape changes.
+//!
+//! `SchemaObject::Database` is recorded in the snapshot but deliberately has
+//! no arena slot: it names the catalog, and SQL text cannot resolve a
+//! database, so it must never become a candidate or a hover target.
 
 use std::ops::Range;
 use std::time::Instant;

@@ -142,8 +142,34 @@ fn names_from(obj: &SchemaObject) -> &str {
         | SchemaObject::View { name, .. }
         | SchemaObject::Column { name, .. }
         | SchemaObject::Index { name, .. }
-        | SchemaObject::Function { name, .. } => name,
+        | SchemaObject::Function { name, .. }
+        | SchemaObject::Database { name, .. } => name,
     }
+}
+
+#[test]
+fn the_connected_database_is_cached_but_never_resolvable() {
+    // The snapshot records which database it describes; the arena indexes
+    // only what SQL text can name, so a database must not become a candidate.
+    let mut snap = simple_snapshot();
+    let database_id = SchemaObjectId::new();
+    snap.objects.push(SchemaObject::Database {
+        id: database_id,
+        name: "tempr".to_string(),
+    });
+    let cache = CatalogCache::from_snapshot(&snap);
+
+    assert_eq!(
+        cache.len(),
+        snap.objects.len() - 1,
+        "database is not an arena entry"
+    );
+    assert!(
+        cache.by_id(database_id).is_none(),
+        "the database has no arena slot"
+    );
+    let (items, _truncated) = cache.prefix_search("tem", 10);
+    assert!(items.is_empty(), "no relation or function named 'tempr'");
 }
 
 // Task 2/3 tests follow in the same order as the implementation plan.

@@ -364,6 +364,19 @@ async fn pg_schema_refresh() {
 
     assert!(snapshot.version >= 1);
 
+    let database = snapshot
+        .objects
+        .iter()
+        .find_map(|o| match o {
+            tempr_domain::SchemaObject::Database { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .expect("the connected database must be recorded in the snapshot");
+    assert!(
+        !database.is_empty(),
+        "snapshot names the connected database"
+    );
+
     let find_table = |snap: &tempr_domain::SchemaSnapshot| {
         snap.objects
             .iter()
