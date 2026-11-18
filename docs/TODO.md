@@ -75,6 +75,9 @@
 - [ ] Phase 4: Query history panel
 - [ ] Phase 4: Layout persistence across restarts
 - [ ] Phase 4: Platform-native packaging (.deb, .rpm, AppImage, .dmg, MSI)
+- [ ] Dock follow-ups from the Phase 4 spec: drag handles, split panes inside the dock, floating panels; plugin-contributed keymap contexts beyond `MainWindow`; per-plugin settings UI
+- [ ] `ResultRenderer` ships wired but with no shipped consumer (Phase 4 stage 1) — the demo plugin adds panel + completion only. Give it a real consumer (a JSON one-line pretty renderer, `bytea` hex) when a column type actually benefits
+- [ ] History: age-based retention (07-storage open question 2 — v1 caps at 10 000 rows instead), search ranking, and a cross-workspace history question that stays deferred
 - [ ] Resolve Open Decisions #1 (name/branding), #3 (telemetry), #4 (beta timing) before Phase 4
 - [ ] Declare the plugin API `1.0` when the user judges it ready — user sign-off, not a Phase 4 exit consequence (→ D31). Until then it stays `0.x` and may break without a compatibility path
 - [ ] SSH tunnel connections (user request 2026-09-03; sketched in 09-database-engine.md "SSH tunnels"): `ConnectionConfig` gains optional `ssh_host`/`ssh_port`/`ssh_user`/`ssh_key_ref`; `ConnectionService`'s `DriverManager::create` establishes the tunnel (keepalive/reconnect owned by the service) and hands the tunneled stream to the driver, TLS composing inside it; needs a pure-Rust SSH client crate (`russh` candidate → DECISIONS entry), key/passphrase via the keychain path, and a per-bastion vs per-connection tunnel decision
