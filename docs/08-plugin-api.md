@@ -103,9 +103,9 @@ The `capabilities` list is advisory — it enables early discovery (the host can
 
 ### API Versioning
 
-The host owns the API version; a plugin's `version` field stays that plugin's own release version. The `tempr_plugin` crate exposes the current API version as a `(major, minor)` pair and keeps it at `0.x` for the whole of Phase 4, when the surface may change without a compatibility guarantee. It becomes `1.0` at Phase 4 exit — gated on the out-of-tree demo plugin (panel + completion provider) shipping against it unmodified. From `1.0` on, changes within a major version are additive only; removing or changing a signature bumps the major.
+The host owns the API version; a plugin's `version` field stays that plugin's own release version. The `tempr_plugin` crate exposes the current API version as a `(major, minor)` pair and reports `0.x` for the whole of Phase 4 — and beyond it, until the user explicitly declares the API ready. Finishing every Phase 4 exit criterion does **not** bump it, and neither does the demo plugin shipping: `0.x` means the surface may change without a compatibility guarantee. The sign-off version is `1.0`; from then on, changes within a major version are additive only, and removing or changing a signature bumps the major (→ D31).
 
-The stable surface is exactly what `tempr_plugin` re-exports. Nothing in `tempr_services` or `tempr_ui` is plugin API, so those crates may churn freely. v1 plugins are static (compiled into the binary), so a version mismatch cannot arise in practice; activation still compares the plugin's declared API major against the host's and rejects a mismatch with a typed `PluginError`, so the check is in place before dynamic loading exists (→ D31).
+The surface that becomes stable is exactly what `tempr_plugin` re-exports. Nothing in `tempr_services` or `tempr_ui` is plugin API, so those crates may churn freely. v1 plugins are static (compiled into the binary), so a version mismatch cannot arise in practice; activation still compares the plugin's declared API major against the host's and rejects a mismatch with a typed `PluginError`, so the check is in place before dynamic loading exists.
 
 ### Root Plugin Trait
 

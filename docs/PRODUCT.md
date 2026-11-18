@@ -61,7 +61,7 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 - AC: Completion popup appears in < 5 ms on a cold (no revalidation) catalog with 10,000 objects. Typing an unknown column reference produces a diagnostic underline.
 
 ### 5. Extensibility & Polish (Phase 4)
-- 🔜 Plugin API versioned from its first release (`0.x` while Phase 4 is in progress) and declared stable at `1.0` once the out-of-tree demo plugin proves it; documented, backward-compatible within major versions
+- 🔜 Plugin API versioned from its first release and kept at `0.x` — stability (`1.0`) is declared only when the user says the API is ready, not by finishing Phase 4; documented, backward-compatible within major versions from that point
 - 🔜 Core features migratable to plugin API as reference implementations
 - 🔜 Theme system supports light and dark themes with configurable accent colors
 - 🔜 Query history persisted and browsable via a dedicated UI panel
