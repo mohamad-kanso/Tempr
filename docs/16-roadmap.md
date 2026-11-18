@@ -186,13 +186,13 @@ RFCs are stored in `rfc/` and linked from this document. The team reviews RFCs a
 **Documents**: [08 — Plugin API](./08-plugin-api.md), [04 — Workspace Model (remaining surface)](./04-workspace.md), [07 — Storage (remaining surface)](./07-storage.md)
 
 **Exit criteria**:
-- Plugin API is declared stable: versioned, documented, and backward-compatible within major versions.
+- Plugin API is versioned and documented from its first release and stays `0.x` through Phase 4; `1.0` (and with it the backward-compatibility guarantee within a major version) is declared only on explicit user sign-off, tracked outside the phase checklist.
 - Core features that can be implemented as plugins (e.g., custom result formatters, export commands) are migrated onto the plugin API as reference implementations.
 - Theme system supports light and dark themes with configurable accent colors; at least one default theme ships.
 - Query history is persisted and browsable via a dedicated UI panel.
 - Layout state (panel sizes, open files, cursor positions) persists across application restarts.
 - A third-party-style plugin (developed outside the core crate) adds a working panel and a completion provider using only the public API.
-- Packaging produces platform-native bundles (`.deb`, `.rpm`, `.dmg`, `.exe`) with correct icons and metadata.
+- Packaging produces platform-native bundles (`.deb`, `.rpm`, `.dmg`, `.msi`) with correct icons and metadata.
 - A static plugin adds a custom panel and registers a completion provider; both work without modification to core crates.
 
 **Demo**: Install a third-party static plugin. It adds a panel visible in the layout and provides completion suggestions in the editor. No core code was modified to support it.
@@ -211,7 +211,7 @@ All four phases must be complete. Additionally, the following aggregate criteria
 | **Keyboard-first audit** | Every user-facing action has a keybinding; no action requires a mouse | Full audit table published in the release notes. |
 | **Docs 01–16** | All architecture documents match shipped behavior | Each document reviewed against the implementation; deviations recorded and linked. |
 | **Cross-platform** | Linux, macOS, Windows builds pass CI and manual smoke tests | No platform-specific regressions in editor, driver, or result grid. |
-| **Plugin API stability** | At least one external plugin ships against the stable API without core modifications | Demonstrated by the Phase 4 demo plugin. |
+| **Plugin API proven** | At least one external plugin ships against the published API without core modifications | Demonstrated by the Phase 4 demo plugin. `1.0` is a separate explicit sign-off (→ D31), so this row does not require the API to be declared stable |
 | **No known P0 bugs** | Zero open issues classified as P0 (data loss, crash, security) | Tracked in the issue tracker at release time. |
 
 ---
