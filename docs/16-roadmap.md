@@ -186,13 +186,13 @@ RFCs are stored in `rfc/` and linked from this document. The team reviews RFCs a
 **Documents**: [08 — Plugin API](./08-plugin-api.md), [04 — Workspace Model (remaining surface)](./04-workspace.md), [07 — Storage (remaining surface)](./07-storage.md)
 
 **Exit criteria**:
-- Plugin API is declared stable: versioned, documented, and backward-compatible within major versions.
+- Plugin API is declared stable: versioned from its first release (`0.x` during Phase 4, `1.0` at Phase 4 exit once the out-of-tree demo plugin proves it), documented, and backward-compatible within major versions.
 - Core features that can be implemented as plugins (e.g., custom result formatters, export commands) are migrated onto the plugin API as reference implementations.
 - Theme system supports light and dark themes with configurable accent colors; at least one default theme ships.
 - Query history is persisted and browsable via a dedicated UI panel.
 - Layout state (panel sizes, open files, cursor positions) persists across application restarts.
 - A third-party-style plugin (developed outside the core crate) adds a working panel and a completion provider using only the public API.
-- Packaging produces platform-native bundles (`.deb`, `.rpm`, `.dmg`, `.exe`) with correct icons and metadata.
+- Packaging produces platform-native bundles (`.deb`, `.rpm`, `.dmg`, `.msi`) with correct icons and metadata.
 - A static plugin adds a custom panel and registers a completion provider; both work without modification to core crates.
 
 **Demo**: Install a third-party static plugin. It adds a panel visible in the layout and provides completion suggestions in the editor. No core code was modified to support it.

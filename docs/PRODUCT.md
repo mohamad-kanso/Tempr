@@ -61,13 +61,13 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 - AC: Completion popup appears in < 5 ms on a cold (no revalidation) catalog with 10,000 objects. Typing an unknown column reference produces a diagnostic underline.
 
 ### 5. Extensibility & Polish (Phase 4)
-- 🔜 Plugin API declared stable: versioned, documented, backward-compatible within major versions
+- 🔜 Plugin API versioned from its first release (`0.x` while Phase 4 is in progress) and declared stable at `1.0` once the out-of-tree demo plugin proves it; documented, backward-compatible within major versions
 - 🔜 Core features migratable to plugin API as reference implementations
 - 🔜 Theme system supports light and dark themes with configurable accent colors
 - 🔜 Query history persisted and browsable via a dedicated UI panel
 - 🔜 Layout state (panel sizes, open files, cursor positions) persists across restarts
 - 🔜 A third-party-style plugin adds a working panel and completion provider using only the public API
-- 🔜 Platform-native bundles for Linux (.deb, .rpm, AppImage), macOS (.dmg), Windows (MSI)
+- 🔜 Platform-native bundles for Linux (.deb, .rpm, AppImage), macOS (.dmg), Windows (MSI installer — not a bare `.exe`)
 - AC: A plugin developed outside the core crates installs, activates its panel, and provides completions without modifying any core file.
 
 ## Platform & constraints
