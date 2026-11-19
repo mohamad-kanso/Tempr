@@ -5934,6 +5934,8 @@ dependencies = [
  "tempr_db_postgres",
  "tempr_domain",
  "tempr_events",
+ "tempr_plugin",
+ "tempr_plugin_export_csv",
  "tempr_services",
  "tempr_ui",
  "tempr_workspace",
@@ -5968,6 +5970,8 @@ dependencies = [
  "serde_json",
  "tempr_db",
  "tempr_domain",
+ "tempr_events",
+ "tempr_plugin",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
@@ -6031,6 +6035,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempr_plugin_export_csv"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "tempfile",
+ "tempr_plugin",
+]
+
+[[package]]
 name = "tempr_services"
 version = "0.1.0"
 dependencies = [
@@ -6068,6 +6081,7 @@ dependencies = [
  "tempr_editor",
  "tempr_events",
  "tempr_intel",
+ "tempr_plugin",
  "tempr_services",
  "tokio",
  "tracing",

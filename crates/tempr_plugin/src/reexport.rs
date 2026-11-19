@@ -12,3 +12,5 @@ pub use gpui::{
 pub use tempr_db::{
     DatabaseDriver, DriverConnection, DriverError, EngineId, QueryStream, SchemaScope,
 };
+pub use tempr_domain;
+pub use tempr_events;

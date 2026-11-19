@@ -305,7 +305,7 @@ mod tests {
 
     fn setup(cx: &mut TestAppContext) -> Fixture {
         let service = CommandService::new(Arc::new(EventBus::new()));
-        cx.update(|cx| commands::install(cx, &service));
+        cx.update(|cx| commands::install(cx, &service, &[]));
         let root = cx.add_window(|window, cx| {
             let palette = cx.new(|cx| Palette::new(service, window, cx));
             let focus = cx.focus_handle();

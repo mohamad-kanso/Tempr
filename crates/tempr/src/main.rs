@@ -8,15 +8,16 @@ use std::sync::Arc;
 use tracing::{Level, debug, error, info};
 use tracing_subscriber::FmtSubscriber;
 
-use tempr_db::DatabaseDriver;
-use tempr_db_postgres::PostgresDriver;
+use tempr_db::EngineId;
 use tempr_domain::{Connection, ConnectionId, DriverKind, SecretRef, TlsMode};
 use tempr_events::{AppEventKind, EventBus, EventFilter};
 use tempr_services::{
-    CommandService, ConnectionService, IntelligenceService, QueryService, SchemaService,
-    ServiceRegistry,
+    CommandService, ConnectionService, IntelligenceService, PluginService, QueryService,
+    SchemaService, ServiceRegistry,
 };
 use tempr_ui::{DevOptions, Services, gpui_compat};
+
+mod plugins;
 
 /// Everything the UI needs a handle to. Built before GPUI starts. The
 /// registry owns start/stop ordering: connection → query → schema; `stop_all`
@@ -29,9 +30,10 @@ struct AppServices {
     command: Arc<CommandService>,
     schema: Arc<SchemaService>,
     intelligence: Arc<IntelligenceService>,
+    plugin: Arc<PluginService>,
 }
 
-fn build_services() -> AppServices {
+fn build_services() -> Result<AppServices> {
     let bus = Arc::new(EventBus::new());
     let registry = ServiceRegistry::new();
 
@@ -47,17 +49,41 @@ fn build_services() -> AppServices {
     let schema = SchemaService::with_cache(bus.clone(), connection.clone(), storage);
     let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
     let command = CommandService::new(bus.clone());
+    let plugin = PluginService::new(bus.clone(), command.clone());
 
-    let pg_driver = Arc::new(PostgresDriver::new()) as Arc<dyn DatabaseDriver>;
-    connection.register_driver(pg_driver);
+    // Plugins activate before anything asks them for a capability: the
+    // completion providers are attached to the engine, then the driver is
+    // resolved. A missing driver is a startup failure, never a silent
+    // no-driver state.
+    let report = plugin.activate_all(plugins::static_plugins());
+    for (id, message) in &report.failed {
+        error!(plugin = %id, error = %message, "plugin failed to activate");
+    }
+    info!(
+        activated = report.activated.len(),
+        failed = report.failed.len(),
+        api = ?report.active_version,
+        "plugins activated"
+    );
+    intelligence.set_completion_providers(plugin.completion_providers());
+
+    let engine = EngineId(POSTGRES_ENGINE.to_string());
+    let Some(driver) = plugin.driver(&engine) else {
+        anyhow::bail!(
+            "no plugin provides the {POSTGRES_ENGINE} driver (activation report: {:?})",
+            report.failed
+        );
+    };
+    connection.register_driver(driver);
 
     registry.register(connection.clone());
     registry.register(query.clone());
     registry.register(schema.clone());
     registry.register(intelligence.clone());
     registry.register(command.clone());
+    registry.register(plugin.clone());
 
-    AppServices {
+    Ok(AppServices {
         bus,
         registry,
         connection,
@@ -65,8 +91,13 @@ fn build_services() -> AppServices {
         command,
         schema,
         intelligence,
-    }
+        plugin,
+    })
 }
+
+/// Engine id the binary connects with. The workspace connection list (a later
+/// phase) will carry this per connection instead.
+const POSTGRES_ENGINE: &str = "postgresql";
 
 /// Build a `Connection` from `DATABASE_URL` (postgres://user:pass@host:port/db).
 /// Phase 1 stand-in for the workspace connection list.
@@ -161,7 +192,7 @@ fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
     info!("Tempr starting");
 
-    let services = build_services();
+    let services = build_services()?;
     let connection = connection_from_env()?;
 
     // Keybinding layers, lowest first: user settings
@@ -244,7 +275,7 @@ fn main() -> Result<()> {
             });
 
     gpui_compat::run_app(move |cx| {
-        tempr_ui::commands::install(cx, &services.command);
+        tempr_ui::commands::install(cx, &services.command, &services.plugin.command_specs());
         cx.on_action(|_: &tempr_ui::Quit, cx| cx.quit());
 
         // Stop services (cancel runs, drain pools) when the app quits.
@@ -279,6 +310,10 @@ fn main() -> Result<()> {
             command: services.command.clone(),
             schema: services.schema.clone(),
             intelligence: services.intelligence.clone(),
+            plugin: services.plugin.clone(),
+            workspace_root: workspace_manifest_path()
+                .parent()
+                .map(std::path::Path::to_path_buf),
         };
         if let Err(e) =
             gpui_compat::open_main_window(cx, "Tempr", throttle_inactive, move |window, cx| {

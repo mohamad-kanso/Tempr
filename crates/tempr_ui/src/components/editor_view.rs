@@ -1667,7 +1667,7 @@ mod view_tests {
 
     fn setup(cx: &mut TestAppContext, text: &str) -> (Entity<EditorView>, AnyWindowHandle) {
         let service = CommandService::new(Arc::new(EventBus::new()));
-        cx.update(|cx| commands::install(cx, &service));
+        cx.update(|cx| commands::install(cx, &service, &[]));
 
         let bus = Arc::new(EventBus::new());
         let connections = ConnectionService::new(bus.clone());
