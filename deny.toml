@@ -13,6 +13,12 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained (merged into zbus 6) — transitive via gpui's Linux platform stack" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained (merged into zbus 6) — transitive via gpui's Linux platform stack" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained (merged into zbus 6) — transitive via gpui's Linux platform stack" },
+    # chrono is unmaintained (RUSTSEC-2026-0543) but has no vulnerability. It is
+    # pulled by the pinned gpui rev (calendar/time handling) and by
+    # `postgres-types`, whose `chrono` feature tokio-postgres enables by default.
+    # Removing it means a gpui rev bump plus a tokio-postgres feature change —
+    # not fixable from Tempr today. Revisit on every gpui rev bump.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (no advisory against a specific version) — transitive via gpui and postgres-types" },
 ]
 
 [licenses]
