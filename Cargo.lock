@@ -6045,6 +6045,7 @@ dependencies = [
  "tempr_editor",
  "tempr_events",
  "tempr_intel",
+ "tempr_plugin",
  "tempr_workspace",
  "thiserror 2.0.18",
  "tokio",

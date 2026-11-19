@@ -148,11 +148,7 @@ impl<'a> PluginContext<'a> {
     }
 
     /// Consumed by `PluginService` after a successful `activate`.
-    #[allow(
-        dead_code,
-        reason = "consumed by PluginService in the next commit of this branch"
-    )]
-    pub(crate) fn into_registrations(self) -> Registrations {
+    pub fn into_registrations(self) -> Registrations {
         self.registrations
     }
 

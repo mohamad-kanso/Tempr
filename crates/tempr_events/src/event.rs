@@ -82,6 +82,13 @@ pub enum AppEvent {
         id: CommandId,
     },
 
+    /// Static plugins finished activating at startup. Counts only — plugin
+    /// identities of failures travel as ids, never as plugin types.
+    PluginsActivated {
+        count: usize,
+        failed: Vec<PluginId>,
+    },
+
     // Plugin-authored events — namespaced by plugin_id
     PluginEvent {
         plugin_id: PluginId,
@@ -106,6 +113,7 @@ pub enum AppEventKind {
     BufferSaved,
     DiagnosticsReady,
     CommandExecuted,
+    PluginsActivated,
     PluginEvent,
 }
 
@@ -126,6 +134,7 @@ impl AppEvent {
             AppEvent::BufferSaved { .. } => AppEventKind::BufferSaved,
             AppEvent::DiagnosticsReady { .. } => AppEventKind::DiagnosticsReady,
             AppEvent::CommandExecuted { .. } => AppEventKind::CommandExecuted,
+            AppEvent::PluginsActivated { .. } => AppEventKind::PluginsActivated,
             AppEvent::PluginEvent { .. } => AppEventKind::PluginEvent,
         }
     }

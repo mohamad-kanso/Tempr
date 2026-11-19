@@ -33,6 +33,11 @@ use tempr_domain::PluginId;
 /// version it was written against; activation rejects a different major.
 pub const PLUGIN_API_VERSION: (u16, u16) = (0, 1);
 
+/// GPUI key context a plugin command binds in: the main window, but not while
+/// the command palette owns the keyboard. Lives here so the host's keymap
+/// installer and the service that registers plugin commands cannot drift.
+pub const COMMAND_CONTEXT: &str = "MainWindow && !Modal";
+
 /// Highest priority a plugin completion item may claim. The host maps it to
 /// `WEIGHT_PLUGIN_BASE (100) + priority`, so plugin items rank between
 /// keywords and statement keywords but never above a schema object.

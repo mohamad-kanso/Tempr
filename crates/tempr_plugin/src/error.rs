@@ -25,6 +25,9 @@ pub enum PluginError {
     #[error("plugin `{plugin}` requires `{missing}`, which is not linked")]
     MissingDependency { plugin: String, missing: String },
 
+    #[error("plugin `{plugin}` requires `{dependency}`, which failed to activate")]
+    DependencyFailed { plugin: String, dependency: String },
+
     #[error("plugin dependency cycle between {plugins:?}")]
     DependencyCycle { plugins: Vec<String> },
 
