@@ -375,6 +375,15 @@ pub(crate) fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
+/// The identifier fragment immediately before `offset` (empty after
+/// whitespace or a dot), in the buffer's own coordinates. The plugin fan-out
+/// uses the same boundary as the built-in matcher.
+pub fn prefix_before(text: &str, offset: usize) -> &str {
+    let end = offset.min(text.len());
+    let start = word_start(&text[..end]);
+    &text[start..end]
+}
+
 /// Start of the identifier being typed (the replacement word).
 fn word_start(text: &str) -> usize {
     let mut start = text.len();
@@ -1155,7 +1164,10 @@ impl PartialOrd for Ranked {
     }
 }
 
-fn match_quality(prefix: &str, folded_prefix: &str, label: &str) -> Option<i32> {
+/// Match quality of `label` against a typed `prefix`: exact start, folded
+/// start, then fuzzy. Exposed so the plugin fan-out scores its candidates with
+/// the same rule as the built-in pipeline instead of a parallel one.
+pub fn match_quality(prefix: &str, folded_prefix: &str, label: &str) -> Option<i32> {
     if prefix.is_empty() {
         return Some(0);
     }

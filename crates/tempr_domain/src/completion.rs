@@ -83,7 +83,8 @@ pub struct PluginCompletionRequest<'a> {
     /// Byte offset of the cursor within `text`.
     pub offset: usize,
     /// The identifier fragment before the cursor (empty after a dot or
-    /// whitespace), already lower-cased for case-insensitive matching.
+    /// whitespace), exactly as typed — providers decide their own
+    /// case-insensitivity. Use [`Self::replace_range`] to build item ranges.
     pub prefix: &'a str,
     /// True for `ctrl-space`: the user asked explicitly.
     pub explicit: bool,
