@@ -6,11 +6,14 @@
 //! Rows arrive as `Batch`es through [`ResultGrid::append`]; the parent view
 //! calls `cx.notify()` after each append so the grid fills incrementally.
 
+use std::sync::Arc;
+
 use gpui::{
     AnyElement, Context, IntoElement, Render, ScrollDelta, ScrollHandle, ScrollStrategy,
     ScrollWheelEvent, UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
 };
-use tempr_domain::{Batch, ColumnSpec, Value};
+use tempr_domain::{Batch, ColumnSpec, PluginId, Value};
+use tempr_plugin::ResultRenderer;
 
 use crate::theme;
 use crate::value_format::format_value;
@@ -25,6 +28,10 @@ const OVERSCAN_COLUMNS: usize = 2;
 pub struct ResultGrid {
     columns: Vec<ColumnSpec>,
     rows: Vec<Vec<Value>>,
+    /// Plugin renderers in registration order; first match wins per column.
+    renderers: Vec<(PluginId, Arc<dyn ResultRenderer>)>,
+    /// Renderer index per column, resolved once in `set_columns`.
+    column_renderers: Vec<Option<usize>>,
     /// Shown instead of the table when there are no columns yet.
     message: Option<String>,
     scroll_handle: UniformListScrollHandle,
@@ -43,9 +50,18 @@ impl Default for ResultGrid {
 
 impl ResultGrid {
     pub fn new() -> Self {
+        Self::with_renderers(Vec::new())
+    }
+
+    /// A grid that consults plugin renderers for cells. The chain is fixed at
+    /// construction: activation happens before the window opens, so a plugin
+    /// cannot appear mid-result and change how an existing table looks.
+    pub fn with_renderers(renderers: Vec<(PluginId, Arc<dyn ResultRenderer>)>) -> Self {
         Self {
             columns: Vec::new(),
             rows: Vec::new(),
+            renderers,
+            column_renderers: Vec::new(),
             message: Some("Run a query (Enter or ctrl-enter) to see results here.".into()),
             scroll_handle: UniformListScrollHandle::new(),
             column_scroll: ScrollHandle::new(),
@@ -68,14 +84,28 @@ impl ResultGrid {
     /// Start a new result set: drop rows, keep the grid empty until columns.
     pub fn reset(&mut self) {
         self.columns.clear();
+        self.column_renderers.clear();
         self.rows.clear();
         self.message = None;
     }
 
     pub fn set_columns(&mut self, columns: Vec<ColumnSpec>) {
+        self.column_renderers = columns
+            .iter()
+            .map(|column| {
+                self.renderers
+                    .iter()
+                    .position(|(_, renderer)| renderer.can_render(column))
+            })
+            .collect();
         self.columns = columns;
         self.rows.clear();
         self.message = None;
+    }
+
+    /// Renderer index chosen for `column`, if any. Test seam for the chain.
+    pub fn renderer_for(&self, column: usize) -> Option<usize> {
+        self.column_renderers.get(column).copied().flatten()
     }
 
     pub fn append(&mut self, batch: Batch) {
@@ -135,6 +165,29 @@ impl ResultGrid {
             .child(text)
     }
 
+    /// One cell: a plugin renderer when the column has one and the value is
+    /// not NULL, otherwise the built-in text formatter. NULL never reaches a
+    /// plugin — the grid owns the null style.
+    fn render_value_cell(&self, column: usize, value: &Value) -> AnyElement {
+        if !matches!(value, Value::Null)
+            && let Some(index) = self.renderer_for(column)
+        {
+            let (_, renderer) = &self.renderers[index];
+            let rendered = renderer.render_cell(value, &self.columns[column]);
+            return div()
+                .w(px(COLUMN_WIDTH))
+                .h_full()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .border_r_1()
+                .border_color(rgb(theme::BORDER))
+                .child(rendered)
+                .into_any_element();
+        }
+        Self::render_cell(format_value(value), matches!(value, Value::Null)).into_any_element()
+    }
+
     fn render_row(&self, ix: usize, visible: std::ops::Range<usize>) -> AnyElement {
         let row = &self.rows[ix];
         let bg = if ix.is_multiple_of(2) {
@@ -143,11 +196,9 @@ impl ResultGrid {
             theme::SURFACE_RAISED
         };
         let start = visible.start;
-        let cells = visible.map(|column| {
-            let value = row.get(column);
-            let is_null = matches!(value, Some(Value::Null));
-            let text = value.map(format_value).unwrap_or_default();
-            Self::render_cell(text, is_null)
+        let cells = visible.map(|column| match row.get(column) {
+            Some(value) => self.render_value_cell(column, value),
+            None => Self::render_cell(String::new(), false).into_any_element(),
         });
         div()
             .id(ix)
@@ -441,5 +492,93 @@ mod tests {
             rows_after.y, rows.y,
             "a horizontal wheel tick must not scroll the rows"
         );
+    }
+
+    /// A renderer that claims one value type and reports which one it was
+    /// asked for, so the chain's choice is observable without rendering.
+    struct TestRenderer {
+        name: &'static str,
+        value_type: tempr_domain::ValueType,
+    }
+
+    impl ResultRenderer for TestRenderer {
+        fn can_render(&self, col: &ColumnSpec) -> bool {
+            col.value_type == self.value_type
+        }
+
+        fn render_cell(&self, _value: &Value, _col: &ColumnSpec) -> AnyElement {
+            div().child(self.name).into_any_element()
+        }
+    }
+
+    fn renderer(
+        name: &'static str,
+        value_type: tempr_domain::ValueType,
+    ) -> (PluginId, Arc<dyn ResultRenderer>) {
+        (
+            PluginId::new(),
+            Arc::new(TestRenderer { name, value_type }) as Arc<dyn ResultRenderer>,
+        )
+    }
+
+    #[test]
+    fn a_renderer_claims_its_value_type_and_text_stays_built_in() {
+        let grid = ResultGrid::with_renderers(vec![renderer("ints", tempr_domain::ValueType::Int)]);
+        let mut grid = grid;
+        grid.set_columns(vec![
+            col("id"),
+            ColumnSpec {
+                name: "note".into(),
+                ordinal: 1,
+                data_type: "text".into(),
+                value_type: tempr_domain::ValueType::String,
+                nullable: true,
+                table_schema: None,
+                table_name: None,
+            },
+        ]);
+
+        assert_eq!(grid.renderer_for(0), Some(0), "int column is claimed");
+        assert_eq!(
+            grid.renderer_for(1),
+            None,
+            "text column keeps the built-in path"
+        );
+    }
+
+    #[test]
+    fn the_first_registered_renderer_wins() {
+        let mut grid = ResultGrid::with_renderers(vec![
+            renderer("first", tempr_domain::ValueType::Int),
+            renderer("second", tempr_domain::ValueType::Int),
+        ]);
+        grid.set_columns(vec![col("id")]);
+        assert_eq!(
+            grid.renderer_for(0),
+            Some(0),
+            "registration order decides precedence"
+        );
+    }
+
+    #[test]
+    fn a_new_result_set_recomputes_the_chain() {
+        let mut grid =
+            ResultGrid::with_renderers(vec![renderer("ints", tempr_domain::ValueType::Int)]);
+        grid.set_columns(vec![col("id")]);
+        assert_eq!(grid.renderer_for(0), Some(0));
+
+        grid.reset();
+        assert_eq!(grid.renderer_for(0), None);
+
+        grid.set_columns(vec![ColumnSpec {
+            name: "note".into(),
+            ordinal: 0,
+            data_type: "text".into(),
+            value_type: tempr_domain::ValueType::String,
+            nullable: true,
+            table_schema: None,
+            table_name: None,
+        }]);
+        assert_eq!(grid.renderer_for(0), None);
     }
 }
