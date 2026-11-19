@@ -187,3 +187,35 @@ mod tests {
         );
     }
 }
+
+/// Namespace for `PluginId::derived`: plugins are identified by their stable
+/// manifest id (`dev.tempr.postgres`), and the domain's `PluginId` is a UUID,
+/// so the two are bridged by a derived id rather than a random one.
+const PLUGIN_NAMESPACE: Uuid = Uuid::from_u128(0x54_45_4d_50_52_00_00_00_80_00_00_00_00_00_00_02);
+
+impl PluginId {
+    /// A plugin id derived from the plugin's own stable namespace (the
+    /// reverse-domain `PluginManifest::id`). The same plugin always maps to
+    /// the same id, so event payloads and registrations stay comparable
+    /// across launches.
+    pub fn derived(namespace: &str) -> Self {
+        Self(Uuid::new_v5(&PLUGIN_NAMESPACE, namespace.as_bytes()))
+    }
+}
+
+#[cfg(test)]
+mod plugin_id_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_ids_are_stable_per_namespace() {
+        assert_eq!(
+            PluginId::derived("dev.tempr.postgres"),
+            PluginId::derived("dev.tempr.postgres")
+        );
+        assert_ne!(
+            PluginId::derived("dev.tempr.postgres"),
+            PluginId::derived("dev.tempr.demo")
+        );
+    }
+}

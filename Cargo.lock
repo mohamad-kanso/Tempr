@@ -6019,6 +6019,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempr_plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "gpui",
+ "tempr_db",
+ "tempr_domain",
+ "tempr_events",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tempr_services"
 version = "0.1.0"
 dependencies = [
