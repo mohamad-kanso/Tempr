@@ -10,7 +10,8 @@ tempr_events.workspace    = true
 tempr_db.workspace        = true
 tempr_workspace.workspace = true
 tempr_intel.workspace     = true
-tempr_editor.workspace    = true
+tempr_editor.workspace   = true
+tempr_plugin.workspace   = true
 
 deadpool.workspace     = true
 futures.workspace      = true

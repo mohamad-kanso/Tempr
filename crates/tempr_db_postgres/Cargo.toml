@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 tempr_db.workspace     = true
 tempr_domain.workspace = true
+tempr_events.workspace = true
+tempr_plugin.workspace = true
 
 async-trait.workspace      = true
 chrono.workspace           = true

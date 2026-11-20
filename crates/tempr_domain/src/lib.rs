@@ -2,6 +2,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod command;
+pub mod completion;
 pub mod connection;
 pub mod history;
 pub mod ids;
@@ -11,6 +12,7 @@ pub mod text;
 pub mod workspace;
 
 pub use command::{CommandId, KeybindingOverrides};
+pub use completion::{CompletionItem, CompletionKind, PluginCompletionRequest};
 pub use connection::{Connection, ConnectionState, DriverKind, SecretRef, TlsMode};
 pub use history::HistoryEntry;
 pub use ids::{

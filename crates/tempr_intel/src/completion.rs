@@ -30,6 +30,8 @@ use crate::analysis::{Analysis, Binding, ColumnRef, Scope};
 use crate::catalog::{CatalogCache, CatalogEntry};
 use crate::semantic::SemanticEngine;
 
+pub use tempr_domain::completion::{CompletionItem, CompletionKind};
+
 /// Hard cap on returned items (spec §5.2's bounded top-N).
 pub const COMPLETION_LIMIT: usize = 200;
 
@@ -197,38 +199,6 @@ pub struct CompletionRequest<'a> {
     pub offset: usize,
     /// True for `ctrl-space`: bypasses the auto-open gating.
     pub explicit: bool,
-}
-
-/// Category for the popup's icon/grouping (docs/12-sql-intelligence.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum CompletionKind {
-    Keyword,
-    Table,
-    Column,
-    Schema,
-    Alias,
-    Cte,
-    Function,
-    Snippet,
-    Plugin,
-}
-
-/// One ranked candidate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletionItem {
-    /// Text shown in the popup.
-    pub label: String,
-    pub kind: CompletionKind,
-    /// Type, signature, schema or ownership hint (empty when there is none).
-    pub detail: String,
-    /// Text the editor writes. Equal to `label` today; separate so stage-6
-    /// snippets can differ without reshaping the item.
-    pub insert: String,
-    /// Byte range in the buffer the item replaces (the word under the
-    /// cursor; empty when the cursor follows a dot or whitespace).
-    pub replace: Range<usize>,
-    /// Ranking score, highest first.
-    pub score: i32,
 }
 
 /// What the cursor position expects (spec §5.2's table).
@@ -403,6 +373,15 @@ pub(crate) fn is_ident_start(c: char) -> bool {
 
 pub(crate) fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// The identifier fragment immediately before `offset` (empty after
+/// whitespace or a dot), in the buffer's own coordinates. The plugin fan-out
+/// uses the same boundary as the built-in matcher.
+pub fn prefix_before(text: &str, offset: usize) -> &str {
+    let end = offset.min(text.len());
+    let start = word_start(&text[..end]);
+    &text[start..end]
 }
 
 /// Start of the identifier being typed (the replacement word).
@@ -1185,7 +1164,10 @@ impl PartialOrd for Ranked {
     }
 }
 
-fn match_quality(prefix: &str, folded_prefix: &str, label: &str) -> Option<i32> {
+/// Match quality of `label` against a typed `prefix`: exact start, folded
+/// start, then fuzzy. Exposed so the plugin fan-out scores its candidates with
+/// the same rule as the built-in pipeline instead of a parallel one.
+pub fn match_quality(prefix: &str, folded_prefix: &str, label: &str) -> Option<i32> {
     if prefix.is_empty() {
         return Some(0);
     }

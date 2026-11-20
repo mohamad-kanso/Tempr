@@ -12,15 +12,22 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
-use tempr_domain::{ConnectionId, ConnectionState, SchemaSnapshot, SchemaSnapshotId, SqlFileId};
+use tempr_domain::{
+    ConnectionId, ConnectionState, PluginCompletionRequest, SchemaSnapshot, SchemaSnapshotId,
+    SqlFileId,
+};
 use tempr_editor::Buffer;
 use tempr_events::{AppEvent, AppEventKind, EventBus, EventFilter, Subscription};
+use tempr_intel::completion::COMPLETION_LIMIT;
 use tempr_intel::{
     Analysis, CatalogCache, CompletionItem, CompletionRequest, HoverInfo, SemanticEngine,
+    match_quality, prefix_before,
 };
+use tempr_plugin::{CompletionProvider, PLUGIN_PRIORITY_MAX};
 use tokio::runtime::Handle;
 
 use crate::schema::SchemaService;
@@ -30,6 +37,11 @@ struct StoredAnalysis {
     source_revision: u64,
     analysis: Arc<Analysis>,
 }
+
+/// Ranking weight of a plugin completion item before its `priority` hint.
+/// Keywords sit at 100 and schema objects at 450, so `100 + priority`
+/// (priority is clamped to 300) can never outrank a column or a relation.
+const PLUGIN_COMPLETION_WEIGHT: i32 = 100;
 
 pub struct IntelligenceService {
     event_bus: Arc<EventBus>,
@@ -45,6 +57,7 @@ pub struct IntelligenceService {
     active_connection: RwLock<Option<ConnectionId>>,
     handle: Mutex<Option<Handle>>,
     subscriptions: Mutex<Vec<Subscription>>,
+    completion_providers: RwLock<Vec<Arc<dyn CompletionProvider>>>,
 }
 
 impl IntelligenceService {
@@ -60,6 +73,7 @@ impl IntelligenceService {
             active_connection: RwLock::new(None),
             handle: Mutex::new(None),
             subscriptions: Mutex::new(Vec::new()),
+            completion_providers: RwLock::new(Vec::new()),
         });
 
         // Weak handler: the service owns the subscription, so a strong
@@ -204,7 +218,18 @@ impl IntelligenceService {
         self.analyses.write().clear();
     }
 
+    /// Attach the providers registered by active plugins. Called once at
+    /// startup, after `PluginService::activate_all`; a later call replaces the
+    /// set (stage 2's theme/panel work activates plugins the same way).
+    pub fn set_completion_providers(&self, providers: Vec<Arc<dyn CompletionProvider>>) {
+        *self.completion_providers.write() = providers;
+    }
+
     /// Synchronous completion for the UI thread (spec decision 7).
+    ///
+    /// The engine's ranked list comes first; plugin providers are then merged
+    /// into it with the same score formula, so one ordering rule decides the
+    /// whole popup (docs/12-sql-intelligence.md).
     pub fn complete(
         &self,
         buffer: &mut Buffer,
@@ -212,12 +237,104 @@ impl IntelligenceService {
         explicit: bool,
     ) -> Vec<CompletionItem> {
         let file = buffer.file_id();
-        self.engine.complete(CompletionRequest {
+        let mut items = self.engine.complete(CompletionRequest {
             file,
             buffer,
             offset,
             explicit,
-        })
+        });
+        self.merge_plugin_completions(&mut items, buffer, file, offset, explicit);
+        items
+    }
+
+    /// Fan out to plugin providers and fold their candidates into `items`.
+    ///
+    /// Nothing is copied when no provider is registered — the common case
+    /// until a plugin ships one. With providers, the buffer text is handed
+    /// over as an owned `String`, because a plugin's request is text-based by
+    /// design (`PluginCompletionRequest`); that copy is the price of not
+    /// exposing the rope or the analysis model.
+    fn merge_plugin_completions(
+        &self,
+        items: &mut Vec<CompletionItem>,
+        buffer: &Buffer,
+        file: SqlFileId,
+        offset: usize,
+        explicit: bool,
+    ) {
+        let providers = self.completion_providers.read().clone();
+        if providers.is_empty() {
+            return;
+        }
+
+        let text = buffer.text().to_string();
+        let prefix = prefix_before(&text, offset);
+        let folded_prefix = prefix.to_lowercase();
+        let connection = *self.active_connection.read();
+        let request = PluginCompletionRequest {
+            file,
+            text: &text,
+            offset,
+            prefix,
+            explicit,
+            connection,
+        };
+
+        let started = Instant::now();
+        let mut contributed = Vec::new();
+        for provider in &providers {
+            let provider_started = Instant::now();
+            let produced = provider.complete(&request);
+            let elapsed = provider_started.elapsed();
+            if elapsed > Duration::from_millis(5) {
+                tracing::error!(
+                    provider = provider.provider_name(),
+                    micros = elapsed.as_micros(),
+                    "plugin completion provider exceeds the 5 ms budget"
+                );
+            } else if elapsed > Duration::from_millis(1) {
+                tracing::warn!(
+                    provider = provider.provider_name(),
+                    micros = elapsed.as_micros(),
+                    "plugin completion provider is slow"
+                );
+            }
+            contributed.extend(produced);
+        }
+
+        for mut item in contributed {
+            let Some(quality) = match_quality(prefix, &folded_prefix, &item.label) else {
+                continue;
+            };
+            let weight = PLUGIN_COMPLETION_WEIGHT + item.score.clamp(0, PLUGIN_PRIORITY_MAX);
+            item.score = weight * 1000 + quality * 4 - item.label.chars().count() as i32;
+
+            match items
+                .iter_mut()
+                .find(|existing| existing.label == item.label && existing.kind == item.kind)
+            {
+                Some(existing) if item.score > existing.score => *existing = item,
+                Some(_) => {}
+                None => items.push(item),
+            }
+        }
+
+        items.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.label.cmp(&b.label))
+                .then_with(|| a.kind.cmp(&b.kind))
+        });
+        items.truncate(COMPLETION_LIMIT);
+
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(5) {
+            tracing::error!(
+                micros = elapsed.as_micros(),
+                providers = providers.len(),
+                "plugin completion fan-out exceeded the 5 ms budget"
+            );
+        }
     }
 
     /// Synchronous hover for the UI thread.
@@ -598,5 +715,147 @@ mod tests {
         let mut buffer = Buffer::new(SqlFileId::new(), "select id from users");
         let end = buffer.len();
         assert!(service.hover(&mut buffer, end).is_some());
+    }
+
+    struct FakeProvider {
+        name: &'static str,
+        items: Vec<(&'static str, CompletionKind, i32)>,
+    }
+
+    impl CompletionProvider for FakeProvider {
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+
+        fn complete(&self, req: &PluginCompletionRequest<'_>) -> Vec<CompletionItem> {
+            self.items
+                .iter()
+                .map(|(label, kind, priority)| CompletionItem {
+                    label: (*label).to_string(),
+                    kind: *kind,
+                    detail: String::new(),
+                    insert: (*label).to_string(),
+                    replace: req.replace_range(),
+                    score: *priority,
+                })
+                .collect()
+        }
+    }
+
+    fn provider(
+        name: &'static str,
+        items: Vec<(&'static str, CompletionKind, i32)>,
+    ) -> Arc<dyn CompletionProvider> {
+        Arc::new(FakeProvider { name, items })
+    }
+
+    #[test]
+    fn plugin_items_join_the_ranked_list() {
+        let (service, _) = service();
+        service.set_completion_providers(vec![provider(
+            "demo",
+            vec![("users_view", CompletionKind::Plugin, 50)],
+        )]);
+        let mut buffer = Buffer::new(SqlFileId::new(), "select * from us");
+        let end = buffer.len();
+        let items = service.complete(&mut buffer, end, false);
+
+        assert!(items.iter().any(|item| item.label == "users_view"));
+        assert!(items.iter().any(|item| item.label == "users"));
+    }
+
+    #[test]
+    fn a_provider_item_never_outranks_a_schema_object() {
+        let (service, _) = service();
+        service.set_completion_providers(vec![provider(
+            "demo",
+            vec![("users", CompletionKind::Table, PLUGIN_PRIORITY_MAX)],
+        )]);
+        let mut buffer = Buffer::new(SqlFileId::new(), "select * from us");
+        let end = buffer.len();
+        let items = service.complete(&mut buffer, end, false);
+
+        let matches: Vec<&CompletionItem> = items.iter().filter(|i| i.label == "users").collect();
+        assert_eq!(matches.len(), 1, "deduped against the catalog item");
+        assert_eq!(matches[0].kind, CompletionKind::Table);
+    }
+
+    #[test]
+    fn higher_priority_sorts_first() {
+        let (service, _) = service();
+        service.set_completion_providers(vec![provider(
+            "demo",
+            vec![
+                ("acme_low", CompletionKind::Plugin, 10),
+                ("acme_high", CompletionKind::Plugin, 250),
+            ],
+        )]);
+        let mut buffer = Buffer::new(SqlFileId::new(), "select * from acme");
+        let end = buffer.len();
+        let items = service.complete(&mut buffer, end, false);
+
+        let low = items
+            .iter()
+            .position(|i| i.label == "acme_low")
+            .expect("low");
+        let high = items
+            .iter()
+            .position(|i| i.label == "acme_high")
+            .expect("high");
+        assert!(high < low, "priority orders plugin items: {items:?}");
+    }
+
+    #[test]
+    fn the_merged_list_stays_bounded() {
+        let (service, _) = service();
+        let labels: Vec<(&'static str, CompletionKind, i32)> = (0..250)
+            .map(|i| {
+                let label: &'static str = Box::leak(format!("much{i:03}").into_boxed_str());
+                (label, CompletionKind::Plugin, 1)
+            })
+            .collect();
+        service.set_completion_providers(vec![provider("demo", labels)]);
+
+        let mut buffer = Buffer::new(SqlFileId::new(), "select * from much");
+        let end = buffer.len();
+        let items = service.complete(&mut buffer, end, false);
+        assert_eq!(items.len(), COMPLETION_LIMIT);
+    }
+
+    #[test]
+    fn providers_fan_out_without_a_catalog() {
+        let bus = Arc::new(EventBus::new());
+        let connection = crate::connection::ConnectionService::new(bus.clone());
+        let schema = SchemaService::new(bus.clone(), connection);
+        let service = IntelligenceService::new(bus, schema);
+        service.set_catalog(empty_catalog());
+        service.set_completion_providers(vec![provider(
+            "demo",
+            vec![("offline_snippet", CompletionKind::Plugin, 40)],
+        )]);
+
+        let mut buffer = Buffer::new(SqlFileId::new(), "select * from of");
+        let end = buffer.len();
+        let items = service.complete(&mut buffer, end, false);
+        assert!(items.iter().any(|item| item.label == "offline_snippet"));
+    }
+
+    #[test]
+    fn a_provider_with_no_items_changes_nothing() {
+        let (service, _) = service();
+        let mut buffer = Buffer::new(SqlFileId::new(), "select * from us");
+        let end = buffer.len();
+        let before = service.complete(&mut buffer, end, false);
+
+        service.set_completion_providers(vec![provider("silent", Vec::new())]);
+        let after = service.complete(&mut buffer, end, false);
+
+        assert_eq!(
+            before
+                .iter()
+                .map(|i| (&i.label, i.kind))
+                .collect::<Vec<_>>(),
+            after.iter().map(|i| (&i.label, i.kind)).collect::<Vec<_>>()
+        );
     }
 }

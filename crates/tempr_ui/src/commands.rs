@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use gpui::{Action, App, KeyBinding, Keystroke, Window};
 use tempr_domain::CommandId;
+use tempr_plugin::{PluginCommand, PluginCommandSpec};
 use tempr_services::{CommandContribution, CommandService};
 
 use crate::components::completion_popup as completion;
@@ -304,7 +305,12 @@ pub fn core_commands() -> Vec<CommandSpec> {
 /// Register the catalog with the service and bind the *resolved* keystrokes
 /// (defaults overridden by user/workspace layers already set on the
 /// service). Call once at startup, after the service has its layers.
-pub fn install(cx: &mut App, service: &CommandService) {
+///
+/// `plugin_specs` are the commands active plugins contributed. Their metadata
+/// is already registered by `PluginService`; this only adds the keymap
+/// entries, each one carrying its command id in [`PluginCommand`], because a
+/// plugin's action types are unknowable to the host.
+pub fn install(cx: &mut App, service: &CommandService, plugin_specs: &[PluginCommandSpec]) {
     let specs = core_commands();
     for s in &specs {
         service.register(s.contribution());
@@ -329,7 +335,45 @@ pub fn install(cx: &mut App, service: &CommandService) {
             bindings.extend(s.default_keystrokes.iter().filter_map(|k| s.binding(k)));
         }
     }
+    bindings.extend(plugin_bindings(service, plugin_specs));
     cx.bind_keys(bindings);
+}
+
+/// One `PluginCommand { id }` binding per usable plugin keystroke, resolved
+/// against the same override layers as core commands.
+fn plugin_bindings(service: &CommandService, specs: &[PluginCommandSpec]) -> Vec<KeyBinding> {
+    let mut bindings = Vec::new();
+    for spec in specs {
+        let resolved = service.keystrokes_for(&spec.id);
+        let mut usable = 0;
+        for keys in &resolved {
+            if !keys.split_whitespace().all(is_fireable_keystroke) {
+                tracing::warn!(command = %spec.id, keys, "invalid plugin keystroke ignored");
+                continue;
+            }
+            bindings.push(KeyBinding::new(
+                keys,
+                PluginCommand::new(spec.id.as_str()),
+                Some(tempr_plugin::COMMAND_CONTEXT),
+            ));
+            usable += 1;
+        }
+        // An override that left the command with no working key falls back to
+        // its defaults, exactly like a core command.
+        if usable == 0 && !resolved.is_empty() && !spec.default_keystrokes.is_empty() {
+            tracing::warn!(command = %spec.id, "no usable plugin keystroke; using defaults");
+            for keys in &spec.default_keystrokes {
+                if keys.split_whitespace().all(is_fireable_keystroke) {
+                    bindings.push(KeyBinding::new(
+                        keys,
+                        PluginCommand::new(spec.id.as_str()),
+                        Some(tempr_plugin::COMMAND_CONTEXT),
+                    ));
+                }
+            }
+        }
+    }
+    bindings
 }
 
 /// Look a command up in the catalog.

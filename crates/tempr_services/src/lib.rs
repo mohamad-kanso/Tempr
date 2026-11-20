@@ -4,6 +4,7 @@
 pub mod command;
 pub mod connection;
 pub mod intelligence;
+pub mod plugin;
 pub mod query;
 pub mod registry;
 pub mod schema;
@@ -13,6 +14,7 @@ pub use command::{
 };
 pub use connection::{ConnectionService, PoolConfig, PooledConnection};
 pub use intelligence::IntelligenceService;
+pub use plugin::{ActivationReport, PluginService};
 pub use query::{QueryService, RowSink};
 pub use registry::{Service, ServiceError, ServiceRegistry};
 pub use schema::{FullRefreshReason, RefreshPath, SchemaService};

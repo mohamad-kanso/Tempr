@@ -11,6 +11,8 @@ tempr_db.workspace          = true
 tempr_db_postgres.workspace = true
 tempr_ui.workspace          = true
 tempr_workspace.workspace   = true
+tempr_plugin.workspace      = true
+tempr_plugin_export_csv.workspace = true
 
 anyhow.workspace             = true
 tracing.workspace            = true

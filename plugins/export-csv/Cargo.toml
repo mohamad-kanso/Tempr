@@ -1,0 +1,16 @@
+[package]
+name              = "tempr_plugin_export_csv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description       = "Reference Tempr plugin: export the last query run as RFC 4180 CSV"
+
+[dependencies]
+tempr_plugin.workspace = true
+
+[dev-dependencies]
+chrono.workspace   = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

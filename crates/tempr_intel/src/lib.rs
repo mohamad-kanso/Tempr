@@ -23,6 +23,7 @@ pub use analysis::{Analysis, Binding, ColumnRef, Diagnostic, DiagnosticKind, Sco
 pub use catalog::{CatalogCache, CatalogEntry, CatalogStats};
 pub use completion::{
     CompletionContext, CompletionItem, CompletionKind, CompletionRequest, CursorContext,
+    match_quality, prefix_before,
 };
 pub use hover::HoverInfo;
 pub use semantic::SemanticEngine;

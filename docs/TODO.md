@@ -13,7 +13,7 @@
 - [ ] `DriverConnection::ping` (active round-trip) on top of the existing `is_closed` recycle check (09-database-engine: idle ping every 30 s, reconnect with backoff → `Reconnecting`/`Failed` states, evict a connection whose query failed with a transport error)
 - [ ] The `schema_fingerprints` sweep does not filter by `has_function_privilege` and does not exclude extension-owned objects, consistent with the other catalog queries in `snapshot_schema` — revisit if a catalog gets noisy with objects the user cannot use or did not create
 - [ ] Per-connection `pool_max_size` from the workspace connection config instead of the service-wide `PoolConfig`
-- [ ] `ThemeProvider` tokens replace the placeholder palette consts in `tempr_ui::theme` (no hard-coded colors rule, 11-gpui.md)
+- [ ] Phase 4 stage 2: `ThemeData` tokens replace the placeholder palette consts in `tempr_ui::theme`, with builtin light/dark themes and `theme::CycleTheme` (no hard-coded colors rule, 11-gpui.md; → D36 notes why themes are data, not a trait)
 - [ ] Profile the 10% of bench frames > 20 ms (p95 23 ms, max 59 ms at 100k rows, release): suspects are text shaping of ~60 fresh cells per frame and per-frame `format_value` allocations — try a shaped-line cache keyed by (row, col) or pre-formatting strings on append; add a per-frame histogram to `ScrollBench`
 - [ ] `ScrollBench`: detect a throttled compositor (e.g. > 25% of frames ≥ 500 ms) and mark the report invalid instead of reporting fps
 - [ ] Workspace open + connection picker in `MainWindow` (workspace connection list from `workspace.toml`, secrets via OS keychain — new dependency → DECISIONS entry) replaces the `DATABASE_URL` stand-in and the `TEMPR_WORKSPACE`/cwd manifest lookup from D24 (the keybinding layering itself stays); surface a malformed `DATABASE_URL` in the UI instead of exiting before the window opens; error toasts driven by `AppEvent`
@@ -64,18 +64,19 @@
 - [ ] Palette: highlight matched characters (`CommandMatch::indices`) in titles; show "no keybinding" hint; remember last query per session
 - [ ] `format_version` is never checked when a manifest is read (`Storage::load_manifest` and the sync `load_manifest_from` both ignore it): a future v2 `workspace.toml` loads silently in an old binary, unknown fields dropped — validate and report a typed error before workspace open ships
 - [ ] Rebind live when `settings.toml` / `workspace.toml` change (`cx.clear_key_bindings()` + `commands::install`) and add a settings validation command; today the three layers resolve once at startup (→ D24, restart required), invalid keystrokes are logged with a fallback to defaults, and a parse error shows once in the status bar
-- [ ] Plugin commands need a GPUI action shape (a generic `PluginCommand { id }` action or per-plugin `actions!`) before `CommandContribution` from 08-plugin-api can register through `CommandService`
 - [ ] `EditorView` follow-ups: horizontal scroll / soft wrap (long lines are clipped today), find/replace, add cursor above/below and select-next-occurrence, gutter run buttons per statement, shaped-line cache keyed by (line, text, highlights) if profiling shows re-shaping visible lines each frame matters
 - [ ] Hover dwell delay: the pointer trigger opens the card on the first mouse move over a reference (no dwell timer), and the card follows the pointer to a different reference on the next move. Add a small dwell (e.g. 150 ms) keyed on the offset once a timer seam is worth the test complexity; the explicit `ctrl-k ctrl-i` command remains the primary path
 - [ ] `AppEvent::CommandExecuted` keymap semantics: today it fires only for palette-dispatched commands; key-driven actions bypass the service, so listeners (history, plugins) see a partial stream — either record from a global action observer or document it as palette-only
 - [ ] Editing ops follow-ups: indent/outdent, join lines, transpose, select word/line, add cursor above/below, word motions across line breaks for `prev_word_boundary` when the previous line is empty
 - [ ] `EditHistory` bounds: cap depth and coalesce typing bursts (today every keystroke stores its removed/inserted text forever; a select-all + paste on a 10 MB file retains full copies)
-- [ ] Phase 4: Plugin API stabilization (versioned, documented)
 - [ ] Phase 4: Theme system (light/dark, configurable accent)
 - [ ] Phase 4: Query history panel
 - [ ] Phase 4: Layout persistence across restarts
 - [ ] Phase 4: Platform-native packaging (.deb, .rpm, AppImage, .dmg, MSI)
 - [ ] Dock follow-ups from the Phase 4 spec: drag handles, split panes inside the dock, floating panels; plugin-contributed keymap contexts beyond `MainWindow`; per-plugin settings UI
+- [ ] Plugin command isolation stops at activation: `PluginService` catches a panic in `activate`, but a panic inside a command closure or `Panel::render` runs on the UI thread outside any boundary. Add per-invocation isolation (or a documented "a panicking plugin takes the app down" contract) before third-party plugins are real
+- [ ] Plugin completion providers have no per-provider timeout: the fan-out times each provider and logs over-budget calls, but a provider that blocks forever freezes the 5 ms path. A watchdog needs either a thread-per-call (too heavy at 5 ms) or a documented synchronous-only contract plus a debug-build assertion
+- [ ] Plugin deactivation only runs at shutdown (`PluginService::deactivate_all`); there is no reload/enable-disable path. Needed when a workspace can disable a plugin, and it is also the test surface for removing one plugin's contributions without touching another's
 - [ ] `ResultRenderer` ships wired but with no shipped consumer (Phase 4 stage 1) — the demo plugin adds panel + completion only. Give it a real consumer (a JSON one-line pretty renderer, `bytea` hex) when a column type actually benefits
 - [ ] History: age-based retention (07-storage open question 2 — v1 caps at 10 000 rows instead), search ranking, and a cross-workspace history question that stays deferred
 - [ ] Resolve Open Decisions #1 (name/branding), #3 (telemetry), #4 (beta timing) before Phase 4

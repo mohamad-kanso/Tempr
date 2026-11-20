@@ -83,14 +83,22 @@ Phase 1 (Connect & Run) — complete 2026-09-03: PostgreSQL driver with TLS, poo
 
 ## Commands
 
+Every cargo invocation runs through `scripts/capped.sh`, which puts the whole
+process tree (rustc, linker, test binaries) in a 4 GB cgroup. `.cargo/config.toml`
+also pins `build.jobs = 1`; the two together are what keep a GPUI debug link
+from taking the machine down.
+
 ```bash
-cargo build                  # build
-cargo fmt --check            # format check
-cargo clippy -- -D warnings  # lint (treat warnings as errors)
-cargo test                   # unit + integration tests
-cargo deny check             # dependency audit (set up in Phase 0)
-bash scripts/setup.sh        # install git hooks (run once after clone)
+./scripts/capped.sh cargo build                  # build
+./scripts/capped.sh cargo fmt --check            # format check
+./scripts/capped.sh cargo clippy -- -D warnings  # lint (treat warnings as errors)
+./scripts/capped.sh cargo test                   # unit + integration tests
+./scripts/capped.sh cargo deny check             # dependency audit (set up in Phase 0)
+bash scripts/setup.sh                            # install git hooks (run once after clone)
 ```
+
+If a capped build is killed at 4 GB, run the failing crate alone
+(`-p <crate>`) instead of raising the cap.
 
 ## Hard rules
 
@@ -116,4 +124,4 @@ When implementation begins:
 ## Current phase
 
 Quick pointer only — `docs/PROGRESS.md` is the source of truth. Update this line as phases complete.
-Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 — complete (2026-09-07: rope buffer + tree-sitter tree, palette + three-layer keybindings, editing ops, `EditorView`, execute-statement-under-cursor; all 8 boxes verified). Phase 3 (Intelligence) — complete (2026-10-23: catalog cache + incremental/full refresh, semantic analyzer, completion, diagnostics, hover, offline cold start; all 8 exit criteria verified, interactive boxes checked). Phase 4 (Extensibility & Polish) — not started.
+Phase: 0 — complete (2026-07-13). Phase 1 — complete (2026-09-03: DB layer, GPUI shell, `Input` + streaming `ResultGrid`, pooling + lifecycle, TLS). Phase 2 — complete (2026-09-07: rope buffer + tree-sitter tree, palette + three-layer keybindings, editing ops, `EditorView`, execute-statement-under-cursor; all 8 boxes verified). Phase 3 (Intelligence) — complete (2026-10-23: catalog cache + incremental/full refresh, semantic analyzer, completion, diagnostics, hover, offline cold start; all 8 exit criteria verified, interactive boxes checked). Phase 4 (Extensibility & Polish) — stage 1 (plugin core) implemented 2026-11-19: `tempr_plugin` `0.1`, `PluginService`, completion fan-out, plugin commands, renderer chain, Postgres + CSV reference plugins. Next: stage 2 (themes).

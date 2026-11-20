@@ -1,0 +1,18 @@
+[package]
+name              = "tempr_plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description       = "Plugin API: manifest, lifecycle, registration context, extension points (docs/08-plugin-api.md)"
+
+[dependencies]
+tempr_domain.workspace = true
+tempr_events.workspace = true
+tempr_db.workspace      = true
+
+gpui.workspace        = true
+async-trait.workspace = true
+thiserror.workspace   = true
+
+[lints]
+workspace = true

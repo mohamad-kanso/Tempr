@@ -5,6 +5,7 @@
 //! in `QueryService` on the tokio runtime; rows and bus events reach this
 //! view through channels drained on the foreground executor.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,12 +16,14 @@ use gpui::{
     actions, div, prelude::*, px, rgb,
 };
 use tempr_domain::{
-    Batch, ColumnSpec, Connection, ConnectionId, ConnectionState, QueryOutcome, QueryRunId,
+    Batch, ColumnSpec, CommandId, Connection, ConnectionId, ConnectionState, QueryOutcome,
+    QueryRun, QueryRunId,
 };
 use tempr_events::{AppEvent, EventBus};
+use tempr_plugin::{CommandContext, PluginCommand};
 use tempr_services::{
-    CommandService, ConnectionService, IntelligenceService, QueryService, RefreshPath, RowSink,
-    SchemaService, ServiceError,
+    CommandService, ConnectionService, IntelligenceService, PluginService, QueryService,
+    RefreshPath, RowSink, SchemaService, ServiceError,
 };
 
 use crate::commands;
@@ -93,6 +96,10 @@ pub struct Services {
     pub command: Arc<CommandService>,
     pub schema: Arc<SchemaService>,
     pub intelligence: Arc<IntelligenceService>,
+    pub plugin: Arc<PluginService>,
+    /// Directory plugins may write exports to. `None` when no workspace is
+    /// configured — a plugin command must report that, not guess a path.
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// Outcome of the tokio-side query task, as seen by the view.
@@ -115,6 +122,8 @@ pub struct MainWindow {
     current_run: Option<QueryRunId>,
     dev: DevOptions,
     bench: Option<ScrollBench>,
+    /// Most recently finished run, handed to plugin commands read-only.
+    last_run: Option<Arc<QueryRun>>,
     focus_handle: FocusHandle,
     _editor_subscription: Subscription,
     _palette_subscription: Subscription,
@@ -130,7 +139,8 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| EditorView::new("", services.intelligence.clone(), cx));
-        let grid = cx.new(|_| ResultGrid::new());
+        let renderers = services.plugin.result_renderers();
+        let grid = cx.new(|_| ResultGrid::with_renderers(renderers));
         let command_service = services.command.clone();
         let palette = cx.new(|cx| Palette::new(command_service, window, cx));
 
@@ -139,6 +149,7 @@ impl MainWindow {
             cx.subscribe_in(&palette, window, |this, _palette, event, window, cx| {
                 if let PaletteEvent::Execute(id) = event
                     && !commands::dispatch(id, &this.services.command, window, cx)
+                    && !this.dispatch_plugin(id, window, cx)
                 {
                     this.set_status(format!("Command {id} is not available here"), true, cx);
                 }
@@ -201,6 +212,7 @@ impl MainWindow {
             current_run: None,
             dev,
             bench: None,
+            last_run: None,
             focus_handle: cx.focus_handle(),
             _editor_subscription,
             _palette_subscription,
@@ -384,6 +396,47 @@ impl MainWindow {
         });
     }
 
+    // ── plugin commands ──────────────────────────────────────────────────
+
+    fn plugin_command_action(
+        &mut self,
+        action: &PluginCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = CommandId::new(action.id.as_ref());
+        if !self.dispatch_plugin(&id, window, cx) {
+            tracing::warn!(command = %id, "no plugin registered this command");
+            self.set_status(format!("Unknown plugin command {id}"), true, cx);
+        }
+        cx.notify();
+    }
+
+    /// Run a plugin command, if one owns `id`.
+    ///
+    /// The host builds the [`CommandContext`]: a plugin reads the last run and
+    /// the workspace directory because the window hands them over, never
+    /// because it could reach a service. The returned outcome is what the
+    /// status bar shows, so a plugin never touches UI state either.
+    fn dispatch_plugin(
+        &mut self,
+        id: &CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(spec) = self.services.plugin.command(id) else {
+            return false;
+        };
+        let context = CommandContext {
+            last_run: self.last_run.clone(),
+            workspace_root: self.services.workspace_root.clone(),
+        };
+        let outcome = (spec.dispatch)(window, cx, &context);
+        self.set_status(outcome.message().to_string(), outcome.is_failure(), cx);
+        self.services.command.record_executed(id.clone());
+        true
+    }
+
     // ── query lifecycle ──────────────────────────────────────────────────
 
     fn run_sql(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -477,11 +530,15 @@ impl MainWindow {
                         cx.notify();
                     });
                 }
-                let cancelled = self
-                    .services
-                    .query
-                    .completed_run(run)
+                let completed = self.services.query.completed_run(run);
+                let cancelled = completed
+                    .as_ref()
                     .is_some_and(|r| r.outcome == QueryOutcome::Cancelled);
+                if let Some(completed) = completed {
+                    // Plugin commands read this through `CommandContext`; the
+                    // handle is replaced per finished run, never mutated.
+                    self.last_run = Some(Arc::new(completed));
+                }
                 if cancelled {
                     self.set_status(
                         format!("Cancelled — {rows} {} (partial)", row_word(rows)),
@@ -666,6 +723,7 @@ impl Render for MainWindow {
             .on_action(cx.listener(Self::refresh_schema_action))
             .on_action(cx.listener(Self::refresh_incremental_action))
             .on_action(cx.listener(Self::refresh_all_action))
+            .on_action(cx.listener(Self::plugin_command_action))
             .relative()
             .flex()
             .flex_col()
@@ -968,7 +1026,8 @@ mod view_tests {
         let schema = SchemaService::new(bus.clone(), connection.clone());
         let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
         let command = CommandService::new(bus.clone());
-        cx.update(|cx| commands::install(cx, &command));
+        let plugin = PluginService::new(bus.clone(), command.clone());
+        cx.update(|cx| commands::install(cx, &command, &[]));
         let services = Services {
             bus,
             connection,
@@ -976,6 +1035,8 @@ mod view_tests {
             command,
             schema,
             intelligence,
+            plugin,
+            workspace_root: None,
         };
         let root = cx.add_window(|window, cx| {
             MainWindow::new(services, None, DevOptions::default(), window, cx)
@@ -1058,7 +1119,8 @@ mod view_tests {
         let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
         intelligence.install_snapshot(&users_snapshot());
         let command = CommandService::new(bus.clone());
-        cx.update(|cx| commands::install(cx, &command));
+        let plugin = PluginService::new(bus.clone(), command.clone());
+        cx.update(|cx| commands::install(cx, &command, &[]));
         let services = Services {
             bus,
             connection,
@@ -1066,6 +1128,8 @@ mod view_tests {
             command,
             schema,
             intelligence: intelligence.clone(),
+            plugin,
+            workspace_root: None,
         };
         let root = cx.add_window(|window, cx| {
             MainWindow::new(services, None, DevOptions::default(), window, cx)
@@ -1114,7 +1178,8 @@ mod view_tests {
         let schema = SchemaService::new(bus.clone(), connection_service.clone());
         let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
         let command = CommandService::new(bus.clone());
-        cx.update(|cx| commands::install(cx, &command));
+        let plugin = PluginService::new(bus.clone(), command.clone());
+        cx.update(|cx| commands::install(cx, &command, &[]));
         let services = Services {
             bus,
             connection: connection_service,
@@ -1122,6 +1187,8 @@ mod view_tests {
             command,
             schema,
             intelligence,
+            plugin,
+            workspace_root: None,
         };
         let root = cx.add_window(|window, cx| {
             MainWindow::new(
@@ -1162,5 +1229,153 @@ mod view_tests {
         assert_eq!(rows, 4, "both streamed batches reach the grid");
         assert_eq!(columns, 1, "the column metadata arrives first");
         assert_eq!(status, "Done — 4 rows", "the outcome task owns the status");
+    }
+
+    /// A plugin that contributes one command and counts host dispatches.
+    struct CounterPlugin {
+        manifest: tempr_plugin::PluginManifest,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        keystroke: &'static str,
+    }
+
+    impl CounterPlugin {
+        fn new(keystroke: &'static str) -> Self {
+            Self {
+                manifest: tempr_plugin::PluginManifest {
+                    id: "dev.tempr.test",
+                    name: "Test plugin",
+                    version: "0.1.0",
+                    api_version: tempr_plugin::PLUGIN_API_VERSION,
+                    requires: &[],
+                    capabilities: &[tempr_plugin::Capability::CommandContribution],
+                },
+                hits: Arc::default(),
+                keystroke,
+            }
+        }
+    }
+
+    impl tempr_plugin::Plugin for CounterPlugin {
+        fn manifest(&self) -> &tempr_plugin::PluginManifest {
+            &self.manifest
+        }
+
+        fn activate(
+            &mut self,
+            cx: &mut tempr_plugin::PluginContext<'_>,
+        ) -> Result<(), tempr_plugin::PluginError> {
+            let hits = self.hits.clone();
+            cx.register_command(tempr_plugin::PluginCommandSpec::new(
+                CommandId::new("dev.tempr.test::count"),
+                "Export last run as CSV",
+                "Plugin",
+                &[self.keystroke],
+                move |_window, _cx, _context| {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tempr_plugin::CommandOutcome::done("Exported 2 rows to last-run.csv")
+                },
+            ))
+        }
+    }
+
+    /// Services with one activated plugin. Returns the specs so the caller can
+    /// install the keybindings, exactly as the binary does.
+    fn services_with_plugin(
+        plugin: CounterPlugin,
+    ) -> (Services, Vec<tempr_plugin::PluginCommandSpec>) {
+        let bus = Arc::new(EventBus::new());
+        let connection = ConnectionService::new(bus.clone());
+        let query = QueryService::new(bus.clone(), connection.clone());
+        let schema = SchemaService::new(bus.clone(), connection.clone());
+        let intelligence = IntelligenceService::new(bus.clone(), schema.clone());
+        let command = CommandService::new(bus.clone());
+        let plugin_service = PluginService::new(bus.clone(), command.clone());
+        let report = plugin_service.activate_all(vec![Box::new(plugin)]);
+        assert!(report.all_activated(), "{:?}", report.failed);
+        let specs = plugin_service.command_specs();
+        let services = Services {
+            bus,
+            connection,
+            query,
+            command,
+            schema,
+            intelligence,
+            plugin: plugin_service,
+            workspace_root: Some(PathBuf::from("/tmp/tempr-test")),
+        };
+        (services, specs)
+    }
+
+    #[gpui::test]
+    fn a_plugin_command_runs_from_its_default_keystroke(cx: &mut TestAppContext) {
+        let plugin = CounterPlugin::new("ctrl-alt-y");
+        let hits = plugin.hits.clone();
+        let (services, specs) = services_with_plugin(plugin);
+        cx.update(|cx| commands::install(cx, &services.command, &specs));
+        let root = cx.add_window(|window, cx| {
+            MainWindow::new(services, None, DevOptions::default(), window, cx)
+        });
+        let window = *root;
+        draw(cx, window);
+
+        press(cx, window, "ctrl-alt-y");
+        draw(cx, window);
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let status = cx.read(|cx| root.read(cx).expect("root").status.clone());
+        assert!(
+            status.contains("Exported 2 rows"),
+            "the command's outcome must reach the status bar, got {status:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_plugin_command_runs_from_the_palette(cx: &mut TestAppContext) {
+        let plugin = CounterPlugin::new("ctrl-alt-y");
+        let hits = plugin.hits.clone();
+        let (services, specs) = services_with_plugin(plugin);
+        cx.update(|cx| commands::install(cx, &services.command, &specs));
+        let root = cx.add_window(|window, cx| {
+            MainWindow::new(services, None, DevOptions::default(), window, cx)
+        });
+        let window = *root;
+        draw(cx, window);
+
+        press(cx, window, "ctrl-shift-p");
+        for ch in "export".chars() {
+            press(cx, window, &ch.to_string());
+        }
+        draw(cx, window);
+        press(cx, window, "enter");
+        draw(cx, window);
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "enter on a palette hit must dispatch the plugin command"
+        );
+    }
+
+    #[gpui::test]
+    fn an_unknown_plugin_command_is_a_no_op_with_a_notice(cx: &mut TestAppContext) {
+        let plugin = CounterPlugin::new("ctrl-alt-y");
+        let hits = plugin.hits.clone();
+        let (services, specs) = services_with_plugin(plugin);
+        cx.update(|cx| commands::install(cx, &services.command, &specs));
+        let root = cx.add_window(|window, cx| {
+            MainWindow::new(services, None, DevOptions::default(), window, cx)
+        });
+        let window = *root;
+        draw(cx, window);
+
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_action(Box::new(PluginCommand::new("dev.tempr.absent::run")), cx);
+        })
+        .unwrap();
+        draw(cx, window);
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let status = cx.read(|cx| root.read(cx).expect("root").status.clone());
+        assert!(status.contains("Unknown plugin command"), "got {status:?}");
     }
 }

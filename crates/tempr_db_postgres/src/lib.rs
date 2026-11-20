@@ -10,10 +10,12 @@ use tempr_domain::ValueType;
 pub(crate) mod decode;
 pub(crate) mod driver;
 pub(crate) mod params;
+mod plugin;
 pub(crate) mod stream;
 mod tls;
 
 pub use driver::PostgresDriver;
+pub use plugin::PostgresPlugin;
 
 pub(crate) fn pg_type_to_value_type(pg_type: &Type) -> ValueType {
     match *pg_type {

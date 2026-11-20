@@ -6,17 +6,18 @@
 
 ## Purpose
 
-The vision document ([01-vision.md](01-vision.md)) mandates that everything in Tempr is extensible. This document defines what "everything" means concretely by specifying the seven extension points that the plugin system exposes:
+The vision document ([01-vision.md](01-vision.md)) mandates that everything in Tempr is extensible. This document defines what "everything" means concretely. Stage 1 of Phase 4 shipped five extension points; themes arrive in stage 2:
 
-1. **Database drivers** — connect to new engines beyond the built-in PostgreSQL driver.
+1. **Database drivers** — connect to new engines beyond the PostgreSQL driver (`dev.tempr.postgres`).
 2. **Completion providers** — inject custom candidates into the SQL completion pipeline.
-3. **Themes** — supply color schemes, typography, and spacing tokens to the UI layer.
-4. **Commands** — register new actions in the command palette and bind keybindings.
-5. **Panels** — contribute custom panels to the workspace dock layout.
-6. **Result renderers** — provide specialized cell rendering for custom data types (e.g., GeoJSON, Protobuf).
-7. **AI providers** — hook into the AI completion and generation surface with custom backends.
+3. **Commands** — register new actions in the command palette and bind keybindings.
+4. **Result renderers** — provide specialized cell rendering for columns the built-in formatter does not serve.
+5. **Panels** — contribute custom panels to the workspace dock (rendered by the stage-3 dock).
+6. **Themes** *(stage 2)* — supply color schemes and font settings as data.
 
-Every core feature in Tempr — including the PostgreSQL driver, the built-in themes, and the default result renderers — is implemented as a static plugin that registers through the same API third-party plugins use. This "eat your own plugin API" policy guarantees the API surface is battle-tested, ergonomic, and designed for real use from day one.
+AI providers are **not** in the v1 API (see "Not in the shipped API" below).
+
+Every core feature in Tempr uses the same registration path a third-party plugin does: the PostgreSQL driver is a plugin, and `plugins/export-csv` is both a reference and a test of the public surface. This "eat your own plugin API" policy is what keeps the surface honest.
 
 ---
 
@@ -27,7 +28,7 @@ This document governs:
 - The `Plugin` root trait that every plugin implements.
 - The `PluginManifest` metadata structure (id, name, version, declared capabilities).
 - The `PluginContext` that plugins receive during activation — the only surface through which plugins interact with the host.
-- Each of the seven extension-point trait contracts: `DatabaseDriver`, `CompletionProvider`, `ResultRenderer`, `ThemeProvider`, `CommandContribution`, `PanelContribution`, `AiProvider`.
+- Each extension-point contract: `DatabaseDriver` (re-exported from `tempr_db`), `CompletionProvider`, `ResultRenderer`, `Panel`, and `PluginCommandSpec`; `register_theme(ThemeData)` joins them in stage 2.
 - Plugin lifecycle: discovery, activation, running, deactivation, and failure states.
 - The v1 static-plugin delivery model and the rationale for deferring dynamic loading.
 - The security boundary: plugins never receive access to the `ServiceRegistry`.
@@ -76,30 +77,43 @@ Implementing the PostgreSQL driver, the built-in themes, and the default result 
 
 ## Interfaces
 
+These signatures are the shipped `tempr_plugin` surface (crates/tempr_plugin).
+Everything a plugin names comes from that crate, including the GPUI and driver
+types it re-exports; a plugin never depends on `tempr_services`, `tempr_ui`,
+`tempr_intel` or `tempr_editor`.
+
 ### Plugin Manifest
 
-Every plugin declares a manifest with stable identity and capability metadata:
-
 ```rust
+pub const PLUGIN_API_VERSION: (u16, u16) = (0, 1);
+
 pub struct PluginManifest {
-    pub id: &'static str,           // unique, reverse-domain recommended: "dev.tempr.postgres"
-    pub name: &'static str,         // human-readable: "PostgreSQL Driver"
-    pub version: &'static str,      // semver: "0.1.0"
-    pub capabilities: Vec<Capability>,
+    pub id: &'static str,              // reverse-domain, unique: "dev.tempr.postgres"
+    pub name: &'static str,            // human-readable: "PostgreSQL driver"
+    pub version: &'static str,         // the plugin's own version, unrelated to the API
+    pub api_version: (u16, u16),       // the API the plugin was written against
+    pub requires: &'static [&'static str], // plugin ids that must activate first
+    pub capabilities: &'static [Capability],
 }
 
 pub enum Capability {
-    Driver { engine_name: &'static str },
+    Driver { engine: &'static str },
     CompletionProvider,
     Theme,
     CommandContribution,
     PanelContribution,
-    ResultRenderer { column_types: Vec<&'static str> },
-    AiProvider { provider_name: &'static str },
+    ResultRenderer,
 }
 ```
 
-The `capabilities` list is advisory — it enables early discovery (the host can check whether a plugin declares the capabilities the workspace needs) and UI display (listing installed plugins and what they provide). Actual registration still happens in `activate` via `PluginContext`.
+`id` must be a lowercase reverse-domain namespace (at least two dot-separated
+segments of `a-z`, `0-9`, `-`). Command and panel ids are namespaced with it:
+`dev.tempr.export-csv::export_last_run`. `PluginManifest::validate` rejects a
+malformed id and an API-major mismatch with a typed `PluginError`.
+
+The `capabilities` list is advisory: registration in `activate` is what counts.
+It exists for discovery, for UI listing, and for logging a plugin that declares
+a capability it never registers.
 
 ### API Versioning
 
@@ -113,233 +127,258 @@ The surface that becomes stable is exactly what `tempr_plugin` re-exports. Nothi
 pub trait Plugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
 
-    /// Called once after construction. The plugin registers all its
-    /// capabilities through the PluginContext. Returning Err marks the
-    /// plugin as failed; its registrations are discarded.
-    fn activate(&mut self, cx: &mut PluginContext) -> Result<(), PluginError>;
+    /// Called once at startup. The plugin registers everything through `cx`.
+    /// `Err` discards every registration this plugin made; the host reports it
+    /// and continues with the other plugins.
+    fn activate(&mut self, cx: &mut PluginContext<'_>) -> Result<(), PluginError>;
 
-    /// Called before shutdown. The plugin should release any held resources.
-    /// The host discards all registrations after this returns.
-    fn deactivate(&mut self);
+    /// Release resources. Registrations are dropped by the host either way.
+    fn deactivate(&mut self) {}
 }
 ```
+
+`PluginService` additionally bounds activation with `catch_unwind`, so a plugin
+that panics is reported as `PluginError::ActivationPanicked` instead of taking
+the process down.
 
 ### PluginContext — The Registration Surface
 
 ```rust
-pub struct PluginContext<'a> {
-    // Registration APIs — the ONLY surface plugins touch.
-    pub fn register_driver(&mut self, driver: Arc<dyn DatabaseDriver>);
-    pub fn register_completion_provider(&mut self, p: Arc<dyn CompletionProvider>);
-    pub fn register_result_renderer(&mut self, r: Arc<dyn ResultRenderer>);
-    pub fn register_theme(&mut self, t: ThemeProvider);
-    pub fn register_command(&mut self, c: CommandContribution);
-    pub fn register_panel(&mut self, p: PanelContribution);
-    pub fn register_ai_provider(&mut self, a: Arc<dyn AiProvider>);
+pub struct PluginContext<'a> { /* plugin id, namespace, event bus, pending registrations */ }
 
-    /// Read-only access to the event bus. Plugins may subscribe to
-    /// AppEvent (including PluginEvent) and publish their own events.
+impl PluginContext<'_> {
+    pub fn plugin_id(&self) -> PluginId;
+    pub fn namespace(&self) -> &'static str;
+
+    /// Read-only event bus. A plugin may subscribe to `AppEvent` and publish
+    /// its own `PluginEvent`s. It is the only host object a plugin can reach.
     pub fn events(&self) -> &EventBus;
+
+    pub fn register_driver(&mut self, driver: Arc<dyn DatabaseDriver>) -> Result<(), PluginError>;
+    pub fn register_completion_provider(&mut self, p: Arc<dyn CompletionProvider>) -> Result<(), PluginError>;
+    pub fn register_result_renderer(&mut self, r: Arc<dyn ResultRenderer>) -> Result<(), PluginError>;
+    pub fn register_command(&mut self, c: PluginCommandSpec) -> Result<(), PluginError>;
+    pub fn register_panel(&mut self, p: Arc<dyn Panel>) -> Result<(), PluginError>;
 }
 ```
 
-A plugin may register multiple capabilities of the same type (e.g., a plugin that provides drivers for both MySQL and SQLite calls `register_driver` twice). Calling a registration method with a duplicate identifier (e.g., the same engine name) is a `PluginError::DuplicateRegistration`.
+Every check that can fail runs inside the context, during the plugin's own
+`activate`, so the plugin sees its own error:
+
+- a duplicate driver engine, provider name, command id or panel id within one
+  plugin → `PluginError::DuplicateRegistration`;
+- a command or panel id outside the plugin's namespace →
+  `PluginError::ForeignNamespace`;
+- a duplicate engine, command id or panel id across two plugins is caught by
+  `PluginService` when it installs the second plugin, and rejects that plugin
+  atomically (nothing of it is installed).
+
+The host drains the collected registrations only after `activate` returns `Ok`,
+which is what makes "a failed plugin leaves no trace" true.
 
 ### Extension-Point Traits
 
-Each extension point is a trait that the host stores and invokes at the appropriate time. These are the contracts plugins implement.
+Each extension point is a trait the host stores in a typed vector and invokes at
+a fixed point in its own pipeline.
 
 #### DatabaseDriver
+
+`tempr_db`'s trait is the contract; `tempr_plugin` re-exports it.
 
 ```rust
 #[async_trait]
 pub trait DatabaseDriver: Send + Sync {
-    /// Engine identifier, e.g. "postgresql", "mysql", "sqlite".
-    /// Must be unique across all registered drivers.
-    fn engine_name(&self) -> &'static str;
-
-    /// Establish a connection to the database using the provided config.
-    async fn connect(&self, cfg: &ConnectionConfig) -> Result<Box<dyn DriverConnection>, DriverError>;
+    fn engine(&self) -> EngineId;
+    async fn connect(&self, connection: &Connection) -> Result<Box<dyn DriverConnection>, DriverError>;
 }
 ```
 
-The `DriverConnection` trait (defined in [09-database-engine.md](09-database-engine.md)) provides `execute`, `cancel`, `snapshot_schema`, and `transaction` methods. This plugin-level trait is intentionally thin — it declares engine identity and connection creation. The full connection lifecycle is governed by the database engine layer.
+`EngineId` is the registration key: one driver per engine. `DriverConnection`
+(also re-exported) owns execution, cancellation, introspection and the engine's
+keyword list — see [09-database-engine.md](09-database-engine.md).
+`dev.tempr.postgres` is the reference implementation.
 
 #### CompletionProvider
 
 ```rust
 pub trait CompletionProvider: Send + Sync {
-    /// Provide completion candidates for the given request.
-    /// Results are merged with the built-in completion pipeline
-    /// and ranked together (ranking detail in 12-sql-intelligence.md).
-    fn complete(&self, req: &CompletionRequest) -> Vec<CompletionItem>;
+    /// Human-readable owner, used when logging a slow provider.
+    fn provider_name(&self) -> &'static str;
+
+    fn complete(&self, req: &PluginCompletionRequest<'_>) -> Vec<CompletionItem>;
+}
+
+pub struct PluginCompletionRequest<'a> {
+    pub file: SqlFileId,
+    pub text: &'a str,          // buffer text; the provider never sees the rope
+    pub offset: usize,
+    pub prefix: &'a str,        // identifier fragment before the cursor, as typed
+    pub explicit: bool,         // ctrl-space
+    pub connection: Option<ConnectionId>,
 }
 ```
 
-The `CompletionRequest` carries the buffer snapshot, cursor offset, and current connection ID. The `CompletionItem` carries label, kind, detail text, and a sort-priority hint. Plugins may return candidates from any source — built-in keyword lists, schema-derived suggestions, external catalogs. Merging and ranking of plugin-provided candidates with the built-in pipeline is deferred to [12-sql-intelligence.md](12-sql-intelligence.md).
+The request is text-based by design: exposing the engine's `Analysis` or the
+editor's `Buffer` would freeze internal types into the public API. A provider is
+synchronous because completion has a 5 ms budget for the whole fan-out; an async
+provider would let a plugin hide I/O behind it.
+
+`CompletionItem::plugin(label, insert, detail, priority, range)` builds an item
+whose `priority` is a weight hint in `0..=300` (stored in `score` until the host
+ranks it). The host maps it to `100 + priority`, so a plugin item can outrank
+keywords but never a schema object — see [12-sql-intelligence.md](12-sql-intelligence.md).
 
 #### ResultRenderer
 
 ```rust
 pub trait ResultRenderer: Send + Sync {
-    /// Determine whether this renderer can handle the given column type.
     /// Called once per column when a result set arrives.
     fn can_render(&self, col: &ColumnSpec) -> bool;
 
-    /// Render a single cell value as a GPUI Element.
-    /// Called only for columns where can_render returned true.
-    fn render_cell(&self, value: &Value, col: &ColumnSpec) -> Box<dyn Element>;
+    /// Render one cell. `Value::Null` never reaches a renderer.
+    fn render_cell(&self, value: &Value, col: &ColumnSpec) -> AnyElement;
 }
 ```
 
-The host evaluates `can_render` for each registered `ResultRenderer` in registration order and picks the first match. If no renderer matches, the default text renderer is used. This chain lets plugins provide specialized rendering for custom types (JSON pretty-printing, bytea hex display, geographic data visualization) without modifying the result grid.
+`AnyElement` rather than `Box<dyn Element>`: GPUI's `Element` has associated
+types and is not object-safe (→ D37). The host resolves the chain once per
+result set, in registration order, first match wins, and falls back to the
+built-in text formatter for unclaimed columns and for NULLs.
 
-#### ThemeProvider
+#### Panel
 
 ```rust
-pub trait ThemeProvider: Send + Sync {
-    /// Theme identifier, e.g. "dracula", "monokai", "solarized-dark".
-    fn name(&self) -> &'static str;
-
-    /// Return the complete theme data — color palette, typography,
-    /// spacing tokens — consumed by GPUI components (see 11-gpui.md).
-    fn theme_data(&self) -> ThemeData;
+pub trait Panel: Send + Sync {
+    fn panel_id(&self) -> &'static str;
+    fn title(&self) -> SharedString;
+    fn render(&mut self, window: &mut Window, cx: &mut App) -> AnyElement;
+    fn focus_handle(&self, _cx: &App) -> Option<FocusHandle> { None }
 }
 ```
 
-Themes register as `ThemeProvider` instances (not wrapped in `Arc<dyn ...>`) because the host may need to clone theme data for concurrent rendering. `ThemeData` contains all color, font, and spacing tokens that the GPUI component library consumes.
+A trait, not a closure: a panel owns state and needs `&mut Window, &mut App`
+each frame, and a plugin cannot create a GPUI entity during `activate` (no
+window exists yet). Panels are stored by `PluginService`; the dock that renders
+them arrives in stage 3 of Phase 4.
 
-#### CommandContribution
+#### PluginCommandSpec and the PluginCommand action
 
 ```rust
-pub struct CommandContribution {
-    pub id: &'static str,          // unique command ID
-    pub title: &'static str,       // display title in the palette
-    pub keybinding: Option<&'static str>,  // e.g. "cmd+k cmd+r"
-    pub handler: Box<dyn Fn(&mut AppContext) + Send + Sync>,
+pub struct PluginCommandSpec {
+    pub id: CommandId,                 // "dev.tempr.export-csv::export_last_run"
+    pub title: &'static str,
+    pub category: &'static str,
+    pub default_keystrokes: Vec<&'static str>,
+    pub dispatch: Arc<dyn Fn(&mut Window, &mut App, &CommandContext) -> CommandOutcome + Send + Sync>,
 }
 
-impl CommandContribution {
-    pub fn commands(&self) -> Vec<Command> {
-        vec![Command {
-            id: self.id,
-            title: self.title,
-            keybinding: self.keybinding,
-        }]
-    }
+pub struct CommandContext {
+    pub last_run: Option<Arc<QueryRun>>,  // filled by the host, read-only
+    pub workspace_root: Option<PathBuf>,
 }
+
+pub enum CommandOutcome { Done(String), Failed(String) }
+
+/// The one action every plugin command travels through.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = plugin, no_json)]
+pub struct PluginCommand { pub id: SharedString }
 ```
 
-Commands contributed by plugins appear in the command palette alongside core commands. The handler receives a mutable `AppContext` reference — the same surface the command palette uses — but does not receive `ServiceRegistry` access. The handler must delegate to services through the event bus or through the scoped APIs available in `AppContext`.
+Commands contributed by plugins appear in the palette and are bound like core
+commands. Two host constraints shape this:
 
-#### PanelContribution
+- GPUI dispatches by action *type*, and the host cannot name a plugin's types,
+  so every plugin command travels through one payload action, `PluginCommand`.
+  A single window handler resolves the id through `PluginService` (→ D35).
+- A plugin command gets a **host-built** `CommandContext` instead of a service
+  handle: the window supplies the last completed run and the workspace
+  directory, and puts the returned `CommandOutcome` in its status bar. Plugin
+  logic stays in the plugin; data access stays read-only and explicit.
 
-```rust
-pub struct PanelContribution {
-    pub panel_id: &'static str,    // unique panel identifier
-    pub title: &'static str,       // tab title in the dock
-    pub render: Box<dyn Fn() -> Box<dyn Element> + Send + Sync>,
-}
-```
+`no_json` keeps `serde` and `schemars` out of the plugin surface — Tempr installs
+every binding in code, never from a JSON keymap.
 
-Panels register a render function that the host calls to construct the panel's GPUI element tree. The panel appears as a dockable tab in the workspace layout. The render function is a closure because panels may capture configuration or state from the plugin's activation context.
+### Not in the shipped API
 
-#### AiProvider
-
-```rust
-pub trait AiProvider: Send + Sync {
-    /// Provider identifier, e.g. "openai", "anthropic", "local-ollama".
-    fn provider_name(&self) -> &'static str;
-
-    /// Stream a completion response for the given prompt.
-    /// Returns an async iterator of response chunks.
-    /// The host handles buffering and UI integration.
-    async fn complete(&self, prompt: &str) -> BoxStream<'static, Result<String, AiError>>;
-}
-```
-
-AI providers return a `BoxStream` of response chunks, enabling streaming output in the UI (token-by-token rendering as the model generates). The host owns the stream and controls backpressure. The `AiError` type covers network failures, rate limiting, and authentication errors.
+- **Themes.** Stage 2 adds `register_theme(ThemeData)` as *data*, not a
+  `ThemeProvider` trait: a static theme has no behaviour, so a trait would add a
+  vtable and a name method for nothing (spec decision 4). Nothing
+  theme-related exists in `tempr_plugin` yet, deliberately — `0.x` may grow, but
+  it must not publish a type with no consumer.
+- **AI providers.** `AiProvider` was dropped from the v1 API: there is no AI
+  surface to consume it, so it would be an untested type frozen into the
+  contract. It remains a post-v1 idea.
 
 ---
 
 ## Data Flow
 
-### Plugin Lifecycle
+### Plugin lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Discovered
-    Discovered --> Activated: PluginService loads crate
-    Activated --> Running: activate() returns Ok
-    Activated --> Failed: activate() returns Err
-    Running --> Deactivated: deactivate() called
-    Running --> Failed: panic / runtime error
-    Deactivated --> [*]
+    [*] --> Linked: crate is compiled into the binary
+    Linked --> Validated: manifest.validate()
+    Validated --> Failed: bad namespace / API major
+    Validated --> Activating: requires resolved
+    Activating --> Running: activate() returns Ok
+    Activating --> Failed: Err or panic
+    Running --> Deactivated: deactivate_all (shutdown)
     Failed --> [*]
-
-    note right of Discovered
-        Crate is compiled in.
-        Manifest is read.
-        Capability list is validated.
-    end note
-
-    note right of Running
-        Registrations are active.
-        Completion providers fan out.
-        Commands appear in palette.
-    end note
+    Deactivated --> [*]
 ```
 
-### Registration Flow
+There is no discovery step: the binary owns the list (`crates/tempr/src/plugins.rs`) and hands it to `PluginService::activate_all`. `Failed` is terminal for the process — v1 has no reload.
 
-At startup, after the `ServiceRegistry` is constructed but before the first GPUI window opens, `PluginService` iterates over all registered static plugins (Rust crates linked into the binary) and activates them in declared-dependency order:
+### Activation order and failure
 
 ```mermaid
 sequenceDiagram
+    participant Bin as Binary
     participant PS as PluginService
-    participant P1 as Plugin (driver)
-    participant P2 as Plugin (theme)
+    participant P as Plugin
     participant PC as PluginContext
-    participant Bus as EventBus
+    participant Cmd as CommandService
 
-    PS->>P1: activate(cx)
-    P1->>PC: register_driver(PostgresDriver)
-    PC-->>PS: store driver registration
-    P1->>PC: register_command(ExportCsv)
-    PC-->>PS: store command registration
-    P1-->>PS: Ok
-
-    PS->>P2: activate(cx)
-    P2->>PC: register_theme(DraculaTheme)
-    PC-->>PS: store theme registration
-    P2-->>PS: Ok
-
-    Note over PS,Bus: All plugins activated. UI window opens.
-    PS->>Bus: publish PluginsActivated
+    Bin->>PS: activate_all(vec![...])
+    PS->>PS: order by requires (stable on ties)
+    loop per plugin
+        PS->>P: manifest().validate()
+        PS->>P: activate(&mut cx) inside catch_unwind
+        P->>PC: register_* (checks run here)
+        PC-->>P: Ok / typed error
+        alt Ok
+            PS->>Cmd: register command metadata
+            PS->>PS: install drivers/providers/renderers/panels atomically
+        else Err or panic
+            PS->>PS: drop cx registrations, record failure
+        end
+    end
+    PS->>PS: publish PluginsActivated { count, failed }
 ```
 
-After activation, the host stores all registered capabilities in typed vectors. The `PluginService` exposes accessor methods that core services use:
+Rules the sequence encodes:
 
-- `QueryService` calls `PluginService::drivers()` to resolve an `engine_name` to a `DatabaseDriver`.
-- `IntelligenceService` calls `PluginService::completion_providers()` to fan out completion requests.
-- `CommandService` calls `PluginService::commands()` to merge plugin-contributed commands into the palette.
-- `ResultGrid` calls `PluginService::result_renderers()` to find a renderer for each column.
-- `LayoutService` calls `PluginService::panels()` to instantiate dockable panel elements.
-- The theme manager calls `PluginService::themes()` to list available themes.
-- The AI surface calls `PluginService::ai_providers()` to list available backends.
+- a plugin's registrations are collected in its own `PluginContext`; the host drains them only on `Ok`, so no rollback code exists;
+- cross-plugin duplicate engine / command id / panel id rejects the **second** plugin atomically — it is recorded as failed, and nothing of it is installed;
+- `requires` may name a plugin that failed or is absent: that plugin fails with `DependencyFailed` / `MissingDependency`, and activation continues with the rest;
+- a cycle is reported once per member rather than looping;
+- deactivation runs in reverse activation order at shutdown.
 
-### Completion Fan-Out
+### What the host reads back
 
-When a completion request arrives at the `IntelligenceService`, the flow is:
+| Consumer | Call |
+|---|---|
+| binary → connection service | `driver(&EngineId)` |
+| `IntelligenceService` (after activation) | `completion_providers()` |
+| `ResultGrid` (at construction) | `result_renderers()` |
+| palette | command metadata registered during activation |
+| keymap installer | `command_specs()` |
+| window command dispatch | `command(&CommandId)` |
+| dock (stage 3) | `panels()` |
 
-1. The built-in `SemanticEngine` generates its candidates (see [12-sql-intelligence.md](12-sql-intelligence.md)).
-2. `IntelligenceService` iterates over all registered `CompletionProvider`s (from `PluginService`).
-3. Each provider's `complete` method is called with the same `CompletionRequest`.
-4. Results from all providers are collected into a single `Vec<CompletionItem>`.
-5. The combined list is ranked and deduplicated by the ranking layer (detailed in [12-sql-intelligence.md](12-sql-intelligence.md)).
-6. The top N candidates are returned to the editor for display.
-
-This fan-out is synchronous within a single request — `CompletionProvider::complete` is not async because completion must resolve against the current buffer snapshot without awaiting I/O. The <5ms latency budget (per [12-sql-intelligence.md](12-sql-intelligence.md)) applies to the entire fan-out, including all plugin providers.
+`PluginService` does not push data into consumers; each consumer pulls the registry it needs at the point where it is built. That is what keeps the dependency graph acyclic and lets the binary wire `IntelligenceService` after both exist.
 
 ---
 
@@ -394,7 +433,7 @@ As the plugin ecosystem grows, a capability permissions model may be needed — 
 
 ## Related Documents
 
-- [Services](05-services.md) — `PluginService` manages plugin lifecycle and exposes registered capabilities to other services; `CommandService` consumes `CommandContribution` registrations.
+- [Services](05-services.md) — `PluginService` manages plugin lifecycle and exposes registered capabilities to other services; it also registers each `PluginCommandSpec`'s metadata with `CommandService`.
 - [Event System](06-event-system.md) — plugins subscribe to and publish events through the `EventBus`; the `PluginEvent` variant carries namespaced plugin events.
 - [Database Engine](09-database-engine.md) — `DatabaseDriver` and `DriverConnection` contracts; the PostgreSQL driver is the reference static plugin implementation.
 - [SQL Intelligence](12-sql-intelligence.md) — `CompletionProvider` fan-out and ranking; the built-in `SemanticEngine` is the default completion source; plugin completions merge into the ranked list.
