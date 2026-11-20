@@ -13,18 +13,19 @@ Every crate listed below maps to exactly one bounded context and one component d
 ```
 tempr/                    # Cargo workspace root
 ├── crates/
-│   ├── tempr/            # binary: app entry, service wiring
+│   ├── tempr/            # binary: app entry, service wiring, static plugin list
 │   ├── tempr_domain/     # domain model types
 │   ├── tempr_workspace/  # WorkspaceService, storage
 │   ├── tempr_events/     # EventBus, AppEvent
-│   ├── tempr_services/   # remaining core services
-│   ├── tempr_plugin/     # Plugin API traits, PluginContext
+│   ├── tempr_services/   # remaining core services, incl. PluginService
+│   ├── tempr_plugin/     # Plugin API: manifest, lifecycle, PluginContext, traits
 │   ├── tempr_db/         # driver abstraction, QueryStream
 │   ├── tempr_db_postgres/# PostgreSQL driver (static plugin)
 │   ├── tempr_editor/     # Buffer, rope, syntax
-│   ├── tempr_ui/         # GPUI components, views
+│   ├── tempr_ui/         # GPUI components, views (result grid included)
 │   ├── tempr_intel/      # SemanticEngine, completion, CatalogCache
-│   └── tempr_grid/       # RowStore, ResultGrid
+│   └── plugins/          # out-of-tree-shaped plugins, linked into the binary
+│       └── export-csv/   # reference plugin: export last run as CSV
 └── docs/
 ```
 
@@ -34,14 +35,14 @@ tempr/                    # Cargo workspace root
 | `tempr_domain` | Domain model types shared across all layers (Connection, Query, Column, DataType), plus the shared text helpers (`fuzzy_match` for the palette and completion ranking) | [03 — Domain](03-domain-model.md) |
 | `tempr_workspace` | WorkspaceService, project storage, state persistence | [04 — Workspace](04-workspace.md), [07 — State](07-storage.md) |
 | `tempr_events` | EventBus, AppEvent enum, publish/subscribe plumbing | [06 — Events](06-event-system.md) |
-| `tempr_services` | Remaining core services (connection management, session lifecycle) | [05 — Services](05-services.md) |
-| `tempr_plugin` | Plugin API traits, PluginContext, plugin lifecycle hooks | [08 — Plugin System](08-plugin-api.md) |
+| `tempr_services` | Core services — connection, query, schema, intelligence, history, command, settings, layout, and `PluginService` (activation + plugin registries) | [05 — Services](05-services.md) |
+| `tempr_plugin` | The public plugin surface: `PluginManifest`, `Plugin`, `PluginContext`, the extension traits, `PluginCommand` action and `CommandContext`. Re-exports the `tempr_db` driver trait and the GPUI types a panel needs, so a plugin names nothing above it | [08 — Plugin System](08-plugin-api.md) |
 | `tempr_db` | Driver abstraction trait, QueryStream, result decoding | [09 — Database](09-database-engine.md) |
-| `tempr_db_postgres` | PostgreSQL driver — ships as a static plugin, depends only on `tempr_db` + `tempr_plugin` | [09 — Database](09-database-engine.md) |
+| `tempr_db_postgres` | PostgreSQL driver — ships as a static plugin through `dev.tempr.postgres`; depends on `tempr_db` + `tempr_plugin` | [09 — Database](09-database-engine.md) |
 | `tempr_editor` | Buffer, rope data structures, syntax highlighting | [10 — Editor](10-editor.md) |
-| `tempr_ui` | GPUI components, views, layout | [11 — UI](11-gpui.md) |
+| `tempr_ui` | GPUI components, views, layout. `ResultGrid` lives here (the earlier `tempr_grid` split never happened — the grid needed GPUI types from the first render) | [11 — UI](11-gpui.md), [13 — Grid](13-result-grid.md) |
+| `plugins/export-csv` | Reference plugin: completion provider + `export_last_run` command (RFC 4180 CSV). Depends on `tempr_plugin` **only** — the shape a third-party plugin will have | [08 — Plugin System](08-plugin-api.md) |
 | `tempr_intel` | `CatalogCache` (immutable arena over `SchemaSnapshot`: id/identity lookups, exact ± folded relation/column lookups, contiguous `columns_of`, folded `prefix_search`), `SemanticEngine` (scopes, reference resolution, diagnostics, `analyze`/`complete`/`hover`), completion (context classification, candidate generation, ranking), hover cards (`HoverInfo`), release probes | [12 — Intelligence](12-sql-intelligence.md) |
-| `tempr_grid` | RowStore, ResultGrid, data grid rendering | [13 — Grid](13-result-grid.md) |
 
 ## Design Rationale
 
@@ -49,9 +50,9 @@ tempr/                    # Cargo workspace root
 
 - **Compile-time layer enforcement.** Rust's dependency system means a crate cannot import symbols from a crate it does not list as a dependency. If `tempr_domain` is not in your `Cargo.toml`, you cannot accidentally couple to it. Violations of layering (e.g. `tempr_db` importing `tempr_ui`) fail at `cargo check`, not in code review.
 
-- **Incremental build times.** Touching `tempr_grid` recompiles only `tempr_grid` and its dependents (`tempr_ui`, the binary). `tempr_intel`, `tempr_editor`, and `tempr_db_postgres` are untouched. On a cold build this matters less; during iterative development it compounds into hours saved per week.
+- **Incremental build times.** Touching `tempr_intel` recompiles it and its dependents (`tempr_services`, `tempr_ui`, the binary). `tempr_editor`, `tempr_db`, and `tempr_db_postgres` are untouched. On a cold build this matters less; during iterative development it compounds into hours saved per week.
 
-- **Plugin-crate pattern.** The `tempr_db_postgres` crate demonstrates how a database driver plugs into the system: it depends on `tempr_db` (for the `Driver` trait) and `tempr_plugin` (for `PluginContext`), and nothing else. New drivers (`tempr_mysql`, `tempr_sqlite`) will follow the same pattern — add one crate, register it at startup, done. The pattern generalises to any extension point.
+- **Plugin-crate pattern.** A plugin crate depends on `tempr_plugin` and nothing else internal. `tempr_plugin` re-exports `tempr_db`'s driver trait, `tempr_domain`'s ids and `Value`, and the GPUI types a panel needs, so the plugin never names `tempr_services` or `tempr_ui`. `tempr_db_postgres` (driver) and `plugins/export-csv` (completion provider + command) are the two reference implementations; registration is one `Vec<Box<dyn Plugin>>` in `crates/tempr/src/plugins.rs`.
 
 ## Interfaces
 
@@ -82,7 +83,7 @@ Each member crate's `Cargo.toml` inherits from the workspace:
 
 ```toml
 [package]
-name = "tempr_grid"
+name = "tempr_ui"
 version.workspace = true
 edition.workspace = true
 
@@ -127,9 +128,9 @@ CI mirrors this pipeline exactly. There are no CI-only steps. If `cargo fmt --ch
 The following graph shows which crates depend on which. Arrows point from dependent to dependency (i.e. "A → B" means A imports B). The layering enforced is:
 
 - **Domain** (`tempr_domain`, `tempr_events`) — depended on by almost everything, depend on nothing internal.
-- **Services** (`tempr_workspace`, `tempr_services`, `tempr_plugin`, `tempr_db`) — depend on domain. `tempr_services` additionally depends on `tempr_intel` + `tempr_editor`: its `IntelligenceService` owns a private `Buffer` mirror of the view's text and the `SemanticEngine` built from it.
+- **Services** (`tempr_workspace`, `tempr_services`, `tempr_plugin`, `tempr_db`) — depend on domain. `tempr_services` additionally depends on `tempr_intel` + `tempr_editor`: its `IntelligenceService` owns a private `Buffer` mirror of the view's text and the `SemanticEngine` built from it. `tempr_plugin` depends on `tempr_db` (driver trait), `tempr_events` (read-only bus) and `gpui` (panel/renderer element types) — those are the only things it may expose to plugins.
 - **Drivers** (`tempr_db_postgres`) — depend only on `tempr_db` + `tempr_plugin` + `tempr_domain`.
-- **Intelligence** (`tempr_intel`, `tempr_editor`, `tempr_grid`) — depend on domain only; `tempr_intel` and `tempr_grid` read editor types, and nothing here depends back on `tempr_services` (no cycle).
+- **Intelligence & editor** (`tempr_intel`, `tempr_editor`) — depend on domain; `tempr_intel` reads `tempr_editor` types, and nothing here depends back on `tempr_services` (no cycle). The result grid is part of `tempr_ui`.
 - **UI** (`tempr_ui`) — depends on everything below it, including `tempr_intel` for the `Analysis`/`HoverInfo`/`CompletionItem` model types; nothing depends on `tempr_ui`.
 - **Binary** (`tempr`) — the root; depends on all crates, wires them together.
 
@@ -139,7 +140,6 @@ graph TD
 
     ui["tempr_ui"]
     intel["tempr_intel"]
-    grid["tempr_grid"]
     editor["tempr_editor"]
 
     db_postgres["tempr_db_postgres"]
@@ -153,24 +153,21 @@ graph TD
 
     binary --> ui
     binary --> intel
-    binary --> grid
     binary --> editor
     binary --> db_postgres
     binary --> services
     binary --> workspace
+    binary --> plugin
 
     ui --> intel
-    ui --> grid
     ui --> editor
     ui --> services
     ui --> workspace
+    ui --> plugin
     ui --> domain
 
     intel --> domain
     intel --> editor
-
-    grid --> domain
-    grid --> editor
 
     editor --> domain
 
@@ -179,6 +176,7 @@ graph TD
     db_postgres --> domain
 
     db --> domain
+    plugin --> db
     plugin --> domain
     plugin --> events
 
@@ -200,6 +198,7 @@ graph TD
 | `tempr_domain` depends on no internal crate | Compile error if any internal import added |
 | `tempr_ui` is never imported by another crate | Checked via dependency graph review |
 | `tempr_db_postgres` imports only `tempr_db`, `tempr_plugin`, `tempr_domain` | `cargo clippy` + workspace lint on dependency declarations |
+| A plugin crate (anything under `plugins/`) imports only `tempr_plugin` | `cargo deny` bans list + dependency review |
 | Binary crate is the only crate with `main()` | `[[bin]]` vs `[[lib]]` distinction in Cargo |
 
 ## Future Considerations

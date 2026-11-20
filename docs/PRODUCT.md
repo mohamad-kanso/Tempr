@@ -61,8 +61,8 @@ Status: ✅ implemented, 🔜 planned phase, per docs/PROGRESS.md.
 - AC: Completion popup appears in < 5 ms on a cold (no revalidation) catalog with 10,000 objects. Typing an unknown column reference produces a diagnostic underline.
 
 ### 5. Extensibility & Polish (Phase 4)
-- 🔜 Plugin API versioned from its first release and kept at `0.x` — stability (`1.0`) is declared only when the user says the API is ready, not by finishing Phase 4; documented, backward-compatible within major versions from that point
-- 🔜 Core features migratable to plugin API as reference implementations
+- ✅ Plugin API versioned from its first release and kept at `0.x` — stability (`1.0`) is declared only when the user says the API is ready, not by finishing Phase 4; documented, backward-compatible within major versions from that point *(`tempr_plugin` `PLUGIN_API_VERSION = (0, 1)`: manifest, lifecycle, `PluginContext`, driver/completion/renderer/panel/command extension points; docs/08 rewritten to the shipped surface; 2026-11-19, → D31, D33–D38)*
+- ✅ Core features use the plugin API as reference implementations *(the PostgreSQL driver is `dev.tempr.postgres` resolved through `PluginService`; `plugins/export-csv` — completion provider + `export_last_run` command — depends on `tempr_plugin` only; 2026-11-19, → D33)*
 - 🔜 Theme system supports light and dark themes with configurable accent colors
 - 🔜 Query history persisted and browsable via a dedicated UI panel
 - 🔜 Layout state (panel sizes, open files, cursor positions) persists across restarts

@@ -13,7 +13,7 @@ This document governs:
 - **RowStore** — a columnar, chunked storage engine that receives `Batch`es from `QueryStream`, holds them in memory up to a configurable threshold, and spills to disk beyond that threshold. It is the single source of truth for all rows fetched so far.
 - **ResultGrid** — a GPUI view that renders only the rows and columns currently visible in the viewport. It performs virtualization on both axes: scrolling vertically does not materialize off-screen rows; scrolling horizontally does not render off-screen columns.
 - **ColumnSpec** metadata — the column headers (name, type, ordinal) delivered by `QueryStream::columns()` before any rows arrive, enabling the grid to lay out headers immediately.
-- **ResultRenderer chain** — the extensible rendering pipeline ([08 — Plugin API](08-plugin-api.md)) that maps `Value` variants to cell-level visual output (text, JSON tree, bytea hex preview, etc.).
+- **ResultRenderer chain** — the extensible rendering pipeline ([08 — Plugin API](08-plugin-api.md)): plugins claim columns and render their cells; everything unclaimed uses the built-in text formatter.
 
 The streaming contract is simple: rows arrive in batches, the row store appends them, the grid is notified with `RowsReceived`, and the grid re-renders only its visible viewport. The user sees the first rows appear as soon as the first batch is received, while the query may still be running on the server.
 
@@ -32,13 +32,13 @@ The streaming contract is simple: rows arrive in batches, the row store appends 
 | Concern | Owner | Notes |
 |---|---|---|
 | Chunked columnar storage of received `Batch`es | `RowStore` | Memory-capped; spills to disk when threshold exceeded |
-| Cell-level rendering (text, JSON, bytea, NULL indicator) | `ResultRenderer` chain | Delegated through [08 — Plugin API](08-plugin-api.md) |
+| Cell-level rendering beyond text | `ResultRenderer` chain | Delegated through [08 — Plugin API](08-plugin-api.md) |
 | Viewport virtualization (rows × columns) | `ResultGrid` (GPUI view) | Renders only visible cells; re-renders on scroll |
 | Column header rendering and column resize/hide | `ResultGrid` | Column metadata from `QueryStream::columns()` |
 | Cell selection and copy (CSV / TSV / JSON) | `ResultGrid` + `ClipboardService` | Keyboard-driven selection; command-registered copy actions |
 | Column sort (client-side, within fetched rows) | `ResultGrid` | Sorts only rows currently in `RowStore`; partial-fetch semantics apply |
 | Cell inspector (large values, expand) | `ResultGrid` | Opens a detail pane for oversized cell content |
-| NULL vs empty-string visual distinction | `ResultRenderer` | NULL renders as a dimmed `∅`; empty string renders as blank |
+| NULL vs empty-string visual distinction | grid formatter | NULL renders as a dimmed `∅`, never through a plugin; empty string renders as blank |
 | Cancel handling | `ResultGrid` / `QueryService` | On `QueryFinished { outcome: Cancelled }`, grid shows partial results with a banner |
 | Export (CSV/JSON/TSV of visible or full fetched rows) | `ResultGrid` | Commands: `ExportCsv`, `ExportJson`, `ExportTsv` |
 
@@ -224,18 +224,24 @@ pub enum CopyFormat {
 
 ### ResultRenderer chain
 
-Cell rendering is delegated to a chain of renderers registered through the plugin system ([08 — Plugin API](08-plugin-api.md)). Each renderer declares which `ValueType` it handles and produces a GPUI element for a cell value.
+Cell rendering is delegated to a chain of renderers contributed by plugins ([08 — Plugin API](08-plugin-api.md)). The trait is column-aware and returns a GPUI `AnyElement`:
 
-| Renderer | Handles | Output |
-|---|---|---|
-| `TextRenderer` | `String`, `Int64`, `Float64`, `Bool`, `Numeric`, `Uuid`, `Date`, `Time`, `Timestamp` | Plain text, truncated with ellipsis if wider than column |
-| `NullRenderer` | `Null` | Dimmed `∅` symbol |
-| `JsonRenderer` | `Json` | Syntax-highlighted JSON with collapsible tree |
-| `ByteaRenderer` | `Bytes` | Hex dump with byte-offset header |
-| `ArrayRenderer` | `Array` | Comma-separated preview with expand-to-inspector |
-| `CustomRenderer` | `Custom` | Raw display string from the driver's display hint |
+```rust
+pub trait ResultRenderer: Send + Sync {
+    fn can_render(&self, col: &ColumnSpec) -> bool;
+    fn render_cell(&self, value: &Value, col: &ColumnSpec) -> AnyElement;
+}
+```
 
-The renderer chain is evaluated in order: the first renderer that claims a `ValueType` wins. Plugins can prepend renderers to override defaults (e.g., a "map preview" renderer for PostGIS geometry types).
+`ResultGrid::with_renderers(plugin.result_renderers())` fixes the chain when the grid is constructed — the chain does not change while a grid lives. On each new result set the grid asks every renderer `can_render` once per column and stores the first index that claims it:
+
+- **first registered renderer wins**, so registration order is priority;
+- a column claimed by no renderer, and every `Value::Null`, uses the built-in text formatter — **NULL is never passed to a plugin**, so no renderer has to handle it;
+- nothing is cached across result sets: a column that was text in one query can be claimed by a renderer in the next.
+
+The built-in formatter is not a `ResultRenderer`; it stays part of the grid so the common path pays no vtable and the grid keeps working with zero plugins. `AnyElement` rather than `Box<dyn Element>` because GPUI's `Element` is not object-safe.
+
+The planned built-ins (`JsonRenderer`, `ByteaRenderer`, `ArrayRenderer`, …) are **not shipped**: they land as ordinary plugins once each has a consumer, which also exercises the API the way a third-party author would.
 
 ---
 
@@ -341,12 +347,9 @@ All capabilities are keyboard-driven and command-registered through the command 
 
 ### Value rendering delegation
 
-Cell rendering is never hard-coded in `ResultGrid`. Every cell is rendered through the `ResultRenderer` chain. The grid calls `renderer.render(value, column_spec)` for each visible cell. The chain is:
+`render_value_cell` is the single dispatch point: if the column has a renderer index and the value is not `Null`, it calls `renderer.render_cell(value, &columns[column])`; otherwise it formats the value as text. The chain is resolved per result set (`bind_columns`), not per cell, so a visible cell costs one `Option<usize>` lookup and no `can_render` calls.
 
-1. **Plugin renderers** (checked first) — plugins can register custom renderers for any `ValueType` or for specific column name patterns.
-2. **Built-in renderers** — `TextRenderer`, `NullRenderer`, `JsonRenderer`, `ByteaRenderer`, `ArrayRenderer`, `CustomRenderer`.
-
-This means a future plugin can add a map renderer for PostGIS geometry columns without modifying the result grid code.
+Because `can_render` sees the whole `ColumnSpec` (type, name, and the driver's type name), a renderer can claim by type, by column name pattern, or by the engine's own type label — e.g. a PostGIS map renderer for `geometry` columns — without the grid knowing anything about `geometry`.
 
 ---
 

@@ -214,7 +214,7 @@ Scope memory is per connection and in memory only. `refresh_incremental` sweeps 
 
 ### IntelligenceService
 
-`IntelligenceService` owns the `SemanticEngine` — the internal completion, diagnostics, and hover pipeline that gives Tempr its "DataGrip" half. It rebuilds the immutable `CatalogCache` from `SchemaRefreshed`, keeps one mirror `Buffer` per file for background analysis, and serves completion and hover synchronously from the UI thread (no I/O, no database access). Plugins can contribute additional completion providers via `CommandContribution` registration through the `PluginService`; `IntelligenceService` fans out requests to all registered providers and merges results (Phase 4).
+`IntelligenceService` owns the `SemanticEngine` — the internal completion, diagnostics, and hover pipeline that gives Tempr its "DataGrip" half. It rebuilds the immutable `CatalogCache` from `SchemaRefreshed`, keeps one mirror `Buffer` per file for background analysis, and serves completion and hover synchronously from the UI thread (no I/O, no database access). Plugin completion providers are attached with `set_completion_providers` after plugin activation; the service fans out to them inside the same synchronous budget, maps each item to `100 + priority` (capped at 300), dedupes on `(label, kind)` against the engine's list and truncates the merged result to 200 items (→ [12-sql-intelligence.md](12-sql-intelligence.md)).
 
 **Owned state:** `SemanticEngine` instance, the analysis cache (`(source revision, Arc<Analysis>)` per file), mirror buffers for analysis, a catalog generation counter, the active connection, and the engine's `CatalogCache`.
 
@@ -322,33 +322,50 @@ pub struct CommandContribution {
 }
 ```
 
-There is no handler closure: a command *is* a GPUI action type, dispatched by the UI (D23). Core commands come from the typed catalog `tempr_ui::commands::core_commands()`; plugin commands will register the same record (their action shape is an open TODO).
+There is no handler closure: a command *is* a GPUI action type, dispatched by the UI (D23). Core commands come from the typed catalog `tempr_ui::commands::core_commands()`; plugin commands register here too, with the context `"MainWindow && !Modal"` and a `PluginCommand { id }` action the window resolves through `PluginService` (→ D35).
 
-Commands contributed by plugins are namespaced (`plugin_id::command_id`) to prevent collisions and are unregistered on plugin deactivation.
+Commands contributed by plugins are namespaced (`plugin_id::command_id`) to prevent collisions and are removed on `PluginService::deactivate_all`.
 
 ---
 
 ### PluginService
 
-`PluginService` discovers, activates, deactivates, and manages the lifecycle of plugins. At v1, plugins are static (compiled-in Rust crates registered at startup — see [Plugin API](08-plugin-api.md)); dynamic loading (WASM or dylib) is a future consideration. `PluginService` receives the `ServiceRegistry` (read-only) and an `EventBus` handle during activation, and provides each plugin with a scoped `PluginContext` that exposes only the registration APIs the plugin needs — plugins never access the `ServiceRegistry` directly. On deactivation, plugin-contributed commands, completion providers, and panels are removed from their respective registries.
+`PluginService` owns activation and every registry a plugin contributes to. At v1 plugins are static (Rust crates linked into the binary and passed in at startup — see [Plugin API](08-plugin-api.md)); there is no discovery, no scanning, no dynamic loading. The service takes the plugin list, orders it by each manifest's `requires`, activates each inside a `catch_unwind` boundary, and installs what it registered only after `activate` returns `Ok`. A plugin that fails or panics is reported in the `ActivationReport` and skipped; the remaining plugins still activate, and the failed one leaves nothing behind.
 
-**Owned state:** plugin manifest list, activation state map (`PluginId → PluginState`), registered extension points (commands, providers, panels, themes).
+Plugins never see the `ServiceRegistry`. Each one receives a `PluginContext` scoped to itself — its id, its namespace, the read-only event bus, and the registration methods. Registration checks run inside that context, so validation errors surface while the plugin is still activating.
 
-**Key async methods:**
+**Owned state:** activation order (for reverse deactivation), typed registries for drivers, completion providers, result renderers and panels (each `(PluginId, Arc<dyn …>)` so deactivation can remove exactly one plugin's contributions), the plugin-command list, and the last `ActivationReport`.
+
+**Key methods (synchronous — activation is startup work, not I/O):**
 
 ```rust
 impl PluginService {
-    pub async fn activate_all(&self) -> Result<(), PluginError>;
-    pub async fn activate(&self, id: PluginId) -> Result<(), PluginError>;
-    pub async fn deactivate(&self, id: PluginId) -> Result<(), PluginError>;
-    pub fn active_plugins(&self) -> Vec<PluginMeta>;
-    pub fn is_active(&self, id: PluginId) -> bool;
+    pub fn new(event_bus: Arc<EventBus>, commands: Arc<CommandService>) -> Arc<Self>;
+    pub fn activate_all(self: &Arc<Self>, plugins: Vec<Box<dyn Plugin>>) -> ActivationReport;
+    pub fn activation_report(&self) -> ActivationReport;
+    pub fn deactivate_all(&self);
+
+    pub fn driver(&self, engine: &EngineId) -> Option<Arc<dyn DatabaseDriver>>;
+    pub fn engines(&self) -> Vec<EngineId>;
+    pub fn completion_providers(&self) -> Vec<Arc<dyn CompletionProvider>>;
+    pub fn result_renderers(&self) -> Vec<(PluginId, Arc<dyn ResultRenderer>)>;
+    pub fn command_specs(&self) -> Vec<PluginCommandSpec>;
+    pub fn command(&self, id: &CommandId) -> Option<PluginCommandSpec>;
+    pub fn panels(&self) -> Vec<Arc<dyn Panel>>;
 }
 ```
 
-**Events published:** `PluginActivated { id: PluginId }`, `PluginDeactivated { id: PluginId }`, `PluginFailed { id: PluginId, error: String }`.
+There is no per-plugin async `activate(&self, id)` / `deactivate(&self, id)` in v1: plugins are linked in, not loaded on demand, and the host never needs to restart one at runtime.
 
-**Events consumed:** `WorkspaceOpened` (triggers activation of all discovered plugins), `WorkspaceClosed` (triggers deactivation in reverse order).
+**How the rest of the app consumes it:**
+
+- the binary resolves the connection engine through `driver(&engine)` and hands the driver to the connection service;
+- `IntelligenceService::set_completion_providers(plugin.completion_providers())` attaches the completion fan-out once, after activation — construction-time wiring would have made the two services mutually dependent;
+- `PluginService` registers each plugin command's metadata with `CommandService` itself, so the palette sees it immediately; `tempr_ui::commands::install` reads `command_specs()` for the default keystrokes;
+- `ResultGrid::with_renderers(plugin.result_renderers())` fixes the renderer chain when a result grid is built;
+- panels are read from `panels()` by the dock in stage 3.
+
+**Events published:** `AppEvent::PluginsActivated { count, failed }` once, at startup.
 
 ---
 
@@ -462,7 +479,7 @@ graph TD
     WS -->|resolve settings| Set
     WS -->|restore layout| LS
     PS -->|register commands| Cmd
-    PS -->|register providers| IS
+    IS -.->|providers attached after activation| PS
 
     %% Event-only communication (dashed)
     QS -.->|QueryStarted, RowsReceived, QueryFinished| Bus
@@ -470,7 +487,7 @@ graph TD
     CS -.->|ConnectionStateChanged| Bus
     SS -.->|SchemaRefreshed| Bus
     WS -.->|WorkspaceOpened, WorkspaceClosed| Bus
-    PS -.->|PluginActivated, PluginDeactivated| Bus
+    PS -.->|PluginsActivated| Bus
     Set -.->|SettingsChanged| Bus
     LS -.->|LayoutChanged| Bus
 
@@ -482,7 +499,7 @@ Reading the diagram:
 
 - `QueryService` and `SchemaService` call `ConnectionService::with_connection_fn` / `with_metadata_connection_fn` directly — this is a synchronous request/response pattern where a connection handle is needed to execute work.
 - `WorkspaceService` calls `SettingsService` and `LayoutService` directly to resolve settings and restore layout during the open sequence.
-- `PluginService` calls `CommandService` and `IntelligenceService` directly during plugin activation to register contributed commands and completion providers.
+- `PluginService` calls `CommandService` directly during activation to register each plugin command's metadata. It does **not** know about `IntelligenceService`: once activation is done, the binary hands `PluginService::completion_providers()` to `IntelligenceService::set_completion_providers`, so the fan-out is attached without either service depending on the other.
 - All other cross-service communication flows through the `EventBus` — services publish events and other services subscribe without holding direct references to the publisher.
 
 ---
@@ -526,7 +543,7 @@ flowchart TD
     G --> H["8. IntelligenceService\n(EventBus, SchemaService)"]
     H --> I["9. HistoryService\n(EventBus)"]
     I --> J["10. CommandService\n(EventBus)"]
-    J --> K["11. PluginService\n(EventBus, CommandService, IntelligenceService)"]
+    J --> K["11. PluginService\n(EventBus, CommandService)"]
 
     style A fill:#4a9eff,color:#fff
     style K fill:#2ecc71,color:#fff
@@ -536,7 +553,7 @@ The order is dictated by two rules:
 
 1. **Dependencies are constructed first.** `ConnectionService` must exist before `QueryService` can borrow from it. `SettingsService` must exist before `WorkspaceService` can resolve the settings cascade.
 
-2. **`PluginService` is last.** Plugins receive scoped `PluginContext` handles to register commands and completion providers. They must not activate before the services they register with are fully constructed and populated.
+2. **`PluginService` is last.** Plugins receive scoped `PluginContext` handles to register commands and completion providers. They must not activate before the services they register with are fully constructed and populated. It does not take `IntelligenceService`: the binary attaches the providers after activation, which keeps the dependency one-directional.
 
 The `EventBus` is constructed first and is the only service with no dependencies — it is a pure communication primitive. All other services receive `Arc<EventBus>` at construction.
 

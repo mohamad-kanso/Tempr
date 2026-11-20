@@ -146,7 +146,8 @@ Every method returns `Result` so a duplicate is a compile-time-visible branch in
 pub use tempr_db::{DatabaseDriver, DriverConnection};
 
 pub trait CompletionProvider: Send + Sync {
-    fn complete(&self, req: &CompletionRequest) -> Vec<CompletionItem>;
+    fn provider_name(&self) -> &'static str;
+    fn complete(&self, req: &PluginCompletionRequest<'_>) -> Vec<CompletionItem>;
 }
 
 pub trait ResultRenderer: Send + Sync {
@@ -166,9 +167,18 @@ pub struct PluginCommandSpec {
     pub title: &'static str,
     pub category: &'static str,              // palette grouping; "Plugin" by default
     pub default_keystrokes: Vec<&'static str>,
-    pub dispatch: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
+    pub dispatch: Arc<dyn Fn(&mut Window, &mut App, &CommandContext) -> CommandOutcome + Send + Sync>,
 }
+
+pub struct CommandContext {
+    pub last_run: Option<Arc<QueryRun>>,     // host-built, read-only
+    pub workspace_root: Option<PathBuf>,
+}
+
+pub enum CommandOutcome { Done(String), Failed(String) }
 ```
+
+**As shipped (stage 1):** `CompletionProvider::complete` takes `PluginCompletionRequest` (buffer text, offset, prefix, explicit, connection) rather than the engine's `CompletionRequest`, which holds `&mut Buffer` and stays in `tempr_intel` (→ D34). `provider_name` exists so the host can name a slow provider in the latency log. `PluginCommandSpec::dispatch` receives a host-built `CommandContext` and returns a `CommandOutcome` instead of taking no arguments and returning nothing — a plugin never resolves a service, and the status bar gets one line of feedback (→ D35). The action is `PluginCommand { id }` declared `#[action(namespace = plugin, no_json)]`; `no_json` keeps `serde`/`schemars` out of the plugin crate because every binding is installed in code. Theme registration is **not** in the stage-1 surface; it arrives with `register_theme(ThemeData)` in stage 2.
 
 `AiProvider` is deliberately absent: PRODUCT lists AI-assisted generation as out of scope for v1, and publishing a trait with no host implementation would be an API surface nobody can test. docs/08 loses it from the v1 list (§16).
 
@@ -348,8 +358,10 @@ New commands (all in the catalog, all with default keystrokes, per the no-mouse-
 
 Registered `PluginCommandSpec`s enter `CommandService` as ordinary metadata (id, title, category, default keystrokes) so palette search finds them with no special case. Dispatch:
 
-- Keybinding: `commands::install` binds every plugin command's keystrokes to `PluginCommand { id }` in the window context. `MainWindow` handles `PluginCommand` by looking the id up in `PluginService::command(id)` and calling its closure. One action, one handler, no per-plugin compile-time registration.
-- Palette: `commands::dispatch` gains a plugin path — if the id is not in the core catalog, resolve it through `PluginService` and call the closure with `(window, cx)`, then record `CommandExecuted` as for any other command.
+- Keybinding: `commands::install` binds every plugin command's keystrokes to `PluginCommand { id }` in `MainWindow && !Modal`. `MainWindow` handles `PluginCommand` by looking the id up in `PluginService::command(id)` and calling its closure. One action, one handler, no per-plugin compile-time registration. The context string is `tempr_plugin::COMMAND_CONTEXT`, the single source both the installer and the test read.
+- Palette: the palette dispatches `PluginCommand { id }` too (the core and plugin paths share one action), then `MainWindow::dispatch_plugin` resolves the spec, builds `CommandContext` from the last completed run and the workspace root, calls the closure and puts the `CommandOutcome` in the status bar. `CommandExecuted` is recorded as for any other command.
+
+**As shipped (stage 1):** the plugin binding uses `ctrl-alt-e` for `dev.tempr.export-csv::export_last_run`; the action lives in `tempr_plugin` (not `tempr_ui`) so a plugin crate can name it without depending on the UI crate.
 
 ### 7.5 Result grid wiring
 

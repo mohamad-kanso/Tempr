@@ -52,6 +52,13 @@
 | D30 | 2026-10-23 | Catalog records the connected database (`SchemaObjectKind::Database`, `CATALOG_FORMAT_VERSION` 3); the `DATABASE_URL` stand-in derives a stable `ConnectionId` (UUIDv5, password excluded) so offline restarts find the cache | Claude (Phase 3 exit sweep) |
 | D31 | 2026-11-18 | Plugin API is versioned from its first release and stays `0.x` until the user explicitly declares it ready; `1.0` is not a Phase 4 exit consequence. Then backward-compatible within a major. No registry, no dynamic loading in v1 | User directive |
 | D32 | 2026-11-18 | Windows packaging artifact is an MSI installer, not a bare `.exe` | User |
+| D33 | 2026-11-19 | Plugins are static crates that depend on `tempr_plugin` only — never on `tempr_services`/`tempr_ui` | Claude (Phase 4 stage 1) |
+| D34 | 2026-11-19 | Completion item types live in `tempr_domain`; `CompletionRequest` stays in `tempr_intel` | Claude (Phase 4 stage 1) |
+| D35 | 2026-11-19 | One payload action `PluginCommand { id }` plus a host-built `CommandContext` carries every plugin command | Claude (Phase 4 stage 1) |
+| D36 | 2026-11-19 | Panels are a `Panel` trait, not a closure returning an element | Claude (Phase 4 stage 1) |
+| D37 | 2026-11-19 | `ResultRenderer::render_cell` returns `AnyElement`; the chain is fixed at grid construction and NULL never reaches a plugin | Claude (Phase 4 stage 1) |
+| D38 | 2026-11-19 | Plugin activation is ordered, atomic and panic-isolated; services are wired to the registries after activation, not in constructors | Claude (Phase 4 stage 1) |
+| D39 | 2026-11-19 | Every build/test/run in this project executes under a 4 GB memory cap | User directive |
 
 ---
 
@@ -381,3 +388,64 @@
 **Why**: PRODUCT.md §5 already named MSI while docs/16-roadmap.md said `.exe`; the user settled it on MSI. MSI gives a standard install/uninstall path, per-machine or per-user registration, and shortcut/association metadata without a bespoke installer.
 **Consequences**: The packaging stage needs an MSI toolchain (`cargo-wix` or WiX Toolset directly) as a build dependency, and bundle metadata (product name, manufacturer, icon, upgrade code) — which depends on PRODUCT open decision #1 (name/branding). docs/16-roadmap.md's Phase 4 exit criterion is corrected to `.msi`.
 **Supersedes**: none.
+
+## D33 — Plugins are static crates depending on `tempr_plugin` only (2026-11-19)
+
+**By**: Claude (Phase 4 stage 1), implementing spec decision 2.
+**Decision**: A plugin is a Rust crate linked into the binary. Its only internal dependency is `tempr_plugin`; `tempr_plugin` re-exports `tempr_db`'s driver trait, the domain ids and `Value`, and the GPUI types an extension point needs (`AnyElement`, `SharedString`, `Window`, `App`, `FocusHandle`). `tempr_db_postgres` and `plugins/export-csv` are the reference implementations, and registration is one `Vec<Box<dyn Plugin>>` in `crates/tempr/src/plugins.rs`.
+**Why**: ADR-0002 and ADR-0008 say Rust-only, plugin-extensible. If a plugin could name `tempr_ui` or `tempr_services`, the "public API" would be whatever happens to be `pub` in those crates, and every internal refactor would be a breaking plugin change. A single re-export surface makes the contract enforceable (remove a re-export and the plugin stops compiling) and makes an out-of-tree plugin a copy of `plugins/export-csv` with a different manifest.
+**Consequences**: `tempr_plugin` must re-export any GPUI type a new extension point exposes, even though it never uses it itself — that is deliberate, and the crate's `pub use` block is the API. It also means `tempr_plugin` depends on `tempr_db`, so the driver trait is part of the plugin surface; moving it later is a major API change. Third-party plugin distribution remains post-v1 (D31).
+
+---
+
+## D34 — Completion types split between domain and intelligence (2026-11-19)
+
+**By**: Claude (Phase 4 stage 1), refining spec decision 3 ("completion types move to `tempr_domain`").
+**Decision**: `CompletionItem`, `CompletionKind` and the plugin-facing `PluginCompletionRequest` live in `tempr_domain::completion`. `CompletionRequest` — the engine's own request — stays in `tempr_intel`, because it holds `&mut Buffer`. A plugin never sees `CompletionRequest`; the host builds a `PluginCompletionRequest` from the buffer text, cursor offset and prefix.
+**Why**: the spec's intent was that `tempr_intel` and `tempr_plugin` can share the result types without a cycle. Moving the request too would have forced `tempr_domain` (or `tempr_plugin`) to depend on `tempr_editor` for `Buffer`, creating exactly the cycle the move was meant to avoid: `editor → domain` is the only legal direction. Splitting also keeps the public contract text-based on purpose — exposing `Buffer` or `Analysis` would freeze internal representations into the plugin API.
+**Consequences**: two request types with similar names; docs and code must say which is which. `PluginCompletionRequest` (text, offset, prefix, explicit, connection) is the stable one. `tempr_plugin` depends on `tempr_domain` for the items and on `tempr_db`/`tempr_events`, not on `tempr_intel`.
+
+---
+
+## D35 — One payload action and a host-built context for plugin commands (2026-11-19)
+
+**By**: Claude (Phase 4 stage 1), implementing spec decision 5.
+**Decision**: Every plugin command travels through a single GPUI action, `PluginCommand { id }`, declared `#[action(namespace = plugin, no_json)]`. `PluginCommandSpec` carries id, title, category, default keystrokes and a dispatch closure `Fn(&mut Window, &mut App, &CommandContext) -> CommandOutcome`. The host builds `CommandContext { last_run, workspace_root }` and shows the returned `CommandOutcome` in the status bar. Plugins get no service handle.
+**Why**: GPUI dispatches by action *type*, and the host cannot name a type a plugin defines at runtime — so one action with a payload is the only shape that serves both the keymap and the palette without per-plugin `actions!` registration. `no_json` keeps `serde`/`schemars` out of the plugin surface: Tempr installs every binding in code and never reads a JSON keymap. A host-built context preserves "no business logic in the UI" (D6) and "plugins never resolve a service": the window decides what a command may see, and read-only data cannot become a write path by accident.
+**Consequences**: a plugin cannot hold long-lived state in a command — state belongs in a `Panel` or the plugin struct, and the command closure captures the `Arc` it needs. `CommandContext` is a narrow, versioned struct; adding a field is a `0.x` change (D31). The action cannot be serialized, which is fine because nothing outside the binary constructs it.
+
+---
+
+## D36 — Panels are a trait, not a closure (2026-11-19)
+
+**By**: Claude (Phase 4 stage 1), implementing spec decision 6.
+**Decision**: `Panel` is a trait with `panel_id`, `title`, `render(&mut self, &mut Window, &mut App) -> AnyElement` and an optional `focus_handle`. `PluginService` stores `Arc<dyn Panel>`; the dock that renders them lands in stage 3.
+**Why**: a panel owns state across frames and needs `&mut Window, &mut App` each time it renders — a `Fn() -> AnyElement` closure cannot own mutable state without interior mutability, and a plugin cannot create a GPUI entity during `activate` because no window exists yet. A trait keeps construction in the plugin and rendering in the host, which is the only split that works with GPUI's entity model.
+**Consequences**: panels are host-rendered containers around plugin content; the plugin's `render` must not assume it owns the window or the focus. Panel ids are namespaced like command ids and validated the same way. Stage 3 adds the dock and may add a `Panel::on_activate` hook, which is additive.
+
+---
+
+## D37 — Result renderers return `AnyElement`, fixed at grid construction (2026-11-19)
+
+**By**: Claude (Phase 4 stage 1), implementing spec decision 7 with two refinements.
+**Decision**: `ResultRenderer::can_render(&ColumnSpec)` and `render_cell(&Value, &ColumnSpec) -> AnyElement`. `ResultGrid::with_renderers(...)` fixes the chain when the grid is built; per result set the grid resolves the first renderer that claims each column and caches the index. `Value::Null` never reaches a renderer — the built-in formatter handles it. Unclaimed columns also use the built-in formatter, which is not itself a `ResultRenderer`.
+**Why**: GPUI's `Element` has associated types and is not object-safe, so `AnyElement` is the only erased form. Fixing the chain at construction matches how the window is built and avoids a lock or a clone on the render path. Keeping NULL and the default text path in the grid means a renderer never has to be defensive, and a zero-plugin build pays no vtable for the common case.
+**Consequences**: a plugin cannot swap renderers for an existing grid — a chain is per grid, chosen at construction. `can_render` sees the whole `ColumnSpec`, so type-, name- and driver-type-based claims all work. The planned built-in JSON/bytea/array renderers are not shipped as core renderers; they can become plugins once each has a consumer.
+
+---
+
+## D38 — Activation is ordered, atomic and panic-isolated (2026-11-19)
+
+**By**: Claude (Phase 4 stage 1).
+**Decision**: `PluginService::activate_all` orders plugins by manifest `requires` (stable for ties), activates each inside `catch_unwind`, and installs its registrations only after `activate` returns `Ok`. A failed plugin is recorded in `ActivationReport` and skipped; the rest still activate. Cross-plugin duplicate engine/command/panel ids reject the second plugin atomically. Services are connected to the registries after activation (`set_completion_providers`, `driver(...)`, `command_specs()`), never through constructor dependencies.
+**Why**: a plugin is third-party code sharing the process; one bad plugin must not take down the editor or half-install itself. Draining registrations only on success is what makes "a failed plugin leaves no trace" true without a rollback path. Constructor wiring would make `PluginService` and `IntelligenceService` mutually dependent (`intel` would need the providers, `plugin` would need `intel` to register them), so the binary attaches them one-way after activation instead.
+**Consequences**: `requires` is a startup-order constraint, not a load-time dependency resolution — a cycle is reported as a failed activation, not a deadlock. Deactivation runs in reverse activation order and removes contributions by `PluginId`. A plugin that panics after activation (during a command or render) is not caught by this boundary; those paths need their own isolation if a real plugin misbehaves.
+
+---
+
+## D39 — Every project command runs under a 4 GB memory cap (2026-11-19)
+
+**By**: User directive, after an overlapping build/test/GUI session exhausted the machine.
+**Decision**: All builds, tests, lints and GUI runs go through `scripts/capped.sh`, which executes the command in a `systemd-run --user --scope` with `MemoryMax=4G` and `MemorySwapMax=0`. `.cargo/config.toml` sets `build.jobs = 1`. Both limits are overridable only deliberately (`TEMPR_MEMORY_MAX`, `TEMPR_MEMORY_SWAP_MAX`).
+**Why**: GPUI debug links are memory-hungry, and running several cargo invocations plus a GUI at once previously took the machine down. A hard cgroup cap makes the failure local to one command instead of the session, and `jobs = 1` prevents independent rustc processes from stacking.
+**Consequences**: a capped build that dies at 4 GB must be narrowed (`-p <crate>`) rather than given more memory; the remedy is scoping, not raising the cap. CI is unaffected (it has its own limits). Contributors who bypass the wrapper lose the protection, so `CLAUDE.md` names the wrapper in every command.

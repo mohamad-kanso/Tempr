@@ -503,6 +503,20 @@ Context weights: column 500, qualified column 480, CTE 470, relation 450, statem
 
 **Not shipped:** usage-frequency boosting from query history (docs below describe it as the second tier; it lands with the Phase 4 history panel). Cross-file workspace symbols are likewise future work.
 
+### Plugin candidates (stage 1)
+
+`IntelligenceService::set_completion_providers` attaches the providers that active plugins registered. The fan-out runs **inside** the same synchronous `complete` call and the same 5 ms budget:
+
+1. the engine's own ranked list is produced first, unchanged;
+2. the buffer text is copied once into a `PluginCompletionRequest` (the rope and the `Analysis` never leave the crate);
+3. each provider is timed individually — >5 ms logs an error, >1 ms logs a warning;
+4. each returned item is filtered by `match_quality` against the typed prefix and rescored with `100 + item.priority.clamp(0, 300)`, all times 1000, plus the same `match_quality * 4 - label.len()` terms;
+5. the merged list is deduped on `(label, kind)` keeping the higher score, then sorted and truncated to 200.
+
+`PLUGIN_COMPLETION_WEIGHT = 100` is the keyword tier, so a plugin item beats a plain keyword but never beats a schema object (columns start at 500, relations at 450). The clamp at 300 caps the total at 400 — below the lowest schema weight by construction, not by convention.
+
+With no provider registered the merge is a single `Vec::is_empty` check and a return, so the built-in path pays nothing for the extension point.
+
 ---
 
 ## Latency Budget
@@ -601,7 +615,7 @@ The current architecture supports this by parameterizing the `SemanticEngine` on
 
 ### AI Provider Integration Point
 
-The semantic engine's analysis output is a natural input for AI-powered SQL assistance. A future `AiProvider` ([08-plugin-api.md](08-plugin-api.md)) could receive:
+The semantic engine's analysis output is a natural input for AI-powered SQL assistance. There is no `AiProvider` trait in the v1 plugin API — publishing one with no consumer would freeze an untested surface — so this is a post-v1 idea only. Such a provider would receive:
 
 - The current `Analysis` (scopes, diagnostics, star expansions).
 - The `CatalogCache` snapshot (table/column metadata).

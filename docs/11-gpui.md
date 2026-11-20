@@ -59,7 +59,7 @@ Verified against the local zed clone (gpui `0.2.2`):
 | 2D data grid | **Nothing.** `examples/data_table.rs` is a demo, not a component | Build `Table` on top of `uniform_list` (rows) + column virtualization — see [13 — Result Grid](./13-result-grid.md) |
 | Text input | **Nothing.** `examples/input.rs` (778 lines) is the reference hand-rolled `TextInput`: `EntityInputHandler`/`ElementInputHandler` (IME + marked range), `FocusHandle`/`Focusable`, `selected_range`/`selection_reversed`, custom `Element` shaping via `ShapedLine`, `actions!` for Backspace/Delete/arrows/Home/End/SelectAll/Copy/Cut/Paste | Tempr's SQL editor is custom anyway ([ADR-0003](adr/0003-custom-sql-editor.md)); `examples/input.rs` is the starting point for single-line `Input` |
 | Animation | `Animation`, `AnimationExt` (`use gpui::AnimationExt as _`), `Transformation`, easings `ease_in_out`, `bounce(..)`, `percentage(delta)` — `element.with_animation(id, Animation::new(dur).repeat().with_easing(..), \|el, delta\| …)` | Spinners for long-running queries |
-| Theme | **Nothing usable** — `ActiveTheme`/`cx.theme()` lives in GPL `crates/theme` | Tempr's own `ThemeProvider` ([08 — Plugin API](./08-plugin-api.md)) |
+| Theme | **Nothing usable** — `ActiveTheme`/`cx.theme()` lives in GPL `crates/theme` | Tempr's own `ThemeData` ([08 — Plugin API](./08-plugin-api.md), stage 2) |
 | Accessibility | `accesskit` is a core dep; `examples/a11y.rs`, `tab_stop.rs`, `focus_visible.rs` show focus/tab-stop APIs | Wire `aria`-equivalent metadata per component |
 
 Useful examples to read before writing a component: `hello_world.rs`, `input.rs`, `uniform_list.rs`, `list_example.rs` (chat-style `ListAlignment::Bottom` + manual scrollbar math), `data_table.rs`, `grid_layout.rs`, `tree.rs`, `popover.rs`, `drag_drop.rs`, `scrollable.rs`, `text*.rs`, `animation.rs`, `view_example/`, `move_entity_between_windows.rs`.
@@ -160,7 +160,7 @@ Overrides: `~/.config/tempr/settings.toml` (user) and `workspace.toml` (workspac
 
 ### Theme Tokens
 
-All components consume theme tokens from the `ThemeProvider` (see [08 — Plugin API](./08-plugin-api.md)). Tokens include:
+All components consume theme tokens, resolved from `ThemeData` (see [08 — Plugin API](./08-plugin-api.md)). Tokens include:
 
 - **Colors:** `background`, `surface`, `border`, `text`, `text_muted`, `accent`, `danger`, `success`, `warning` — each with normal/hover/pressed/disabled states.
 - **Spacing:** `xs` (4px), `sm` (8px), `md` (12px), `lg` (16px), `xl` (24px).
@@ -508,7 +508,7 @@ This is a **v0.2+** target. v0.1 will have keyboard navigation but not full scre
 
 ### Theming System Integration
 
-When [08 — Plugin API](./08-plugin-api.md) ships dark/light/high-contrast themes, each view's `render()` will read tokens from `ThemeProvider`. The component library must never hard-code colors. This is enforced by code review and, in the future, by a custom `clippy` lint that flags hardcoded hex colors in `src/ui/`.
+When [08 — Plugin API](./08-plugin-api.md) ships dark/light themes in Phase 4 stage 2, each view's `render()` will read tokens from the resolved `ThemeData`. The component library must never hard-code colors. This is enforced by code review and, in the future, by a custom `clippy` lint that flags hardcoded hex colors in `src/ui/`.
 
 ### Virtualized List/Table Performance
 
