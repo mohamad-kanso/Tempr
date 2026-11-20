@@ -2,3 +2,11 @@
 # libgit2's transport is an order of magnitude slower than the git CLI for it.
 [net]
 git-fetch-with-cli = true
+
+# One rustc/one linker at a time. GPUI plus a debug binary is a multi-gigabyte
+# link, and a workspace build with parallel jobs is what pushed this machine
+# into memory pressure once already. Run cargo through scripts/capped.sh for
+# the hard 4 GB kernel cap; this setting keeps the peak low even when someone
+# forgets. Override per command with `cargo -j N` only if the budget allows.
+[build]
+jobs = 1
